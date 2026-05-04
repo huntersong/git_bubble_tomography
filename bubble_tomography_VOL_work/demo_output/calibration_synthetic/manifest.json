@@ -1,0 +1,137 @@
+{
+  "output_dir": "demo_output\\calibration_synthetic",
+  "generated_sets": {
+    "volume_dots": [
+      {
+        "path": "demo_output\\calibration_synthetic\\volume_dots\\volume_dots_01.png",
+        "pattern_type": "volume_dots",
+        "pattern_size": [
+          11,
+          8
+        ],
+        "missing_points": [
+          [
+            5,
+            3
+          ],
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            3
+          ],
+          [
+            6,
+            4
+          ]
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\volume_dots\\volume_dots_02.png",
+        "pattern_type": "volume_dots",
+        "pattern_size": [
+          11,
+          8
+        ],
+        "missing_points": [
+          [
+            5,
+            3
+          ],
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            3
+          ],
+          [
+            6,
+            4
+          ]
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\volume_dots\\volume_dots_03.png",
+        "pattern_type": "volume_dots",
+        "pattern_size": [
+          11,
+          8
+        ],
+        "missing_points": [
+          [
+            5,
+            3
+          ],
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            3
+          ],
+          [
+            6,
+            4
+          ]
+        ]
+      }
+    ],
+    "circles": [
+      {
+        "path": "demo_output\\calibration_synthetic\\circles\\circles_01.png",
+        "pattern_type": "circles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\circles\\circles_02.png",
+        "pattern_type": "circles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\circles\\circles_03.png",
+        "pattern_type": "circles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      }
+    ],
+    "acircles": [
+      {
+        "path": "demo_output\\calibration_synthetic\\acircles\\acircles_01.png",
+        "pattern_type": "acircles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\acircles\\acircles_02.png",
+        "pattern_type": "acircles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      },
+      {
+        "path": "demo_output\\calibration_synthetic\\acircles\\acircles_03.png",
+        "pattern_type": "acircles",
+        "pattern_size": [
+          9,
+          6
+        ]
+      }
+    ]
+  }
+}
