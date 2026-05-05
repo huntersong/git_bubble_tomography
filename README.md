@@ -1,3 +1,9 @@
+#本程序包括气泡三维重建系统，基于多相机视角进行三维重建，支持多相机标定、气泡重建、三维点云导出、示踪粒子3D重建、Tomographic PIV。
+#目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV，
+#PTV功能正在开发中。
+
+
+{
 # git_bubble_tomography
 bubble_tomography_VOL_work260430
 
@@ -319,3 +325,4 @@ A: 减小网格分辨率（如32?），增大光线采样步长，减少迭代次数。MART计算复杂度为O(N_
 ## 许可
 
 MIT License
+}
