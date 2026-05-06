@@ -1,3 +1,16 @@
+#本程序包括气泡三维重建系统，基于多相机视角进行三维重建，支持多相机标定、气泡重建、三维点云导出、示踪粒子3D重建、Tomographic PIV。 #目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV， { #上面的功能都在\bubble_tomography文件夹里。 通过shell命令启动：python main.py --gui #GUI界面提供四个标签页： #1. 相机标定：添加相机、加载标定图像、设置标定板参数、执行标定 #2. 气泡重建：批量加载气泡图像序列、设置MART参数、执行重建、时间点切换查看
+#3. 结果可视化：查看点云、体素切片、投影对比、综合报告、批量结果概览
+#4. Particle Tracking / PIV：批量加载粒子图像、粒子3D重建、速度场计算、时间点切换 #目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV， #PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里。
+
+#封装的软件都在 branch分支的\bubble_tomography_exe文件夹里。 通过直接打开exe文件启动，
+
+#PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里
+
+} #本程序基于Python3.7开发，依赖PyQt5、numpy、opencv-python、scipy、matplotlib、scikit-image、tqdm
+
+若有问题，请提issue，联系方式huntersong1992@qq.com,songyuchen@sjtu.edu.cn
+
+{#以下是README.md的内容：
 # git_bubble_tomography
 bubble_tomography_VOL_work260430
 
@@ -319,3 +332,4 @@ A: 减小网格分辨率（如32?），增大光线采样步长，减少迭代次数。MART计算复杂度为O(N_
 ## 许可
 
 MIT License
+}
