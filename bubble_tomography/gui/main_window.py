@@ -19,10 +19,10 @@ from PyQt5.QtWidgets import (
     QMessageBox, QScrollArea, QGridLayout, QCheckBox, QSlider,
     QStatusBar, QToolBar, QAction, QFrame, QListWidget,
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
-    QMenu
+    QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QModelIndex
-from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
@@ -901,6 +901,889 @@ class CalibrationPreviewWidget(QWidget):
         self.rulerDistanceChanged.emit(self._ruler_distance_px)
 
 
+SUPPORTED_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.pgm', '.ppm'}
+
+
+class FileTreePanel(QWidget):
+    """
+    文件树面板：展示工作目录下的图像文件。
+    - 按子文件夹（图像组）分组，可展开/收缩
+    - 点击图片节点时发出信号供主窗口预览
+    - 右键菜单：展开/收缩/复制路径/重命名
+    - 惰性加载：点击组节点时才发出预览信号，展开/收缩不触发预览
+    """
+
+    # 信号：点击了一张图片，参数为图片绝对路径
+    image_selected = pyqtSignal(str)
+    # 信号：点击了一个图像组（文件夹），参数为该文件夹下第一张图片路径
+    group_selected = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._work_dir: str = ""
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.setInterval(100)  # 防抖 100ms
+        self._pending_path: str = ""
+        self._load_timer.timeout.connect(self._emit_pending_signal)
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 标题行
+        header = QWidget()
+        header.setStyleSheet("background-color: #1e2d3d;")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 6, 6)
+        header_layout.setSpacing(4)
+
+        title = QLabel("📁 文件树")
+        title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
+        header_layout.addWidget(title, stretch=1)
+
+        # 刷新按钮
+        self._refresh_btn = QPushButton("⟳")
+        self._refresh_btn.setToolTip("刷新文件树")
+        self._refresh_btn.setFixedSize(24, 24)
+        self._refresh_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #bdc3c7;
+                border: none; font-size: 14px;
+            }
+            QPushButton:hover { color: #ecf0f1; }
+        """)
+        self._refresh_btn.clicked.connect(self.refresh)
+        header_layout.addWidget(self._refresh_btn)
+
+        # 全部展开/收缩
+        self._expand_btn = QPushButton("⊞")
+        self._expand_btn.setToolTip("全部展开/收缩")
+        self._expand_btn.setFixedSize(24, 24)
+        self._expand_btn.setCheckable(True)
+        self._expand_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #bdc3c7;
+                border: none; font-size: 14px;
+            }
+            QPushButton:hover { color: #ecf0f1; }
+            QPushButton:checked { color: #3498db; }
+        """)
+        self._expand_btn.clicked.connect(self._toggle_expand_all)
+        header_layout.addWidget(self._expand_btn)
+
+        layout.addWidget(header)
+
+        # 路径标签
+        self._path_label = QLabel("未设置工作目录")
+        self._path_label.setStyleSheet(
+            "color: #7f8c8d; font-size: 10px; padding: 3px 8px; "
+            "background-color: #263545;"
+        )
+        self._path_label.setWordWrap(True)
+        self._path_label.setMaximumHeight(36)
+        layout.addWidget(self._path_label)
+
+        # 树形控件
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setIndentation(14)
+        self._tree.setAnimated(True)
+        self._tree.setUniformRowHeights(True)  # 统一行高提升性能
+        self._tree.setIconSize(QSize(16, 16))
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._tree.setStyleSheet("""
+            QTreeWidget {
+                background-color: #1a2535;
+                color: #bdc3c7;
+                border: none;
+                font-size: 12px;
+            }
+            QTreeWidget::item {
+                padding: 3px 4px;
+                border-radius: 3px;
+            }
+            QTreeWidget::item:hover {
+                background-color: #2c3e50;
+                color: #ecf0f1;
+            }
+            QTreeWidget::item:selected {
+                background-color: #2980b9;
+                color: #ffffff;
+            }
+            QTreeWidget::branch {
+                background-color: #1a2535;
+            }
+            QTreeWidget::branch:has-children:!has-siblings:closed,
+            QTreeWidget::branch:closed:has-children:has-siblings {
+                border-image: none;
+                image: none;
+            }
+            QScrollBar:vertical {
+                background: #1a2535; width: 8px; border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #34495e; border-radius: 4px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: #4a6785; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        self._tree.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self._tree, stretch=1)
+
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
+    def set_work_dir(self, path: str):
+        """设置工作目录并刷新树。"""
+        self._work_dir = path
+        self.refresh()
+
+    def refresh(self):
+        """重新扫描工作目录，重建树节点。"""
+        self._tree.setUpdatesEnabled(False)  # 批量更新期间禁止重绘
+        self._tree.clear()
+        if not self._work_dir or not os.path.isdir(self._work_dir):
+            self._path_label.setText("未设置工作目录")
+            self._tree.setUpdatesEnabled(True)
+            return
+
+        self._path_label.setText(self._work_dir)
+
+        root_dir = Path(self._work_dir)
+
+        # 先收集根目录下直属图片
+        root_images = sorted(
+            p for p in root_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
+        )
+
+        # 再收集子文件夹
+        subdirs = sorted(
+            p for p in root_dir.iterdir()
+            if p.is_dir() and not p.name.startswith('.')
+        )
+
+        # 根目录直属图片单独分组
+        if root_images:
+            group_item = QTreeWidgetItem(self._tree)
+            group_item.setText(0, f"📂 {root_dir.name}  ({len(root_images)} 张)")
+            group_item.setData(0, Qt.UserRole, str(root_dir))
+            group_item.setData(0, Qt.UserRole + 1, "group")
+            group_item.setForeground(0, QColor("#3498db"))
+            group_item.setExpanded(False)
+            for img_path in root_images:
+                self._add_image_item(group_item, img_path)
+
+        # 子文件夹
+        for sub in subdirs:
+            imgs = sorted(
+                p for p in sub.iterdir()
+                if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
+            )
+            if not imgs:
+                continue
+            group_item = QTreeWidgetItem(self._tree)
+            group_item.setText(0, f"📂 {sub.name}  ({len(imgs)} 张)")
+            group_item.setData(0, Qt.UserRole, str(sub))
+            group_item.setData(0, Qt.UserRole + 1, "group")
+            group_item.setForeground(0, QColor("#3498db"))
+            group_item.setExpanded(False)
+            for img_path in imgs:
+                self._add_image_item(group_item, img_path)
+
+        if self._tree.topLevelItemCount() == 0:
+            empty_item = QTreeWidgetItem(self._tree)
+            empty_item.setText(0, "（无图像文件）")
+            empty_item.setForeground(0, QColor("#7f8c8d"))
+
+        self._tree.setUpdatesEnabled(True)  # 恢复重绘
+
+    def _add_image_item(self, parent: QTreeWidgetItem, img_path: Path):
+        item = QTreeWidgetItem(parent)
+        item.setText(0, f"  🖼 {img_path.name}")
+        item.setData(0, Qt.UserRole, str(img_path))
+        item.setData(0, Qt.UserRole + 1, "image")
+        item.setForeground(0, QColor("#95a5a6"))
+
+    def _toggle_expand_all(self, checked: bool):
+        self._tree.setUpdatesEnabled(False)
+        if checked:
+            self._tree.expandAll()
+            self._expand_btn.setText("⊟")
+        else:
+            self._tree.collapseAll()
+            self._expand_btn.setText("⊞")
+        self._tree.setUpdatesEnabled(True)
+
+    # ------------------------------------------------------------------
+    # 点击事件（带防抖，避免快速点击导致堆积加载）
+    # ------------------------------------------------------------------
+    def _on_item_clicked(self, item: QTreeWidgetItem, col: int):
+        path = item.data(0, Qt.UserRole)
+        kind = item.data(0, Qt.UserRole + 1)
+        if not path:
+            return
+
+        if kind == "image":
+            self._pending_path = path
+            self._pending_kind = "image"
+            self._load_timer.start()  # 防抖
+        elif kind == "group":
+            # 点击组节点：仅展开/收缩，不触发预览
+            # 预览需通过右键菜单或点击子图片触发
+            item.setExpanded(not item.isExpanded())
+
+    def _emit_pending_signal(self):
+        """防抖定时器到期，实际发出信号。"""
+        path = self._pending_path
+        kind = getattr(self, '_pending_kind', 'image')
+        if not path:
+            return
+        if kind == "image":
+            self.image_selected.emit(path)
+        elif kind == "group":
+            self.group_selected.emit(path)
+
+    # ------------------------------------------------------------------
+    # 右键菜单
+    # ------------------------------------------------------------------
+    def _on_context_menu(self, pos):
+        """右键菜单：展开/收缩/复制路径/重命名。"""
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+
+        path = item.data(0, Qt.UserRole)
+        kind = item.data(0, Qt.UserRole + 1)
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e2d3d;
+                color: #ecf0f1;
+                border: 1px solid #34495e;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 24px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background-color: #2980b9;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #34495e;
+                margin: 4px 8px;
+            }
+        """)
+
+        # --- 展开/收缩（组节点才有子节点） ---
+        if item.childCount() > 0:
+            if item.isExpanded():
+                act_collapse = menu.addAction("🔽 收缩")
+                act_collapse.triggered.connect(lambda: item.setExpanded(False))
+            else:
+                act_expand = menu.addAction("▶ 展开")
+                act_expand.triggered.connect(lambda: item.setExpanded(True))
+
+            # 展开所有 / 收缩所有
+            menu.addSeparator()
+            act_expand_all = menu.addAction("⊟ 展开所有")
+            act_expand_all.triggered.connect(self._tree.expandAll)
+            act_collapse_all = menu.addAction("⊞ 收缩所有")
+            act_collapse_all.triggered.connect(self._tree.collapseAll)
+
+        # --- 预览（组节点预览第一张，图片节点直接预览） ---
+        if path:
+            menu.addSeparator()
+            if kind == "group":
+                act_preview = menu.addAction("👁 预览第一张")
+                act_preview.triggered.connect(
+                    lambda: self._preview_group(item))
+            elif kind == "image":
+                act_preview = menu.addAction("👁 预览图片")
+                act_preview.triggered.connect(
+                    lambda: self.image_selected.emit(path))
+
+        # --- 复制路径 ---
+        if path:
+            menu.addSeparator()
+            act_copy = menu.addAction("📋 复制路径")
+            act_copy.triggered.connect(lambda: self._copy_path(path))
+
+        # --- 重命名 ---
+        if path and kind == "image":
+            act_rename = menu.addAction("✏️ 重命名")
+            act_rename.triggered.connect(lambda: self._rename_item(item, path))
+
+        # --- 删除（移入回收站） ---
+        if path:
+            act_delete = menu.addAction("🗑 删除")
+            act_delete.triggered.connect(lambda: self._delete_item(item, path))
+
+        menu.exec_(self._tree.viewport().mapToGlobal(pos))
+
+    def _preview_group(self, item: QTreeWidgetItem):
+        """预览组节点的第一张图片。"""
+        child = item.child(0)
+        if child:
+            first_img = child.data(0, Qt.UserRole)
+            if first_img:
+                self.group_selected.emit(first_img)
+
+    def _copy_path(self, path: str):
+        """复制文件路径到剪贴板。"""
+        from PyQt5.QtWidgets import QApplication as _QApp
+        clipboard = _QApp.clipboard()
+        clipboard.setText(path)
+        # 显示状态提示
+        if hasattr(self, '_path_label'):
+            self._path_label.setText(f"已复制: {path}")
+            QTimer.singleShot(2000, lambda: self._path_label.setText(self._work_dir or "未设置工作目录"))
+
+    def _rename_item(self, item: QTreeWidgetItem, old_path: str):
+        """重命名图片文件。"""
+        from PyQt5.QtWidgets import QInputDialog
+        old_p = Path(old_path)
+        new_name, ok = QInputDialog.getText(
+            self, "重命名", "新文件名:", text=old_p.name)
+        if not ok or not new_name or new_name == old_p.name:
+            return
+        new_path = old_p.parent / new_name
+        if new_path.exists():
+            QMessageBox.warning(self, "重命名失败", f"文件已存在: {new_path}")
+            return
+        try:
+            old_p.rename(new_path)
+            # 更新树节点
+            item.setText(0, f"  🖼 {new_name}")
+            item.setData(0, Qt.UserRole, str(new_path))
+            self._path_label.setText(f"已重命名: {new_name}")
+            QTimer.singleShot(2000, lambda: self._path_label.setText(self._work_dir or "未设置工作目录"))
+        except OSError as e:
+            QMessageBox.warning(self, "重命名失败", str(e))
+
+    def _delete_item(self, item: QTreeWidgetItem, path: str):
+        """删除文件（移入系统回收站）。"""
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除以下文件吗？\n{path}\n\n文件将移入系统回收站。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            import send2trash
+            send2trash.send2trash(path)
+        except ImportError:
+            # send2trash 不可用时回退到永久删除（二次确认）
+            reply2 = QMessageBox.warning(
+                self, "永久删除",
+                "未安装 send2trash 库，文件将永久删除（不可恢复）！\n是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply2 == QMessageBox.Yes:
+                os.remove(path)
+            else:
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "删除失败", str(e))
+            return
+        # 从树中移除节点
+        parent = item.parent()
+        if parent:
+            parent.removeChild(item)
+            # 更新父节点的图片计数
+            remaining = parent.childCount()
+            if remaining == 0:
+                # 组内无图片了，移除组节点
+                tree = parent.treeWidget()
+                if tree:
+                    (tree.invisibleRootItem() if parent.parent() is None
+                     else parent.parent()).removeChild(parent)
+            else:
+                dir_name = Path(parent.data(0, Qt.UserRole)).name
+                parent.setText(0, f"📂 {dir_name}  ({remaining} 张)")
+        else:
+            self._tree.takeTopLevelItem(self._tree.indexOfTopLevelItem(item))
+
+
+class ImagePreviewPanel(QWidget):
+    """窗口最右侧：显示文件树中选中的图片（大图预览），可折叠。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_path: str = ""
+        self._expanded: bool = True
+        self._expanded_width: int = 320   # 展开时宽度（会被主窗口 setFixedWidth 覆盖）
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ---- 标题栏（始终可见）----
+        self._title_bar = QWidget()
+        self._title_bar.setFixedHeight(32)
+        self._title_bar.setStyleSheet("background-color: #1e2d3d;")
+        tb_layout = QHBoxLayout(self._title_bar)
+        tb_layout.setContentsMargins(8, 0, 8, 0)
+        tb_layout.setSpacing(6)
+
+        # 折叠按钮
+        self._collapse_btn = QPushButton("▸")
+        self._collapse_btn.setToolTip("折叠/展开预览面板")
+        self._collapse_btn.setFixedSize(20, 20)
+        self._collapse_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #bdc3c7;
+                border: none; font-size: 14px; font-weight: bold;
+            }
+            QPushButton:hover { color: #ecf0f1; }
+        """)
+        self._collapse_btn.clicked.connect(self._toggle_collapse)
+        tb_layout.addWidget(self._collapse_btn)
+
+        title = QLabel("🖼 图片预览")
+        title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
+        tb_layout.addWidget(title, stretch=1)
+
+        self._fit_btn = QPushButton("适应窗口")
+        self._fit_btn.setCheckable(True)
+        self._fit_btn.setChecked(True)
+        self._fit_btn.setFixedSize(72, 24)
+        self._fit_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #bdc3c7;
+                border: 1px solid #34495e; font-size: 11px;
+                border-radius: 3px;
+            }
+            QPushButton:checked { color: #3498db; border-color: #3498db; }
+            QPushButton:hover { color: #ecf0f1; }
+        """)
+        tb_layout.addWidget(self._fit_btn)
+        layout.addWidget(self._title_bar)
+
+        # ---- 可折叠的内容区 ----
+        self._content = QWidget()
+        content_layout = QVBoxLayout(self._content)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea { background-color: #111c28; border: none; }
+            QScrollBar:vertical {
+                background: #1a2535; width: 8px; border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #34495e; border-radius: 4px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: #4a6785; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+        self._scroll = scroll
+
+        self._img_label = QLabel()
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setStyleSheet("background-color: #111c28; color: #7f8c8d; font-size: 12px;")
+        self._img_label.setText("请从左侧文件树选择图片")
+        scroll.setWidget(self._img_label)
+        content_layout.addWidget(scroll, stretch=1)
+
+        # 路径标签
+        self._path_label = QLabel("未选择图片")
+        self._path_label.setStyleSheet("color: #7f8c8d; font-size: 10px; padding: 2px 6px;")
+        self._path_label.setWordWrap(True)
+        self._path_label.setMaximumHeight(32)
+        content_layout.addWidget(self._path_label)
+
+        layout.addWidget(self._content, stretch=1)
+
+    # ------------------------------------------------------------------
+    # 折叠 / 展开
+    # ------------------------------------------------------------------
+    def _toggle_collapse(self):
+        if self._expanded:
+            self.collapse()
+        else:
+            self.expand()
+
+    def collapse(self):
+        """折叠预览面板，只保留标题栏。"""
+        self._expanded = False
+        self._expanded_width = self.width()
+        self._content.hide()
+        self._collapse_btn.setText("▸")
+        self.setFixedWidth(self._title_bar.sizeHint().width() + 16)
+
+    def expand(self):
+        """展开预览面板。"""
+        self._expanded = True
+        self._content.show()
+        self._collapse_btn.setText("◂")
+        self.setFixedWidth(self._expanded_width)
+        # 重新适配图片
+        if hasattr(self, '_orig_pixmap') and not self._orig_pixmap.isNull():
+            self._apply_pixmap()
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    # ------------------------------------------------------------------
+    # 图片加载
+    # ------------------------------------------------------------------
+    def load_image(self, img_path: str):
+        """加载并显示图片。"""
+        self._current_path = img_path
+        self._path_label.setText(os.path.basename(img_path))
+
+        # 如果当前折叠，自动展开
+        if not self._expanded:
+            self.expand()
+
+        try:
+            pix = QPixmap(img_path)
+            if pix.isNull():
+                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    if img.ndim == 2:
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                    elif img.ndim == 3 and img.shape[2] == 4:
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                    elif img.ndim == 3 and img.shape[2] == 1:
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                    else:
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w, ch = img_rgb.shape
+                    # 使用 .tobytes() 创建数据副本，避免 numpy 数组被 GC 后 QImage 引用悬垂指针
+                    qimg = QImage(img_rgb.data.tobytes(), w, h, w * ch, QImage.Format_RGB888)
+                    pix = QPixmap.fromImage(qimg)
+        except Exception:
+            pix = QPixmap()
+
+        if pix.isNull():
+            self._img_label.setText("无法加载图片")
+            return
+
+        self._orig_pixmap = pix
+        self._apply_pixmap()
+
+    def _apply_pixmap(self):
+        if not hasattr(self, '_orig_pixmap') or self._orig_pixmap.isNull():
+            return
+        if self._fit_btn.isChecked():
+            scaled = self._orig_pixmap.scaled(
+                self._img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        else:
+            scaled = self._orig_pixmap
+        self._img_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._expanded and hasattr(self, '_fit_btn') and self._fit_btn.isChecked():
+            self._apply_pixmap()
+
+    def clear(self):
+        self._current_path = ""
+        self._path_label.setText("未选择图片")
+        self._img_label.setText("请从左侧文件树选择图片")
+        if hasattr(self, '_orig_pixmap'):
+            self._orig_pixmap = QPixmap()
+
+
+class _IEColorbarWidget(QWidget):
+    """图像处理查看器的颜色条组件，显示 min-max 值映射。"""
+
+    def __init__(self, sp_func, parent=None):
+        super().__init__(parent)
+        self._sp = sp_func
+        self._vmin = 0.0
+        self._vmax = 255.0
+        self.setMinimumWidth(self._sp(200))
+
+    def set_range(self, vmin, vmax):
+        self._vmin = vmin
+        self._vmax = vmax
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt5.QtGui import QPainter, QLinearGradient, QPen
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        margin = self._sp(40)
+        bar_h = self._sp(8)
+        y0 = (h - bar_h) // 2
+
+        # 渐变色条（灰度：黑→白）
+        gradient = QLinearGradient(margin, 0, w - margin, 0)
+        gradient.setColorAt(0.0, QColor(0, 0, 0))
+        gradient.setColorAt(1.0, QColor(255, 255, 255))
+        painter.fillRect(margin, y0, w - 2 * margin, bar_h, gradient)
+
+        # 边框
+        painter.setPen(QPen(QColor(100, 100, 100), 1))
+        painter.drawRect(margin, y0, w - 2 * margin, bar_h)
+
+        # 标签
+        painter.setPen(QColor(170, 170, 170))
+        font = painter.font()
+        font.setPointSize(max(7, int(9 * self._sp(1) / 1.0)))
+        painter.setFont(font)
+
+        vmin_str = f"{self._vmin:.0f}" if abs(self._vmin) < 1e4 else f"{self._vmin:.1e}"
+        vmax_str = f"{self._vmax:.0f}" if abs(self._vmax) < 1e4 else f"{self._vmax:.1e}"
+
+        painter.drawText(0, y0 + bar_h + self._sp(12), vmin_str)
+        painter.drawText(w - margin, y0 + bar_h + self._sp(12), vmax_str)
+        painter.drawText(w // 2, y0 + bar_h + self._sp(12), f"{(self._vmin + self._vmax) / 2:.0f}")
+
+        painter.end()
+
+
+class _IEImageViewer(QLabel):
+    """图像处理查看器的增强QLabel，支持鼠标悬停显示像素坐标和值。"""
+
+    pixel_hover = pyqtSignal(int, int, object)  # x, y, pixel_value
+
+    def __init__(self, text="", sp_func=None, parent=None):
+        super().__init__(text, parent)
+        self._sp = sp_func or (lambda x: x)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+        self._image_data = None  # numpy array
+        self._scale_x = 1.0
+        self._scale_y = 1.0
+        self._offset_x = 0
+        self._offset_y = 0
+
+    def set_image_data(self, img):
+        """设置原始图像数据用于像素值读取。"""
+        self._image_data = img
+
+    def setPixmap(self, pixmap):
+        """重写setPixmap，记录缩放信息。"""
+        super().setPixmap(pixmap)
+        if pixmap and self._image_data is not None:
+            ih, iw = self._image_data.shape[:2]
+            pw = pixmap.width()
+            ph = pixmap.height()
+            if pw > 0 and ph > 0:
+                self._scale_x = iw / pw
+                self._scale_y = ih / ph
+                # 计算图片在label中的偏移（居中显示）
+                self._offset_x = (self.width() - pw) // 2
+                self._offset_y = (self.height() - ph) // 2
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 重新计算偏移
+        if self.pixmap() and self._image_data is not None:
+            pw = self.pixmap().width()
+            ph = self.pixmap().height()
+            self._offset_x = (self.width() - pw) // 2
+            self._offset_y = (self.height() - ph) // 2
+
+    def mouseMoveEvent(self, event):
+        """鼠标移动时发出像素坐标和值。"""
+        if self._image_data is None or self.pixmap() is None:
+            self.pixel_hover.emit(-1, -1, None)
+            return
+
+        x = event.pos().x() - self._offset_x
+        y = event.pos().y() - self._offset_y
+
+        pw = self.pixmap().width()
+        ph = self.pixmap().height()
+
+        if 0 <= x < pw and 0 <= y < ph:
+            img_x = int(x * self._scale_x)
+            img_y = int(y * self._scale_y)
+            ih, iw = self._image_data.shape[:2]
+            if 0 <= img_y < ih and 0 <= img_x < iw:
+                val = self._image_data[img_y, img_x]
+                if isinstance(val, np.ndarray):
+                    val = tuple(val.tolist())
+                self.pixel_hover.emit(img_x, img_y, val)
+                return
+
+        self.pixel_hover.emit(-1, -1, None)
+
+    def leaveEvent(self, event):
+        self.pixel_hover.emit(-1, -1, None)
+
+
+class _IEAlgoCard(QFrame):
+    """操作面板算法卡片，支持点击和拖拽。"""
+
+    add_requested = pyqtSignal(str)  # step_key
+
+    def __init__(self, key, label, desc, sp_func, parent=None):
+        super().__init__(parent)
+        self._sp = sp_func
+        self._key = key
+        self._label = label
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("algo_key", key)
+        self.setStyleSheet(
+            "QFrame { background: #383838; border: 1px solid #4a4a4a; "
+            "  border-radius: 4px; padding: 4px; }"
+            "QFrame:hover { background: #454545; border-color: #6a6a6a; }"
+            "QLabel { color: #ddd; border: none; }"
+        )
+        c_lay = QVBoxLayout(self)
+        c_lay.setContentsMargins(self._sp(6), self._sp(4), self._sp(6), self._sp(4))
+        c_lay.setSpacing(0)
+
+        name_lbl = QLabel(f"<b>{label}</b>")
+        name_lbl.setStyleSheet("font-size: 12px; color: #eee; border: none;")
+        c_lay.addWidget(name_lbl)
+
+        desc_lbl = QLabel(desc)
+        desc_lbl.setStyleSheet("font-size: 10px; color: #999; border: none;")
+        c_lay.addWidget(desc_lbl)
+
+    def mousePressEvent(self, event):
+        """点击添加到工作流。"""
+        if event.button() == Qt.LeftButton:
+            self.add_requested.emit(self._key)
+            self._drag_start = event.pos()
+
+    def mouseMoveEvent(self, event):
+        """拖拽算法卡片到工作流画布。"""
+        if not (event.buttons() & Qt.LeftButton):
+            return
+        drag = QDrag(self)
+        mime = drag.mimeData()
+        mime.setText(self._key)
+        # 创建拖拽预览
+        pixmap = self.grab()
+        drag.setPixmap(pixmap.scaled(
+            min(pixmap.width(), 150), min(pixmap.height(), 60),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        drag.setHotSpot(event.pos())
+        drag.exec_(Qt.CopyAction)
+
+
+class _IEWorkflowCanvas(QWidget):
+    """工作流画布，支持拖拽添加节点和节点拖拽排序。"""
+
+    node_drop_requested = pyqtSignal(str)  # step_key
+    node_move_requested = pyqtSignal(str, int)  # step_key, new_index
+
+    def __init__(self, sp_func, parent=None):
+        super().__init__(parent)
+        self._sp = sp_func
+        self.setAcceptDrops(True)
+        self._drag_insert_line = None
+        self._drag_insert_idx = -1
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+            # 计算插入位置指示
+            self._update_drop_indicator(event.pos())
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasText():
+            step_key = event.mimeData().text()
+            event.acceptProposedAction()
+            # 计算插入位置
+            insert_idx = self._calc_insert_index(event.pos())
+            self.node_drop_requested.emit(step_key)
+            self._clear_drop_indicator()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._clear_drop_indicator()
+
+    def _calc_insert_index(self, pos):
+        """根据鼠标位置计算插入到画布中的节点索引。"""
+        # 查找 ie_canvas_layout
+        content = self.findChild(QScrollArea)
+        if not content:
+            return -1
+        canvas_content = content.widget()
+        if not canvas_content:
+            return -1
+        layout = canvas_content.layout()
+        if not layout:
+            return -1
+
+        # 映射坐标到 canvas_content
+        local_pos = self.mapTo(canvas_content, pos)
+        y = local_pos.y()
+
+        count = layout.count()
+        for i in range(count):
+            item = layout.itemAt(i)
+            if item and item.widget():
+                widget = item.widget()
+                rect = widget.geometry()
+                if y < rect.center().y():
+                    return i
+        return count - 1  # 在 stretch 之前
+
+    def _update_drop_indicator(self, pos):
+        """显示插入位置指示线。"""
+        self._clear_drop_indicator()
+        idx = self._calc_insert_index(pos)
+        if idx < 0:
+            return
+        content = self.findChild(QScrollArea)
+        if not content:
+            return
+        canvas_content = content.widget()
+        if not canvas_content:
+            return
+        layout = canvas_content.layout()
+        if not layout or idx >= layout.count():
+            return
+
+        item = layout.itemAt(idx)
+        if item and item.widget():
+            widget = item.widget()
+            # 创建指示线
+            line = QFrame(canvas_content)
+            line.setFixedHeight(3)
+            line.setStyleSheet("background: #4CAF50; border: none; border-radius: 1px;")
+            # 插入到布局中
+            layout.insertWidget(idx, line)
+            self._drag_insert_line = line
+            self._drag_insert_idx = idx
+
+    def _clear_drop_indicator(self):
+        """清除插入位置指示线。"""
+        if self._drag_insert_line is not None:
+            self._drag_insert_line.deleteLater()
+            self._drag_insert_line = None
+        self._drag_insert_idx = -1
+
+
 class BubbleTomographyGUI(QMainWindow):
     """气泡三维层析重建系统主窗口"""
 
@@ -1018,6 +1901,9 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_worker_thread = None
         self._piv2d_last_result: Optional[dict] = None
         self._piv2d_last_image: Optional[np.ndarray] = None
+
+        # 工作目录
+        self._work_dir: str = ""
 
         self._init_ui()
         self._create_menubar()
@@ -1145,8 +2031,22 @@ class BubbleTomographyGUI(QMainWindow):
         # 默认选中图像处理
         self._nav_buttons["image_editor"].setChecked(True)
 
+        # === 文件树面板（导航栏右侧） ===
+        self._file_tree_panel = FileTreePanel()
+        self._file_tree_panel.setFixedWidth(self._sp(220))
+        self._file_tree_panel.image_selected.connect(self._on_filetree_image_selected)
+        self._file_tree_panel.group_selected.connect(self._on_filetree_image_selected)
+
+        # === 图片预览面板（最右侧）===
+        self._preview_panel = ImagePreviewPanel()
+        self._preview_panel.setFixedWidth(self._sp(320))
+        self._file_tree_panel.image_selected.connect(self._preview_panel.load_image)
+        self._file_tree_panel.group_selected.connect(self._preview_panel.load_image)
+
         main_layout.addWidget(self._nav_panel)
+        main_layout.addWidget(self._file_tree_panel)
         main_layout.addWidget(self.content_stack, stretch=1)
+        main_layout.addWidget(self._preview_panel)
 
         # 连接导航切换
         self._nav_btn_group.buttonClicked.connect(self._on_nav_changed)
@@ -1166,18 +2066,84 @@ class BubbleTomographyGUI(QMainWindow):
         line.setStyleSheet("color: #4a6785;")
         return line
 
-    def _on_nav_changed(self, btn):
-        """左侧导航切换"""
-        page_map = {
-            "相机标定": 0,
-            "气泡重建": 1,
-            "单相机3D重建": 2,
-            "Particle / PIV": 3,
-            "二维PIV": 4,
-            "图像处理": 5,
-        }
-        idx = page_map.get(btn.text(), 0)
-        self.content_stack.setCurrentIndex(idx)
+    # 注：_on_nav_changed 定义在文件末尾（使用正确的页面索引映射）
+
+    def _set_work_directory(self):
+        """设置工作目录，并刷新文件树。"""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择工作目录",
+            self._work_dir or os.path.expanduser("~"),
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        if directory:
+            self._work_dir = directory
+            self._file_tree_panel.set_work_dir(directory)
+            self.statusBar().showMessage(f"工作目录已设置: {directory}")
+
+    def _on_filetree_image_selected(self, img_path: str):
+        """文件树点击图片时，在右侧当前页面中加载预览（通用处理）。"""
+        if not os.path.isfile(img_path):
+            return
+        # 若当前在图像处理页面，则直接加载到图像处理预览
+        current_idx = self.content_stack.currentIndex()
+        try:
+            if current_idx == 0:  # 图像处理页（已移动到 index 0）
+                if hasattr(self, 'ie_single_path') and hasattr(self, '_ie_load_orig_preview'):
+                    self.ie_single_path = img_path
+                    if hasattr(self, 'ie_single_label'):
+                        self.ie_single_label.setText(os.path.basename(img_path))
+                        self.ie_single_label.setStyleSheet("")
+                    self._ie_load_orig_preview(img_path)
+                    if hasattr(self, '_ie_request_preview'):
+                        self._ie_request_preview()
+                    return
+        except Exception:
+            pass
+        # 其他情况：弹出一个简易图像查看对话框
+        self._show_image_viewer(img_path)
+
+    def _show_image_viewer(self, img_path: str):
+        """弹出独立图像查看窗口（用于文件树预览）。"""
+        from PyQt5.QtWidgets import QDialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle(os.path.basename(img_path))
+        dlg.resize(800, 600)
+        layout = QVBoxLayout(dlg)
+
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        try:
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                if img.ndim == 2:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.ndim == 3 and img.shape[2] == 4:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                elif img.ndim == 3 and img.shape[2] == 1:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                else:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                h, w, ch = img_rgb.shape
+                # 使用 .tobytes() 创建数据副本，避免 numpy 数组被 GC 后 QImage 引用悬垂指针
+                qimg = QImage(img_rgb.data.tobytes(), w, h, w * ch, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(qimg)
+                scaled = pix.scaled(780, 560, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                label.setPixmap(scaled)
+            else:
+                label.setText("无法读取图像")
+        except Exception as e:
+            label.setText(f"预览失败: {e}")
+
+        layout.addWidget(label)
+        info = QLabel(img_path)
+        info.setStyleSheet("color: #888; font-size: 10px;")
+        info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info)
+        dlg.exec_()
+        return
 
     def _create_menubar(self):
         """创建菜单栏。"""
@@ -1185,6 +2151,14 @@ class BubbleTomographyGUI(QMainWindow):
 
         # ===== 文件菜单 =====
         file_menu = menubar.addMenu("文件(&F)")
+
+        # --- 设置工作目录（最顶部） ---
+        set_workdir_action = QAction("设置工作目录(&W)...", self)
+        set_workdir_action.setShortcut("Ctrl+W")
+        set_workdir_action.triggered.connect(self._set_work_directory)
+        file_menu.addAction(set_workdir_action)
+
+        file_menu.addSeparator()
 
         save_calib = QAction("保存标定...", self)
         save_calib.setShortcut("Ctrl+S")
@@ -1261,94 +2235,321 @@ class BubbleTomographyGUI(QMainWindow):
         help_menu.addAction(about_action)
 
     def _apply_global_style(self):
-        """应用全局样式。"""
+        """应用全局样式 — DaVis 10 深色主题。"""
         self.setStyleSheet(self._scale_stylesheet("""
             /* === 全局字体 === */
             * {
                 font-family: "Microsoft YaHei", "SimHei", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
+            /* === DaVis 深色主题核心 === */
             QMainWindow {
-                font-size: 13px;
+                background-color: #1e1e1e;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #ddd;
             }
             QMenuBar {
+                background-color: #2b2b2b;
+                color: #ddd;
+                border-bottom: 1px solid #444;
                 font-size: 13px;
                 padding: 2px;
             }
             QMenuBar::item {
                 padding: 4px 12px;
+                background: transparent;
+            }
+            QMenuBar::item:selected {
+                background: #3c3c3c;
+                border-radius: 3px;
             }
             QMenu {
+                background-color: #2b2b2b;
+                color: #ddd;
+                border: 1px solid #444;
                 font-size: 13px;
             }
             QMenu::item {
                 padding: 5px 30px 5px 20px;
             }
+            QMenu::item:selected {
+                background-color: #3c3c3c;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #444;
+                margin: 4px 10px;
+            }
             QStatusBar {
+                background-color: #2b2b2b;
+                color: #aaa;
+                border-top: 1px solid #444;
                 font-size: 12px;
             }
             QGroupBox {
                 font-size: 13px;
                 font-weight: bold;
-                border: 1px solid #ccc;
+                color: #ccc;
+                border: 1px solid #444;
                 border-radius: 5px;
                 margin-top: 10px;
                 padding-top: 15px;
+                background-color: #2b2b2b;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 5px;
+                color: #ccc;
             }
             QLabel {
                 font-size: 13px;
+                color: #ddd;
+                background-color: transparent;
             }
             QPushButton {
                 font-size: 13px;
                 padding: 5px 14px;
+                background-color: #3c3c3c;
+                color: #ddd;
+                border: 1px solid #555;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                border-color: #666;
+            }
+            QPushButton:pressed {
+                background-color: #555;
+            }
+            QPushButton:disabled {
+                background-color: #333;
+                color: #666;
             }
             QLineEdit {
                 font-size: 13px;
                 padding: 4px 8px;
+                background-color: #3c3c3c;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
             }
             QComboBox {
                 font-size: 13px;
                 padding: 4px 8px;
+                background-color: #3c3c3c;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #3c3c3c;
+                color: #eee;
+                border: 1px solid #555;
+                selection-background-color: #4a4a4a;
             }
             QSpinBox, QDoubleSpinBox {
                 font-size: 13px;
                 padding: 3px 6px;
+                background-color: #3c3c3c;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
             }
             QTextEdit {
                 font-size: 12px;
+                background-color: #1e1e1e;
+                color: #ccc;
+                border: 1px solid #444;
+                border-radius: 4px;
             }
             QListWidget {
                 font-size: 13px;
+                background-color: #1e1e1e;
+                color: #ddd;
+                border: 1px solid #444;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 3px;
+            }
+            QListWidget::item:selected {
+                background-color: #3c3c3c;
+                color: #fff;
+            }
+            QListWidget::item:hover {
+                background-color: #333;
             }
             QSlider::groove:horizontal {
+                background: #555;
                 height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #42A5F5;
             }
             QProgressBar {
                 font-size: 12px;
+                background-color: #2b2b2b;
+                border: 1px solid #444;
+                border-radius: 4px;
+                text-align: center;
+                color: #ddd;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 3px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #444;
+                background-color: #2b2b2b;
             }
             QTabWidget::tab {
                 font-size: 13px;
                 padding: 6px 16px;
+                background-color: #333;
+                color: #aaa;
+                border: 1px solid #444;
+                border-bottom: none;
+                border-radius: 4px 4px 0 0;
+                margin-right: 2px;
+            }
+            QTabWidget::tab:selected {
+                background-color: #3c3c3c;
+                color: #fff;
+            }
+            QTabWidget::tab:hover {
+                background-color: #444;
             }
             QToolBar {
                 font-size: 13px;
+                background-color: #2b2b2b;
+                border-bottom: 1px solid #444;
+                spacing: 4px;
+                padding: 2px;
             }
             QScrollArea {
                 font-size: 13px;
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background: #2b2b2b;
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #555;
+                border-radius: 4px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #666;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #2b2b2b;
+                height: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #555;
+                border-radius: 4px;
+                min-width: 30px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #666;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QSplitter::handle {
+                background: #444;
+            }
+            QSplitter::handle:horizontal {
+                width: 2px;
+            }
+            QSplitter::handle:vertical {
+                height: 2px;
+            }
+            QCheckBox {
+                color: #ddd;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid #666;
+                background: #3c3c3c;
+            }
+            QCheckBox::indicator:checked {
+                background: #4CAF50;
+                border-color: #4CAF50;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #888;
+            }
+            QRadioButton {
+                color: #ddd;
+                spacing: 6px;
+            }
+            QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                border: 1px solid #666;
+                background: #3c3c3c;
+            }
+            QRadioButton::indicator:checked {
+                background: #2196F3;
+                border-color: #2196F3;
+            }
+            QToolTip {
+                background-color: #3c3c3c;
+                color: #eee;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QTreeWidget {
+                background-color: #1e1e1e;
+                color: #ddd;
+                border: 1px solid #444;
+                border-radius: 4px;
+            }
+            QTreeWidget::item {
+                padding: 2px;
+            }
+            QTreeWidget::item:selected {
+                background-color: #3c3c3c;
+            }
+            QTreeWidget::item:hover {
+                background-color: #333;
+            }
+            QHeaderView::section {
+                background-color: #333;
+                color: #ddd;
+                border: 1px solid #444;
+                padding: 4px;
             }
         """))
 
-    def _navigate_to(self, page_idx):
-        """窗口菜单导航辅助"""
-        self.content_stack.setCurrentIndex(page_idx)
-        nav_keys = ["calibration", "reconstruction", "raytrace", "particle", "piv2d", "image_editor"]
-        if page_idx < len(nav_keys):
-            self._nav_buttons[nav_keys[page_idx]].setChecked(True)
+    # 注：_navigate_to 定义在文件末尾（使用正确的页面索引映射）
 
     def _open_pdf_manual(self):
         pdf_path, _ = QFileDialog.getOpenFileName(
@@ -1368,21 +2569,7 @@ class BubbleTomographyGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "打开失败", f"无法打开PDF说明?\n{e}")
 
-    def _clear_current_log(self):
-        """清空当前页面的日志区"""
-        page_idx = self.content_stack.currentIndex()
-        if page_idx == 0:
-            self.calib_result_text.clear()
-        elif page_idx == 1:
-            self.recon_log.clear()
-        elif page_idx == 2:
-            self.rt_log.clear()
-        elif page_idx == 3:
-            self.piv_log.clear()
-        elif page_idx == 4:
-            self.piv2d_log.clear()
-        elif page_idx == 5:
-            self.ie_log.clear()
+    # 注：_clear_current_log 定义在文件末尾（使用正确的页面索引映射）
 
     def _show_about(self):
         """显示关于对话框。"""
@@ -2768,116 +3955,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.single_calib_label.setText(f"单相机标定: 已加载 {len(self._single_calib_files)} 张图像，可在预览区域右键打开标尺")
         self._refresh_calibration_preview(selected_key="single_camera")
 
-    def _run_single_calibration_legacy(self):
-        """执行单相机标定。"""
-        if not hasattr(self, '_single_calib_files') or not self._single_calib_files:
-            QMessageBox.warning(self, "警告", "请先加载标定图像")
-            return
-        if len(self._single_calib_files) < 3:
-            QMessageBox.warning(self, "警告", "至少需要 3 张标定图像")
-            return
-
-        import cv2
-
-        pattern_map = {
-            "checkerboard (棋盘格)": "checkerboard",
-            "circles (对称圆点阵)": "circles",
-            "acircles (非对称圆点阵)": "acircles",
-            "volume_dots (体标定板点阵)": "volume_dots",
-        }
-        pattern_type = pattern_map.get(
-            self.pattern_type_combo.currentText(), "checkerboard"
-        )
-        pattern_size = (
-            self.pattern_w_spin.value(), self.pattern_h_spin.value()
-        )
-        square_size = self.square_size_spin.value()
-
-        # 生成标定板物理坐?
-        objp = np.zeros(
-            (pattern_size[0] * pattern_size[1], 3), np.float32
-        )
-        objp[:, :2] = np.mgrid[
-            0:pattern_size[0], 0:pattern_size[1]
-        ].T.reshape(-1, 2) * square_size
-
-        obj_points = []
-        img_points = []
-
-        for fpath in self._single_calib_files:
-            img = cv2.imread(fpath)
-            if img is None:
-                continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            if pattern_type == "checkerboard":
-                ret, corners = cv2.findChessboardCorners(
-                    gray, pattern_size, None
-                )
-                if ret:
-                    corners = cv2.cornerSubPix(
-                        gray, corners, (11, 11), (-1, -1),
-                        criteria=(cv2.TERM_CRITERIA_EPS +
-                                  cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-                    )
-                    obj_points.append(objp)
-                    img_points.append(corners)
-            else:
-                flags = (
-                    cv2.CALIB_CB_SYMMETRIC_GRID if pattern_type == "circles"
-                    else cv2.CALIB_CB_ASYMMETRIC_GRID
-                )
-                ret, centers = cv2.findCirclesGrid(
-                    gray, pattern_size, flags=flags
-                )
-                if ret:
-                    obj_points.append(objp)
-                    img_points.append(centers)
-
-        if len(obj_points) < 3:
-            QMessageBox.warning(self, "警告",
-                "能成功检测点的图像不足 3 张，请检查图像质量")
-            return
-
-        h, w = cv2.imread(self._single_calib_files[0]).shape[:2]
-        rms, camera_matrix, dist_coeffs, rvecs, tvecs = \
-            cv2.calibrateCamera(
-                obj_points, img_points, (w, h), None, None
-            )
-
-        self.single_camera_params = {
-            'camera_matrix': camera_matrix.tolist(),
-            'dist_coeffs': dist_coeffs.flatten().tolist(),
-            'rms': float(rms),
-            'image_size': [w, h],
-            'rvecs': [r.flatten().tolist() for r in rvecs],
-            'tvecs': [t.flatten().tolist() for t in tvecs],
-            'n_images': len(obj_points)
-        }
-
-        report = (
-            f"=== 单相机标定完?===\n\n"
-            f"图像数量: {len(obj_points)}\n"
-            f"图像尺寸: {w} x {h}\n"
-            f"重投影?(RMS): {rms:.4f} px\n\n"
-            f"--- 内参矩阵 ---\n"
-            f"fx={camera_matrix[0,0]:.2f}  fy={camera_matrix[1,1]:.2f}\n"
-            f"cx={camera_matrix[0,2]:.2f}  cy={camera_matrix[1,2]:.2f}\n\n"
-            f"--- 畸变系数 ---\n"
-            f"k1={dist_coeffs[0,0]:.6f}\n"
-            f"k2={dist_coeffs[0,1]:.6f}\n"
-            f"p1={dist_coeffs[0,2]:.6f}\n"
-            f"p2={dist_coeffs[0,3]:.6f}\n"
-            f"k3={dist_coeffs[0,4]:.6f}\n\n"
-            f"标定结果已保存，叔于单相机射线追踪三维重建?"
-        )
-        self.calib_result_text.setPlainText(report)
-        self.statusBar().showMessage(
-            f"单相机标定完? RMS={rms:.4f}px"
-        )
-        QMessageBox.information(self, "完成",
-            f"单相机标定完?\nRMS请: {rms:.4f} px\n"
-            "可用于单相机 3D 重建模块。")
+    # 注：_run_single_calibration_legacy 的完整实现在本文件后面（使用 MultiCameraCalibrator）
 
     def _run_single_calibration_legacy(self):
         """执行单相机标定，支持棋盘格和圆点标定板。"""
@@ -4274,32 +5352,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._nav_buttons["reconstruction"].setChecked(True)
         self._show_image(summary_path)
 
-    def _show_image(self, path):
-        """在当前活动页面的预览区显示图像。"""
-        pixmap = QPixmap(path)
-        page_idx = self.content_stack.currentIndex()
-        if page_idx == 0:
-            self.calib_preview_label.show_static_image(path, title=os.path.basename(path))
-        elif page_idx == 1:
-            self.proj_preview_label.setPixmap(pixmap.scaled(
-                self.proj_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
-        elif page_idx == 2:
-            self.rt_preview_label.setPixmap(pixmap.scaled(
-                self.rt_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
-        elif page_idx == 3:
-            self.piv_preview.setPixmap(pixmap.scaled(
-                self.piv_preview.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
-        elif page_idx == 4:
-            self.piv2d_result_preview.setPixmap(pixmap.scaled(
-                self.piv2d_result_preview.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
-        elif page_idx == 5:
-            self.ie_preview_label.setPixmap(pixmap.scaled(
-                self.ie_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+    # 注：_show_image 定义在文件末尾（使用正确的页面索引映射）
 
     def _show_particle_viz(self):
         """粒子追踪页面：显示粒子 3D 位置。"""
@@ -4612,10 +5665,11 @@ class BubbleTomographyGUI(QMainWindow):
             new_w, new_h = int(w * scale), int(h * scale)
             if len(img.shape) == 2:
                 arr = (img * 255).astype(np.uint8)
-                qimg = QImage(arr.data, w, h, w, QImage.Format_Grayscale8)
+                # 使用 .tobytes() 创建数据副本，避免 numpy 数组被 GC 后 QImage 引用悬垂指针
+                qimg = QImage(arr.data.tobytes(), w, h, w, QImage.Format_Grayscale8)
             else:
                 arr = (img * 255).astype(np.uint8)
-                qimg = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
+                qimg = QImage(arr.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg).scaled(
                 new_w, new_h, Qt.KeepAspectRatio)
             self.rt_img_preview.setPixmap(pixmap)
@@ -6028,11 +7082,11 @@ class BubbleTomographyGUI(QMainWindow):
         )
 
     # ------------------------------------------------------------
-    #  通用图像处理页面（Page 5）
+    #  通用图像处理页面（Page 5）— DaVis 10 风格三栏布局
     # ------------------------------------------------------------
 
     def _create_image_editor_page(self):
-        """创建图像处理页面：单张预览 + 批量处理。"""
+        """创建图像处理页面：DaVis 10 风格三栏布局。"""
         from utils.image_editor import ImageEditor as _IE
 
         page = QWidget()
@@ -6040,451 +7094,1171 @@ class BubbleTomographyGUI(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        body_splitter = QSplitter(Qt.Horizontal)
-
-        # File and directory selectors
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFixedWidth(self._sp(380))
-
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
-        left_layout.setSpacing(self._sp(4))
-
-        # 文件 / 目录选择
-        src_group = QGroupBox("📂 输入")
-        src_layout = QGridLayout(src_group)
-
-        src_layout.addWidget(QLabel("处理模式:"), 0, 0)
-        self.ie_mode_combo = QComboBox()
-        self.ie_mode_combo.addItems(["单张图像", "批量目录"])
-        self.ie_mode_combo.currentIndexChanged.connect(self._ie_on_mode_changed)
-        src_layout.addWidget(self.ie_mode_combo, 0, 1)
-
-        # 单张模式
-        self.ie_single_widget = QWidget()
-        sg_lay = QVBoxLayout(self.ie_single_widget)
-        sg_lay.setContentsMargins(0, 0, 0, 0)
-        btn_open_single = QPushButton("📄 选择图像文件...")
-        btn_open_single.clicked.connect(self._ie_open_single)
-        sg_lay.addWidget(btn_open_single)
-        self.ie_single_label = QLabel("未选择文件")
-        self.ie_single_label.setWordWrap(True)
-        self.ie_single_label.setStyleSheet("color: gray;")
-        sg_lay.addWidget(self.ie_single_label)
-        src_layout.addWidget(self.ie_single_widget, 1, 0, 1, 2)
-
-        # 批量模式
-        self.ie_batch_widget = QWidget()
-        bg_lay = QGridLayout(self.ie_batch_widget)
-        bg_lay.setContentsMargins(0, 0, 0, 0)
-        btn_src_dir = QPushButton("输入目录...")
-        btn_src_dir.clicked.connect(self._ie_pick_src_dir)
-        bg_lay.addWidget(btn_src_dir, 0, 0)
-        self.ie_src_label = QLabel("未选择")
-        self.ie_src_label.setStyleSheet("color: gray;")
-        self.ie_src_label.setWordWrap(True)
-        bg_lay.addWidget(self.ie_src_label, 1, 0)
-        btn_dst_dir = QPushButton("输出目录...")
-        btn_dst_dir.clicked.connect(self._ie_pick_dst_dir)
-        bg_lay.addWidget(btn_dst_dir, 2, 0)
-        self.ie_dst_label = QLabel("未选择")
-        self.ie_dst_label.setStyleSheet("color: gray;")
-        self.ie_dst_label.setWordWrap(True)
-        bg_lay.addWidget(self.ie_dst_label, 3, 0)
-        src_layout.addWidget(self.ie_batch_widget, 1, 0, 1, 2)
-        self.ie_batch_widget.hide()
-
-        left_layout.addWidget(src_group)
-
-        # 处理步骤列表（拖拽排序 + checkbox）
-        pipeline_group = QGroupBox("处理步骤（拖拽排序，勾选启用）")
-        pg_lay = QVBoxLayout(pipeline_group)
-
-        self.ie_step_list = QListWidget()
-        self.ie_step_list.setDragDropMode(QAbstractItemView.InternalMove)
-        self.ie_step_list.setDefaultDropAction(Qt.MoveAction)
-        self.ie_step_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.ie_step_list.setAlternatingRowColors(True)
-        self.ie_step_list.setMaximumHeight(self._sp(180))
-        self.ie_step_list.currentRowChanged.connect(self._ie_on_step_selected)
-        self.ie_step_list.model().rowsMoved.connect(self._ie_on_step_reordered)
-        self.ie_step_list.itemChanged.connect(lambda _: self._ie_request_preview())
-
-        # 初?5 骤（全部勾）
-        for step_key in _IE.ALL_STEPS:
-            item = QListWidgetItem(f"  {_IE.STEP_LABELS[step_key]}")
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
-            item.setCheckState(Qt.Checked)
-            item.setData(Qt.UserRole, step_key)   # Store step key
-            self.ie_step_list.addItem(item)
-
-        pg_lay.addWidget(self.ie_step_list)
-        left_layout.addWidget(pipeline_group)
-
-        # Parameter panel
-        module_group = QGroupBox("🧩 模块参数")
-        module_layout = QVBoxLayout(module_group)
-        module_hint = QLabel("上方流程列表用于勾选启用和拖拽排序；下方页签用于调整各模块参数。")
-        module_hint.setWordWrap(True)
-        module_hint.setStyleSheet("color: #666;")
-        module_layout.addWidget(module_hint)
-
-        self.ie_param_tabs = QTabWidget()
-        self.ie_param_tabs.currentChanged.connect(self._ie_on_param_tab_changed)
-        self._build_crop_param_page()       # index 0
-        self._build_gray_param_page()       # index 1
-        self._build_mirror_param_page()     # index 2
-        self._build_rotate_param_page()     # index 3
-        self._build_bit_depth_param_page()  # index 4
-        self._build_gray_math_param_page()  # index 5
-        self._build_bc_param_page()         # index 6
-        self._build_arith_param_page()      # index 7
-        self._build_threshold_param_page()  # index 8
-        module_layout.addWidget(self.ie_param_tabs)
-        left_layout.addWidget(module_group)
-        self.ie_step_list.setCurrentRow(0)
-
-        # Single-image preview
-        action_group = QGroupBox("执行")
-        ag2_lay = QVBoxLayout(action_group)
-
-        btn_save_single = QPushButton("💾 保存处理结果（单张）")
-        btn_save_single.setStyleSheet(
-            f"QPushButton {{ background-color: #388E3C; color: white; "
-            f"padding: {self._sp(6)}px; border-radius: 5px; font-size: {self._sp(13)}px; }}"
-            f"QPushButton:hover {{ background-color: #2E7D32; }}"
+        # ===== 顶部工具栏 =====
+        toolbar = QFrame()
+        toolbar.setFixedHeight(self._sp(42))
+        toolbar.setStyleSheet(
+            "QFrame { background: #2b2b2b; border-bottom: 1px solid #444; }"
+            "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 4px 10px; font-size: 12px; }"
+            "QPushButton:hover { background: #505050; }"
+            "QPushButton:pressed { background: #606060; }"
+            "QPushButton:disabled { background: #333; color: #666; }"
+            "QLabel { color: #ccc; font-size: 12px; }"
         )
-        btn_save_single.clicked.connect(self._ie_save_single)
-        ag2_lay.addWidget(btn_save_single)
+        tb_lay = QHBoxLayout(toolbar)
+        tb_lay.setContentsMargins(self._sp(8), self._sp(4), self._sp(8), self._sp(4))
 
-        self.ie_batch_run_btn = QPushButton("批量处理所有图像")
-        self.ie_batch_run_btn.setStyleSheet(
-            f"QPushButton {{ background-color: #E64A19; color: white; "
-            f"padding: {self._sp(6)}px; border-radius: 5px; font-size: {self._sp(13)}px; }}"
-            f"QPushButton:hover {{ background-color: #BF360C; }}"
-            f"QPushButton:disabled {{ background-color: #888; color: #ccc; }}"
+        self.ie_run_btn = QPushButton("处理")
+        self.ie_run_btn.setFixedWidth(self._sp(80))
+        self.ie_run_btn.setStyleSheet(
+            "QPushButton { background: #2196F3; color: white; border: none; "
+            "  border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #1976D2; }"
+            "QPushButton:disabled { background: #555; color: #888; }"
         )
-        self.ie_batch_run_btn.clicked.connect(self._ie_run_batch)
-        ag2_lay.addWidget(self.ie_batch_run_btn)
+        self.ie_run_btn.clicked.connect(self._ie_do_preview)
+        tb_lay.addWidget(self.ie_run_btn)
 
-        self.ie_stop_btn = QPushButton("停止批量")
+        self.ie_stop_btn = QPushButton("■ 停止")
+        self.ie_stop_btn.setFixedWidth(self._sp(80))
         self.ie_stop_btn.setEnabled(False)
         self.ie_stop_btn.clicked.connect(self._ie_stop_batch)
-        ag2_lay.addWidget(self.ie_stop_btn)
+        tb_lay.addWidget(self.ie_stop_btn)
 
-        self.ie_progress_bar = QProgressBar()
-        self.ie_progress_bar.setValue(0)
-        self.ie_progress_bar.setVisible(False)
-        ag2_lay.addWidget(self.ie_progress_bar)
+        self.ie_reset_btn = QPushButton("↺ 重置")
+        self.ie_reset_btn.setFixedWidth(self._sp(80))
+        self.ie_reset_btn.clicked.connect(self._ie_reset_workflow)
+        tb_lay.addWidget(self.ie_reset_btn)
 
-        left_layout.addWidget(action_group)
-        left_layout.addStretch()
+        tb_lay.addSpacing(self._sp(16))
 
-        left_scroll.setWidget(left_panel)
+        # 缩放控件
+        tb_lay.addWidget(QLabel("缩放:"))
+        self.ie_zoom_out_btn = QPushButton("−")
+        self.ie_zoom_out_btn.setFixedSize(self._sp(28), self._sp(28))
+        self.ie_zoom_out_btn.clicked.connect(lambda: self._ie_zoom(-1))
+        tb_lay.addWidget(self.ie_zoom_out_btn)
 
-        # Original and processed preview
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        self.ie_zoom_label = QLabel("100%")
+        self.ie_zoom_label.setFixedWidth(self._sp(50))
+        self.ie_zoom_label.setAlignment(Qt.AlignCenter)
+        tb_lay.addWidget(self.ie_zoom_label)
 
-        preview_splitter = QSplitter(Qt.Vertical)
+        self.ie_zoom_in_btn = QPushButton("+")
+        self.ie_zoom_in_btn.setFixedSize(self._sp(28), self._sp(28))
+        self.ie_zoom_in_btn.clicked.connect(lambda: self._ie_zoom(1))
+        tb_lay.addWidget(self.ie_zoom_in_btn)
 
-        # 原图 / 处理?对比
-        img_compare = QWidget()
-        compare_layout = QHBoxLayout(img_compare)
-        compare_layout.setContentsMargins(0, 0, 0, 0)
+        self.ie_fit_btn = QPushButton("适应窗口")
+        self.ie_fit_btn.clicked.connect(lambda: self._ie_zoom(0))
+        tb_lay.addWidget(self.ie_fit_btn)
 
-        orig_wrap = QGroupBox("原图")
-        orig_lay = QVBoxLayout(orig_wrap)
-        self.ie_orig_label = QLabel("（未加载）")
-        self.ie_orig_label.setAlignment(Qt.AlignCenter)
-        self.ie_orig_label.setMinimumSize(self._sp(300), self._sp(240))
-        self.ie_orig_label.setStyleSheet("border: 1px solid #ccc; background: #f8f8f8;")
-        orig_lay.addWidget(self.ie_orig_label)
-        compare_layout.addWidget(orig_wrap)
+        tb_lay.addStretch()
 
-        result_wrap = QGroupBox("处理结果（实时预览）")
-        result_lay = QVBoxLayout(result_wrap)
-        self.ie_preview_label = QLabel("（未处理）")
-        self.ie_preview_label.setAlignment(Qt.AlignCenter)
-        self.ie_preview_label.setMinimumSize(self._sp(300), self._sp(240))
-        self.ie_preview_label.setStyleSheet("border: 1px solid #ccc; background: #f8f8f8;")
-        result_lay.addWidget(self.ie_preview_label)
-        compare_layout.addWidget(result_wrap)
+        # 输入模式切换
+        self.ie_mode_combo = QComboBox()
+        self.ie_mode_combo.addItems(["单张图像", "批量目录"])
+        self.ie_mode_combo.setStyleSheet(
+            "QComboBox { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 3px 8px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView { background: #3c3c3c; color: #ddd; "
+            "  selection-background-color: #505050; }"
+        )
+        self.ie_mode_combo.currentIndexChanged.connect(self._ie_on_mode_changed)
+        tb_lay.addWidget(self.ie_mode_combo)
 
-        preview_splitter.addWidget(img_compare)
+        outer.addWidget(toolbar)
 
-        # 日志
-        self.ie_log = QTextEdit()
-        self.ie_log.setReadOnly(True)
-        self.ie_log.setPlaceholderText("操作日志将在此显示...")
-        self.ie_log.setMaximumHeight(self._sp(150))
-        preview_splitter.addWidget(self.ie_log)
-        preview_splitter.setSizes([400, 150])
+        # ===== 三栏主体 =====
+        body_splitter = QSplitter(Qt.Horizontal)
+        body_splitter.setStyleSheet("QSplitter::handle { background: #444; width: 2px; }")
 
-        right_layout.addWidget(preview_splitter)
+        # --- 左栏：操作面板 ---
+        ops_panel = self._ie_create_ops_panel(_IE)
+        body_splitter.addWidget(ops_panel)
 
-        body_splitter.addWidget(left_scroll)
-        body_splitter.addWidget(right_panel)
-        body_splitter.setSizes([self._sp(380), self._sp(700)])
+        # --- 中栏：工作流画布 ---
+        canvas_widget = self._ie_create_workflow_canvas(_IE)
+        body_splitter.addWidget(canvas_widget)
 
+        # --- 右栏：查看器区域 ---
+        viewer_widget = self._ie_create_viewer_area()
+        body_splitter.addWidget(viewer_widget)
+
+        body_splitter.setSizes([self._sp(220), self._sp(320), self._sp(520)])
         outer.addWidget(body_splitter, stretch=1)
+
         self.content_stack.addWidget(page)
 
         # 实时预览定时器（防抖）
         self._ie_preview_timer = QTimer(self)
         self._ie_preview_timer.setSingleShot(True)
-        self._ie_preview_timer.setInterval(300)  # 300ms 防抖
+        self._ie_preview_timer.setInterval(300)
         self._ie_preview_timer.timeout.connect(self._ie_do_preview)
 
-    # Parameter page builders
+        # 初始化工作流节点
+        self._ie_init_workflow_nodes(_IE)
 
-    def _build_crop_param_page(self):
-        """裁剪参数。"""
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        # 缩放状态
+        self._ie_zoom_level = 100
 
+    # ===== DaVis 风格子组件 =====
+
+    def _ie_create_ops_panel(self, _IE):
+        """左栏：操作面板 — 搜索框 + 可折叠算法分组。"""
+        panel = QWidget()
+        panel.setStyleSheet(
+            "QWidget { background: #2b2b2b; }"
+            "QLabel { color: #ccc; }"
+            "QLineEdit { background: #3c3c3c; color: #eee; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 5px 8px; }"
+            "QLineEdit::placeholder { color: #888; }"
+            "QGroupBox { color: #aaa; border: none; border-top: 1px solid #444; "
+            "  margin-top: 12px; padding-top: 16px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+        )
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
+        lay.setSpacing(self._sp(4))
+
+        # 搜索框
+        self.ie_ops_search = QLineEdit()
+        self.ie_ops_search.setPlaceholderText("🔍 搜索算法...")
+        self.ie_ops_search.textChanged.connect(self._ie_filter_ops)
+        lay.addWidget(self.ie_ops_search)
+
+        # 可滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: #2b2b2b; }"
+            "QScrollBar:vertical { background: #2b2b2b; width: 6px; }"
+            "QScrollBar::handle:vertical { background: #555; border-radius: 3px; }"
+        )
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(self._sp(2))
+
+        # 算法分组定义
+        algo_groups = {
+            "📐 几何变换": [
+                ("crop", "裁剪 (ROI)", "设置感兴趣区域"),
+                ("mirror", "镜像翻转", "水平/垂直镜像"),
+                ("rotate", "旋转", "90°/180°/自定义角度"),
+            ],
+            "🎨 灰度处理": [
+                ("gray", "灰度转换", "彩色→8-bit灰度"),
+                ("bit_depth", "位深转换", "24/16/12位→8位"),
+                ("gray_math", "灰度运算", "平均/log/exp/sqrt/sqr"),
+            ],
+            "☀️ 图像增强": [
+                ("bc", "亮度/对比度", "调整α/β参数"),
+                ("threshold", "阈值化", "全局/大津/自适应"),
+            ],
+            "🔢 运算处理": [
+                ("arithmetic", "图像加减", "标量或双图运算"),
+            ],
+        }
+
+        self._ie_algo_cards = {}  # key -> card widget
+        for group_name, algos in algo_groups.items():
+            group_box = QGroupBox(group_name)
+            group_box.setCheckable(True)
+            group_box.setChecked(True)
+            g_lay = QVBoxLayout(group_box)
+            g_lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+            g_lay.setSpacing(self._sp(2))
+
+            for key, label, desc in algos:
+                card = self._ie_make_algo_card(key, label, desc)
+                g_lay.addWidget(card)
+                self._ie_algo_cards[key] = card
+
+            scroll_lay.addWidget(group_box)
+
+        scroll_lay.addStretch()
+        scroll.setWidget(scroll_content)
+        lay.addWidget(scroll, stretch=1)
+
+        panel.setFixedWidth(self._sp(220))
+        return panel
+
+    def _ie_make_algo_card(self, key, label, desc):
+        """创建单个算法卡片（可点击添加 / 可拖拽到画布）。"""
+        card = _IEAlgoCard(key, label, desc, self._sp)
+        card.add_requested.connect(self._ie_add_node)
+        return card
+
+    def _ie_create_workflow_canvas(self, _IE):
+        """中栏：工作流画布 — 垂直节点卡片流，支持拖拽添加和节点排序。"""
+        canvas = _IEWorkflowCanvas(self._sp)
+        canvas.setStyleSheet("background: #1e1e1e;")
+        canvas.node_drop_requested.connect(self._ie_add_node)
+        canvas.node_move_requested.connect(self._ie_move_node)
+        c_lay = QVBoxLayout(canvas)
+        c_lay.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
+        c_lay.setSpacing(0)
+
+        # 标题
+        title = QLabel("⚙ 工作流")
+        title.setStyleSheet(
+            "color: #ccc; font-size: 14px; font-weight: bold; "
+            "padding: 4px; border: none;"
+        )
+        c_lay.addWidget(title)
+
+        # 可滚动节点区域
+        self.ie_canvas_scroll = QScrollArea()
+        self.ie_canvas_scroll.setWidgetResizable(True)
+        self.ie_canvas_scroll.setStyleSheet(
+            "QScrollArea { border: none; background: #1e1e1e; }"
+            "QScrollBar:vertical { background: #1e1e1e; width: 6px; }"
+            "QScrollBar::handle:vertical { background: #555; border-radius: 3px; }"
+        )
+
+        self.ie_canvas_content = QWidget()
+        self.ie_canvas_layout = QVBoxLayout(self.ie_canvas_content)
+        self.ie_canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self.ie_canvas_layout.setSpacing(0)
+        self.ie_canvas_layout.addStretch()
+
+        self.ie_canvas_scroll.setWidget(self.ie_canvas_content)
+        c_lay.addWidget(self.ie_canvas_scroll, stretch=1)
+
+        # 节点引用列表
+        self._ie_workflow_nodes = {}  # key -> node widget
+
+        return canvas
+
+    def _ie_create_viewer_area(self):
+        """右栏：查看器区域 — 上下分割源图/结果。"""
+        viewer = QWidget()
+        viewer.setStyleSheet("background: #1e1e1e;")
+        v_lay = QVBoxLayout(viewer)
+        v_lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        v_lay.setSpacing(0)
+
+        # 输入源选择区域
+        source_bar = QFrame()
+        source_bar.setStyleSheet(
+            "QFrame { background: #2b2b2b; border-radius: 4px; border: none; }"
+            "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 3px 10px; font-size: 11px; }"
+            "QPushButton:hover { background: #505050; }"
+            "QLabel { color: #aaa; font-size: 11px; border: none; }"
+        )
+        sb_lay = QHBoxLayout(source_bar)
+        sb_lay.setContentsMargins(self._sp(6), self._sp(4), self._sp(6), self._sp(4))
+
+        sb_lay.addWidget(QLabel("数据源:"))
+
+        # 单张模式控件
+        self.ie_single_widget = QWidget()
+        sg_lay = QHBoxLayout(self.ie_single_widget)
+        sg_lay.setContentsMargins(0, 0, 0, 0)
+        btn_open_single = QPushButton("📄 选择图像")
+        btn_open_single.clicked.connect(self._ie_open_single)
+        sg_lay.addWidget(btn_open_single)
+        self.ie_single_label = QLabel("未选择文件")
+        self.ie_single_label.setStyleSheet("color: #888; border: none;")
+        sg_lay.addWidget(self.ie_single_label)
+        sb_lay.addWidget(self.ie_single_widget)
+
+        # 批量模式控件
+        self.ie_batch_widget = QWidget()
+        bg_lay = QHBoxLayout(self.ie_batch_widget)
+        bg_lay.setContentsMargins(0, 0, 0, 0)
+        btn_src_dir = QPushButton("输入目录")
+        btn_src_dir.clicked.connect(self._ie_pick_src_dir)
+        bg_lay.addWidget(btn_src_dir)
+        self.ie_src_label = QLabel("未选择")
+        self.ie_src_label.setStyleSheet("color: #888; border: none;")
+        bg_lay.addWidget(self.ie_src_label)
+        btn_dst_dir = QPushButton("输出目录")
+        btn_dst_dir.clicked.connect(self._ie_pick_dst_dir)
+        bg_lay.addWidget(btn_dst_dir)
+        self.ie_dst_label = QLabel("未选择")
+        self.ie_dst_label.setStyleSheet("color: #888; border: none;")
+        bg_lay.addWidget(self.ie_dst_label)
+        sb_lay.addWidget(self.ie_batch_widget)
+        self.ie_batch_widget.hide()
+
+        # 保存/批量按钮
+        sb_lay.addStretch()
+        self.ie_batch_run_btn = QPushButton("▶ 批量处理")
+        self.ie_batch_run_btn.setStyleSheet(
+            "QPushButton { background: #E64A19; color: white; border: none; "
+            "  border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #BF360C; }"
+            "QPushButton:disabled { background: #555; color: #888; }"
+        )
+        self.ie_batch_run_btn.clicked.connect(self._ie_run_batch)
+        sb_lay.addWidget(self.ie_batch_run_btn)
+
+        btn_save_single = QPushButton("💾 保存")
+        btn_save_single.setStyleSheet(
+            "QPushButton { background: #388E3C; color: white; border: none; "
+            "  border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #2E7D32; }"
+        )
+        btn_save_single.clicked.connect(self._ie_save_single)
+        sb_lay.addWidget(btn_save_single)
+
+        # 文件名模式行
+        fname_bar = QFrame()
+        fname_bar.setStyleSheet(
+            "QFrame { background: #2b2b2b; border-radius: 3px; border: none; }"
+            "QLabel { color: #aaa; font-size: 11px; border: none; }"
+            "QLineEdit { background: #3c3c3c; color: #eee; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 2px 6px; font-size: 11px; }"
+            "QLineEdit:focus { border: 1px solid #2196F3; }"
+        )
+        fb_lay = QHBoxLayout(fname_bar)
+        fb_lay.setContentsMargins(self._sp(6), self._sp(2), self._sp(6), self._sp(2))
+
+        fb_lay.addWidget(QLabel("输出文件名:"))
+
+        self.ie_filename_edit = QLineEdit()
+        self.ie_filename_edit.setPlaceholderText("{original}_processed")
+        self.ie_filename_edit.setToolTip(
+            "支持占位符:\n"
+            "{original} - 原文件名（不含扩展名）\n"
+            "{index} - 帧序号（批量时）\n"
+            "{step} - 处理步骤名\n"
+            "{date} - 当前日期 YYYYMMDD"
+        )
+        self.ie_filename_edit.setStyleSheet(
+            "QLineEdit { background: #3c3c3c; color: #eee; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 2px 6px; font-size: 11px; }"
+            "QLineEdit:focus { border: 1px solid #2196F3; }"
+        )
+        fb_lay.addWidget(self.ie_filename_edit, stretch=1)
+
+        v_lay.addWidget(source_bar)
+        v_lay.addWidget(fname_bar)
+
+        # 上下分割的图像查看器
+        viewer_splitter = QSplitter(Qt.Vertical)
+        viewer_splitter.setStyleSheet(
+            "QSplitter::handle { background: #444; height: 2px; }"
+        )
+
+        # 源图区
+        orig_frame = QFrame()
+        orig_frame.setStyleSheet(
+            "QFrame { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; }"
+        )
+        of_lay = QVBoxLayout(orig_frame)
+        of_lay.setContentsMargins(self._sp(2), self._sp(2), self._sp(2), self._sp(2))
+
+        orig_header = QLabel("📷 源图像")
+        orig_header.setStyleSheet(
+            "color: #4CAF50; font-size: 12px; font-weight: bold; "
+            "padding: 2px 6px; background: #2b2b2b; border-radius: 2px; border: none;"
+        )
+        of_lay.addWidget(orig_header)
+
+        self.ie_orig_label = _IEImageViewer("（未加载）", self._sp)
+        self.ie_orig_label.setMinimumSize(self._sp(300), self._sp(200))
+        self.ie_orig_label.setStyleSheet(
+            "border: 1px solid #333; background: #111; color: #666; font-size: 13px;"
+        )
+        of_lay.addWidget(self.ie_orig_label, stretch=1)
+
+        # 坐标/像素值信息条
+        self.ie_orig_info_bar = QLabel("")
+        self.ie_orig_info_bar.setFixedHeight(self._sp(18))
+        self.ie_orig_info_bar.setStyleSheet(
+            "color: #aaa; font-size: 10px; background: #222; "
+            "padding: 0 6px; border: none;"
+        )
+        # 鼠标移动时更新坐标信息
+        self.ie_orig_label.pixel_hover.connect(
+            lambda x, y, v: self.ie_orig_info_bar.setText(
+                f"  坐标: ({x}, {y})    像素值: {v}" if x >= 0 else "")
+        )
+        of_lay.addWidget(self.ie_orig_info_bar)
+
+        # 颜色条
+        self.ie_orig_colorbar = _IEColorbarWidget(self._sp)
+        self.ie_orig_colorbar.setFixedHeight(self._sp(20))
+        of_lay.addWidget(self.ie_orig_colorbar)
+
+        viewer_splitter.addWidget(orig_frame)
+
+        # 结果图区
+        result_frame = QFrame()
+        result_frame.setStyleSheet(
+            "QFrame { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; }"
+        )
+        rf_lay = QVBoxLayout(result_frame)
+        rf_lay.setContentsMargins(self._sp(2), self._sp(2), self._sp(2), self._sp(2))
+
+        result_header = QLabel("🔬 处理结果")
+        result_header.setStyleSheet(
+            "color: #2196F3; font-size: 12px; font-weight: bold; "
+            "padding: 2px 6px; background: #2b2b2b; border-radius: 2px; border: none;"
+        )
+        rf_lay.addWidget(result_header)
+
+        self.ie_preview_label = _IEImageViewer("（未处理）", self._sp)
+        self.ie_preview_label.setMinimumSize(self._sp(300), self._sp(200))
+        self.ie_preview_label.setStyleSheet(
+            "border: 1px solid #333; background: #111; color: #666; font-size: 13px;"
+        )
+        rf_lay.addWidget(self.ie_preview_label, stretch=1)
+
+        # 坐标/像素值信息条
+        self.ie_result_info_bar = QLabel("")
+        self.ie_result_info_bar.setFixedHeight(self._sp(18))
+        self.ie_result_info_bar.setStyleSheet(
+            "color: #aaa; font-size: 10px; background: #222; "
+            "padding: 0 6px; border: none;"
+        )
+        self.ie_preview_label.pixel_hover.connect(
+            lambda x, y, v: self.ie_result_info_bar.setText(
+                f"  坐标: ({x}, {y})    像素值: {v}" if x >= 0 else "")
+        )
+        rf_lay.addWidget(self.ie_result_info_bar)
+
+        # 颜色条
+        self.ie_result_colorbar = _IEColorbarWidget(self._sp)
+        self.ie_result_colorbar.setFixedHeight(self._sp(20))
+        rf_lay.addWidget(self.ie_result_colorbar)
+
+        viewer_splitter.addWidget(result_frame)
+
+        viewer_splitter.setSizes([self._sp(300), self._sp(300)])
+        v_lay.addWidget(viewer_splitter, stretch=1)
+
+        # 帧导航栏（批量模式浏览多帧）
+        frame_nav = QFrame()
+        frame_nav.setStyleSheet(
+            "QFrame { background: #2b2b2b; border-radius: 3px; border: none; }"
+            "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 2px 8px; font-size: 11px; min-width: 24px; }"
+            "QPushButton:hover { background: #505050; }"
+            "QPushButton:disabled { background: #333; color: #555; }"
+            "QLabel { color: #aaa; font-size: 11px; border: none; }"
+            "QSlider::groove:horizontal { background: #555; height: 4px; }"
+            "QSlider::handle:horizontal { background: #2196F3; width: 12px; "
+            "  margin: -4px 0; border-radius: 6px; }"
+        )
+        fn_lay = QHBoxLayout(frame_nav)
+        fn_lay.setContentsMargins(self._sp(6), self._sp(2), self._sp(6), self._sp(2))
+
+        fn_lay.addWidget(QLabel("帧:"))
+        self.ie_frame_first_btn = QPushButton("⏮")
+        self.ie_frame_first_btn.clicked.connect(lambda: self._ie_navigate_frame('first'))
+        fn_lay.addWidget(self.ie_frame_first_btn)
+
+        self.ie_frame_prev_btn = QPushButton("◀")
+        self.ie_frame_prev_btn.clicked.connect(lambda: self._ie_navigate_frame('prev'))
+        fn_lay.addWidget(self.ie_frame_prev_btn)
+
+        self.ie_frame_slider = QSlider(Qt.Horizontal)
+        self.ie_frame_slider.setRange(0, 0)
+        self.ie_frame_slider.setValue(0)
+        self.ie_frame_slider.valueChanged.connect(self._ie_on_frame_slider)
+        fn_lay.addWidget(self.ie_frame_slider, stretch=1)
+
+        self.ie_frame_next_btn = QPushButton("▶")
+        self.ie_frame_next_btn.clicked.connect(lambda: self._ie_navigate_frame('next'))
+        fn_lay.addWidget(self.ie_frame_next_btn)
+
+        self.ie_frame_last_btn = QPushButton("⏭")
+        self.ie_frame_last_btn.clicked.connect(lambda: self._ie_navigate_frame('last'))
+        fn_lay.addWidget(self.ie_frame_last_btn)
+
+        self.ie_frame_label = QLabel("0 / 0")
+        self.ie_frame_label.setFixedWidth(self._sp(70))
+        self.ie_frame_label.setAlignment(Qt.AlignCenter)
+        fn_lay.addWidget(self.ie_frame_label)
+
+        # 播放按钮
+        self.ie_frame_play_btn = QPushButton("▶ 播放")
+        self.ie_frame_play_btn.setCheckable(True)
+        self.ie_frame_play_btn.clicked.connect(self._ie_toggle_frame_play)
+        fn_lay.addWidget(self.ie_frame_play_btn)
+
+        # FPS
+        self.ie_fps_spin = QSpinBox()
+        self.ie_fps_spin.setRange(1, 60)
+        self.ie_fps_spin.setValue(10)
+        self.ie_fps_spin.setFixedWidth(self._sp(45))
+        self.ie_fps_spin.setStyleSheet(
+            "QSpinBox { background: #3c3c3c; color: #eee; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 1px 3px; }"
+        )
+        fn_lay.addWidget(QLabel("FPS:"))
+        fn_lay.addWidget(self.ie_fps_spin)
+
+        v_lay.addWidget(frame_nav)
+
+        # 帧播放定时器
+        self._ie_frame_timer = QTimer(self)
+        self._ie_frame_timer.setInterval(100)
+        self._ie_frame_timer.timeout.connect(lambda: self._ie_navigate_frame('next'))
+
+        # 批量帧列表
+        self._ie_batch_files = []
+
+        # 进度条
+        self.ie_progress_bar = QProgressBar()
+        self.ie_progress_bar.setValue(0)
+        self.ie_progress_bar.setVisible(False)
+        self.ie_progress_bar.setStyleSheet(
+            "QProgressBar { background: #2b2b2b; border: none; border-radius: 2px; "
+            "  text-align: center; color: #ddd; height: 16px; }"
+            "QProgressBar::chunk { background: #4CAF50; border-radius: 2px; }"
+        )
+        v_lay.addWidget(self.ie_progress_bar)
+
+        # 日志区
+        self.ie_log = QTextEdit()
+        self.ie_log.setReadOnly(True)
+        self.ie_log.setPlaceholderText("操作日志...")
+        self.ie_log.setMaximumHeight(self._sp(100))
+        self.ie_log.setStyleSheet(
+            "QTextEdit { background: #1a1a1a; color: #aaa; border: 1px solid #333; "
+            "  border-radius: 4px; font-size: 11px; padding: 4px; }"
+        )
+        v_lay.addWidget(self.ie_log)
+
+        return viewer
+
+    # ===== 工作流节点管理 =====
+
+    def _ie_init_workflow_nodes(self, _IE):
+        """初始化默认工作流：数据源节点。"""
+        # 添加数据源节点
+        self._ie_add_data_source_node()
+        # 默认添加所有处理节点
+        for step_key in _IE.ALL_STEPS:
+            self._ie_add_node(step_key, request_preview=False)
+        # 触发一次预览
+        self._ie_request_preview()
+
+    def _ie_add_data_source_node(self):
+        """添加数据源节点（绿色标题栏）。"""
+        node = QFrame()
+        node.setStyleSheet(
+            "QFrame { background: #2b2b2b; border: 1px solid #4CAF50; "
+            "  border-radius: 6px; }"
+        )
+        n_lay = QVBoxLayout(node)
+        n_lay.setContentsMargins(0, 0, 0, 0)
+        n_lay.setSpacing(0)
+
+        # 绿色标题栏
+        title_bar = QFrame()
+        title_bar.setStyleSheet(
+            "QFrame { background: #4CAF50; border-radius: 5px 5px 0 0; }"
+        )
+        tb_lay = QHBoxLayout(title_bar)
+        tb_lay.setContentsMargins(self._sp(8), self._sp(4), self._sp(8), self._sp(4))
+
+        icon = QLabel("📷")
+        icon.setStyleSheet("border: none; font-size: 14px;")
+        tb_lay.addWidget(icon)
+
+        title_lbl = QLabel("<b>数据源</b>")
+        title_lbl.setStyleSheet("color: white; font-size: 12px; border: none;")
+        tb_lay.addWidget(title_lbl)
+        tb_lay.addStretch()
+        n_lay.addWidget(title_bar)
+
+        # 内容区
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(self._sp(8), self._sp(6), self._sp(8), self._sp(6))
+        b_lay.setSpacing(self._sp(2))
+
+        self.ie_source_info = QLabel("未加载图像")
+        self.ie_source_info.setStyleSheet("color: #999; font-size: 11px; border: none;")
+        b_lay.addWidget(self.ie_source_info)
+
+        self.ie_source_dim = QLabel("")
+        self.ie_source_dim.setStyleSheet("color: #888; font-size: 10px; border: none;")
+        b_lay.addWidget(self.ie_source_dim)
+
+        n_lay.addWidget(body)
+
+        # 插入到画布布局（stretch之前）
+        insert_idx = self.ie_canvas_layout.count() - 1  # 最后一个是stretch
+        self.ie_canvas_layout.insertWidget(insert_idx, node)
+        self._ie_data_source_node = node
+
+        # 添加箭头
+        self._ie_add_arrow()
+
+    def _ie_add_node(self, step_key, request_preview=True):
+        """添加处理节点到工作流画布。"""
+        if step_key in self._ie_workflow_nodes:
+            return  # 已存在
+
+        from utils.image_editor import ImageEditor as _IE
+        label = _IE.STEP_LABELS.get(step_key, step_key)
+
+        node = QFrame()
+        node.setProperty("step_key", step_key)
+        node.setStyleSheet(
+            "QFrame { background: #2b2b2b; border: 1px solid #2196F3; "
+            "  border-radius: 6px; }"
+        )
+        n_lay = QVBoxLayout(node)
+        n_lay.setContentsMargins(0, 0, 0, 0)
+        n_lay.setSpacing(0)
+
+        # 蓝色标题栏
+        title_bar = QFrame()
+        title_bar.setStyleSheet(
+            "QFrame { background: #2196F3; border-radius: 5px 5px 0 0; }"
+        )
+        tb_lay = QHBoxLayout(title_bar)
+        tb_lay.setContentsMargins(self._sp(8), self._sp(4), self._sp(8), self._sp(4))
+
+        # 启用/禁用 checkbox
+        enable_check = QCheckBox()
+        enable_check.setChecked(True)
+        enable_check.setStyleSheet(
+            "QCheckBox { border: none; spacing: 0; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; }"
+            "QCheckBox::indicator:unchecked { background: #555; border: 1px solid #777; border-radius: 2px; }"
+            "QCheckBox::indicator:checked { background: #4CAF50; border: 1px solid #4CAF50; border-radius: 2px; }"
+        )
+        enable_check.stateChanged.connect(lambda s, k=step_key: self._ie_toggle_node(k, s))
+        tb_lay.addWidget(enable_check)
+
+        title_lbl = QLabel(f"<b>{label}</b>")
+        title_lbl.setStyleSheet("color: white; font-size: 12px; border: none;")
+        tb_lay.addWidget(title_lbl)
+        tb_lay.addStretch()
+
+        # 删除按钮
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(self._sp(20), self._sp(20))
+        del_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #ccc; border: none; "
+            "  font-size: 14px; font-weight: bold; }"
+            "QPushButton:hover { color: #ff5252; }"
+        )
+        del_btn.clicked.connect(lambda _, k=step_key: self._ie_remove_node(k))
+        tb_lay.addWidget(del_btn)
+
+        n_lay.addWidget(title_bar)
+
+        # 内容区
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(self._sp(8), self._sp(6), self._sp(8), self._sp(6))
+        b_lay.setSpacing(self._sp(2))
+
+        # 参数显示（简要）
+        param_summary = self._ie_get_param_summary(step_key)
+        param_lbl = QLabel(param_summary)
+        param_lbl.setStyleSheet("color: #bbb; font-size: 11px; border: none;")
+        param_lbl.setWordWrap(True)
+        param_lbl.setProperty("param_summary", True)
+        b_lay.addWidget(param_lbl)
+
+        # 输出名
+        output_row = QHBoxLayout()
+        output_row.setSpacing(self._sp(4))
+        output_lbl = QLabel("输出:")
+        output_lbl.setStyleSheet("color: #888; font-size: 10px; border: none;")
+        output_row.addWidget(output_lbl)
+        output_name = QLabel(f"img_{step_key}")
+        output_name.setStyleSheet(
+            "color: #4CAF50; font-size: 10px; border: none; "
+            "background: #1e1e1e; padding: 1px 4px; border-radius: 2px;"
+        )
+        output_row.addWidget(output_name)
+        output_row.addStretch()
+        b_lay.addLayout(output_row)
+
+        # 进度条
+        progress = QProgressBar()
+        progress.setValue(0)
+        progress.setFixedHeight(self._sp(4))
+        progress.setStyleSheet(
+            "QProgressBar { background: #1e1e1e; border: none; border-radius: 2px; }"
+            "QProgressBar::chunk { background: #4CAF50; border-radius: 2px; }"
+        )
+        progress.setVisible(False)
+        b_lay.addWidget(progress)
+
+        # 编辑参数按钮
+        edit_btn = QPushButton("编辑参数...")
+        edit_btn.setStyleSheet(
+            "QPushButton { background: #383838; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 2px 8px; font-size: 11px; }"
+            "QPushButton:hover { background: #505050; }"
+        )
+        edit_btn.clicked.connect(lambda _, k=step_key: self._ie_edit_node_params(k))
+        b_lay.addWidget(edit_btn)
+
+        n_lay.addWidget(body)
+
+        # 插入到画布（stretch之前，箭头之后）
+        insert_idx = self.ie_canvas_layout.count() - 1
+        self.ie_canvas_layout.insertWidget(insert_idx, node)
+
+        # 添加箭头
+        self._ie_add_arrow()
+
+        self._ie_workflow_nodes[step_key] = {
+            "widget": node,
+            "enable_check": enable_check,
+            "progress": progress,
+            "param_label": param_lbl,
+        }
+
+        if request_preview:
+            self._ie_request_preview()
+
+    def _ie_remove_node(self, step_key):
+        """从工作流移除节点。"""
+        if step_key not in self._ie_workflow_nodes:
+            return
+
+        info = self._ie_workflow_nodes.pop(step_key)
+        widget = info["widget"]
+        # 找到widget在layout中的index，同时移除其后的箭头
+        idx = self.ie_canvas_layout.indexOf(widget)
+        if idx >= 0:
+            # 移除箭头（在节点之后，stretch之前）
+            arrow_idx = idx + 1
+            if arrow_idx < self.ie_canvas_layout.count():
+                arrow_item = self.ie_canvas_layout.itemAt(arrow_idx)
+                if arrow_item and arrow_item.widget():
+                    arrow_item.widget().deleteLater()
+
+        widget.deleteLater()
+        self._ie_request_preview()
+
+    def _ie_toggle_node(self, step_key, state):
+        """启用/禁用节点。"""
+        if step_key not in self._ie_workflow_nodes:
+            return
+        info = self._ie_workflow_nodes[step_key]
+        enabled = (state == Qt.Checked)
+        # 视觉反馈：改变边框颜色
+        border_color = "#2196F3" if enabled else "#555"
+        opacity = "1.0" if enabled else "0.5"
+        info["widget"].setStyleSheet(
+            f"QFrame {{ background: #2b2b2b; border: 1px solid {border_color}; "
+            f"  border-radius: 6px; opacity: {opacity}; }}"
+        )
+        self._ie_request_preview()
+
+    def _ie_add_arrow(self):
+        """在工作流中添加向下箭头。"""
+        arrow = QLabel("▼")
+        arrow.setAlignment(Qt.AlignCenter)
+        arrow.setFixedHeight(self._sp(18))
+        arrow.setStyleSheet(
+            "color: #666; font-size: 14px; background: transparent; border: none;"
+        )
+        insert_idx = self.ie_canvas_layout.count() - 1
+        self.ie_canvas_layout.insertWidget(insert_idx, arrow)
+
+    def _ie_get_param_summary(self, step_key):
+        """获取步骤参数的简要描述。"""
+        cfg = self.ie_config
+        summaries = {
+            "crop": f"ROI: ({cfg.crop.x}, {cfg.crop.y}) {cfg.crop.w}×{cfg.crop.h}",
+            "gray": "彩色 → 8-bit 灰度",
+            "mirror": f"模式: {['水平', '垂直', '水平+垂直'][['horizontal', 'vertical', 'both'].index(cfg.mirror.mode)]}",
+            "rotate": f"方式: {cfg.rotate.mode}" + (f" {cfg.rotate.angle}°" if cfg.rotate.mode == 'custom' else ''),
+            "bit_depth": f"源位深: {cfg.bit_depth.source_bits or '自动'}",
+            "gray_math": f"运算: {cfg.gray_math.operation}" + (f" k={cfg.gray_math.kernel_size}" if cfg.gray_math.operation == 'average' else ''),
+            "bc": f"α={cfg.bc.alpha:.1f}, β={cfg.bc.beta}",
+            "arithmetic": f"{cfg.arithmetic.operation}" + (f" val={cfg.arithmetic.scalar_value}" if not cfg.arithmetic.operand_path else " 双图"),
+            "threshold": f"模式: {cfg.threshold.mode} T={cfg.threshold.threshold_value}",
+        }
+        return summaries.get(step_key, "")
+
+    def _ie_edit_node_params(self, step_key):
+        """弹出参数编辑对话框。"""
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox
+        from utils.image_editor import ImageEditor as _IE
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"编辑参数 — {_IE.STEP_LABELS.get(step_key, step_key)}")
+        dialog.setMinimumWidth(self._sp(360))
+        dialog.setStyleSheet(
+            "QDialog { background: #2b2b2b; }"
+            "QLabel { color: #ccc; }"
+            "QGroupBox { color: #aaa; border: 1px solid #444; "
+            "  margin-top: 12px; padding-top: 16px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+            "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { "
+            "  background: #3c3c3c; color: #eee; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 3px 6px; }"
+            "QCheckBox { color: #ccc; }"
+            "QSlider::groove:horizontal { background: #555; height: 4px; }"
+            "QSlider::handle:horizontal { background: #2196F3; width: 12px; "
+            "  margin: -4px 0; border-radius: 6px; }"
+        )
+
+        d_lay = QVBoxLayout(dialog)
+
+        # 构建参数控件（复用现有逻辑）
+        param_widget = QWidget()
+        p_lay = QVBoxLayout(param_widget)
+
+        if step_key == "crop":
+            self._build_crop_param_widget(p_lay)
+        elif step_key == "gray":
+            p_lay.addWidget(QLabel("将图像转换为 8-bit 灰度图（无可调参数）"))
+        elif step_key == "mirror":
+            self._build_mirror_param_widget(p_lay)
+        elif step_key == "rotate":
+            self._build_rotate_param_widget(p_lay)
+        elif step_key == "bit_depth":
+            self._build_bit_depth_param_widget(p_lay)
+        elif step_key == "gray_math":
+            self._build_gray_math_param_widget(p_lay)
+        elif step_key == "bc":
+            self._build_bc_param_widget(p_lay)
+        elif step_key == "arithmetic":
+            self._build_arith_param_widget(p_lay)
+        elif step_key == "threshold":
+            self._build_threshold_param_widget(p_lay)
+
+        p_lay.addStretch()
+        d_lay.addWidget(param_widget)
+
+        # 按钮
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.setStyleSheet(
+            "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
+            "  border-radius: 3px; padding: 5px 16px; }"
+            "QPushButton:hover { background: #505050; }"
+        )
+        btns.accepted.connect(dialog.accept)
+        btns.rejected.connect(dialog.reject)
+        d_lay.addWidget(btns)
+
+        if dialog.exec_() == QDialog.Accepted:
+            self._ie_sync_config_from_ui()
+            # 更新节点参数摘要
+            if step_key in self._ie_workflow_nodes:
+                param_lbl = self._ie_workflow_nodes[step_key]["param_label"]
+                param_lbl.setText(self._ie_get_param_summary(step_key))
+            self._ie_request_preview()
+
+    # ===== 参数构建器（对话框版本，与原Tab版共享控件） =====
+
+    def _build_crop_param_widget(self, layout):
         labels = ["X (px):", "Y (px):", "宽 (px):", "高 (px):"]
-        self.ie_crop_spins = []
+        if not hasattr(self, 'ie_crop_spins'):
+            self.ie_crop_spins = []
         for i, lbl in enumerate(labels):
-            lay.addWidget(QLabel(lbl), i, 0)
-            sp = QSpinBox()
-            sp.setRange(0, 99999)
-            sp.valueChanged.connect(lambda _: self._ie_request_preview())
-            lay.addWidget(sp, i, 1)
-            self.ie_crop_spins.append(sp)
+            if i < len(self.ie_crop_spins):
+                layout.addWidget(QLabel(lbl))
+                layout.addWidget(self.ie_crop_spins[i])
+            else:
+                layout.addWidget(QLabel(lbl))
+                sp = QSpinBox()
+                sp.setRange(0, 99999)
+                sp.valueChanged.connect(lambda _: self._ie_request_preview())
+                layout.addWidget(sp)
+                self.ie_crop_spins.append(sp)
 
-        self.ie_param_tabs.addTab(widget, "裁剪 (ROI)")
+    def _build_mirror_param_widget(self, layout):
+        layout.addWidget(QLabel("镜像方向:"))
+        if not hasattr(self, 'ie_mirror_combo'):
+            self.ie_mirror_combo = QComboBox()
+            self.ie_mirror_combo.addItems(["水平镜像", "垂直镜像", "水平+垂直"])
+            self.ie_mirror_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_mirror_combo)
 
-    def _build_gray_param_page(self):
-        """灰度参数。"""
-        widget = QWidget()
-        lay = QVBoxLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
-        lay.addWidget(QLabel("将图像转换为 8-bit 灰度图（无可调参数）"))
-        lay.addStretch()
-        self.ie_param_tabs.addTab(widget, "灰度转换")
+    def _build_rotate_param_widget(self, layout):
+        layout.addWidget(QLabel("旋转方式:"))
+        if not hasattr(self, 'ie_rotate_mode_combo'):
+            self.ie_rotate_mode_combo = QComboBox()
+            self.ie_rotate_mode_combo.addItems(["顺时针 90°", "逆时针 90°", "180°", "自定义角度"])
+            self.ie_rotate_mode_combo.currentIndexChanged.connect(self._ie_on_rotate_mode_changed)
+        layout.addWidget(self.ie_rotate_mode_combo)
+        layout.addWidget(QLabel("角度:"))
+        if not hasattr(self, 'ie_rotate_angle_spin'):
+            self.ie_rotate_angle_spin = QDoubleSpinBox()
+            self.ie_rotate_angle_spin.setRange(-360.0, 360.0)
+            self.ie_rotate_angle_spin.setSingleStep(1.0)
+            self.ie_rotate_angle_spin.setEnabled(False)
+            self.ie_rotate_angle_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_rotate_angle_spin)
+        if not hasattr(self, 'ie_rotate_expand_check'):
+            self.ie_rotate_expand_check = QCheckBox("自动扩展画布")
+            self.ie_rotate_expand_check.setChecked(True)
+            self.ie_rotate_expand_check.stateChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_rotate_expand_check)
+        layout.addWidget(QLabel("边界灰度:"))
+        if not hasattr(self, 'ie_rotate_border_spin'):
+            self.ie_rotate_border_spin = QSpinBox()
+            self.ie_rotate_border_spin.setRange(0, 255)
+            self.ie_rotate_border_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_rotate_border_spin)
 
-    def _build_mirror_param_page(self):
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
-        lay.addWidget(QLabel("镜像方向:"), 0, 0)
-        self.ie_mirror_combo = QComboBox()
-        self.ie_mirror_combo.addItems(["水平镜像", "垂直镜像", "水平+垂直"])
-        self.ie_mirror_combo.currentIndexChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_mirror_combo, 0, 1)
-        self.ie_param_tabs.addTab(widget, "图像镜像")
+    def _build_bit_depth_param_widget(self, layout):
+        layout.addWidget(QLabel("源位深:"))
+        if not hasattr(self, 'ie_bit_depth_combo'):
+            self.ie_bit_depth_combo = QComboBox()
+            self.ie_bit_depth_combo.addItems(["自动识别", "24 位", "16 位", "12 位"])
+            self.ie_bit_depth_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_bit_depth_combo)
 
-    def _build_rotate_param_page(self):
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
-        lay.addWidget(QLabel("旋转方式:"), 0, 0)
-        self.ie_rotate_mode_combo = QComboBox()
-        self.ie_rotate_mode_combo.addItems(["顺时针 90°", "逆时针 90°", "180°", "自定义角度"])
-        self.ie_rotate_mode_combo.currentIndexChanged.connect(self._ie_on_rotate_mode_changed)
-        lay.addWidget(self.ie_rotate_mode_combo, 0, 1)
-        lay.addWidget(QLabel("角度:"), 1, 0)
-        self.ie_rotate_angle_spin = QDoubleSpinBox()
-        self.ie_rotate_angle_spin.setRange(-360.0, 360.0)
-        self.ie_rotate_angle_spin.setSingleStep(1.0)
-        self.ie_rotate_angle_spin.setEnabled(False)
-        self.ie_rotate_angle_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_rotate_angle_spin, 1, 1)
-        self.ie_rotate_expand_check = QCheckBox("自动扩展画布")
-        self.ie_rotate_expand_check.setChecked(True)
-        self.ie_rotate_expand_check.stateChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_rotate_expand_check, 2, 0, 1, 2)
-        lay.addWidget(QLabel("边界灰度:"), 3, 0)
-        self.ie_rotate_border_spin = QSpinBox()
-        self.ie_rotate_border_spin.setRange(0, 255)
-        self.ie_rotate_border_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_rotate_border_spin, 3, 1)
-        self.ie_param_tabs.addTab(widget, "图像旋转")
+    def _build_gray_math_param_widget(self, layout):
+        layout.addWidget(QLabel("计算方式:"))
+        if not hasattr(self, 'ie_gray_math_combo'):
+            self.ie_gray_math_combo = QComboBox()
+            self.ie_gray_math_combo.addItems(["平均", "log", "exp", "sqrt", "sqr"])
+            self.ie_gray_math_combo.currentIndexChanged.connect(self._ie_on_gray_math_changed)
+        layout.addWidget(self.ie_gray_math_combo)
+        layout.addWidget(QLabel("平均核大小:"))
+        if not hasattr(self, 'ie_gray_math_kernel_spin'):
+            self.ie_gray_math_kernel_spin = QSpinBox()
+            self.ie_gray_math_kernel_spin.setRange(1, 99)
+            self.ie_gray_math_kernel_spin.setSingleStep(2)
+            self.ie_gray_math_kernel_spin.setValue(3)
+            self.ie_gray_math_kernel_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_gray_math_kernel_spin)
 
-    def _build_bit_depth_param_page(self):
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
-        lay.addWidget(QLabel("源位深:"), 0, 0)
-        self.ie_bit_depth_combo = QComboBox()
-        self.ie_bit_depth_combo.addItems(["自动识别", "24 位", "16 位", "12 位"])
-        self.ie_bit_depth_combo.currentIndexChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_bit_depth_combo, 0, 1)
-        self.ie_param_tabs.addTab(widget, "转 8 位图")
+    def _build_bc_param_widget(self, layout):
+        layout.addWidget(QLabel("对比度 α:"))
+        if not hasattr(self, 'ie_alpha_spin'):
+            self.ie_alpha_spin = QDoubleSpinBox()
+            self.ie_alpha_spin.setRange(0.1, 5.0)
+            self.ie_alpha_spin.setSingleStep(0.1)
+            self.ie_alpha_spin.setValue(1.0)
+            self.ie_alpha_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_alpha_spin)
+        layout.addWidget(QLabel("亮度 β:"))
+        if not hasattr(self, 'ie_beta_spin'):
+            self.ie_beta_spin = QSpinBox()
+            self.ie_beta_spin.setRange(-255, 255)
+            self.ie_beta_spin.setValue(0)
+            self.ie_beta_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_beta_spin)
+        layout.addWidget(QLabel("α 滑块:"))
+        if not hasattr(self, 'ie_alpha_slider'):
+            self.ie_alpha_slider = QSlider(Qt.Horizontal)
+            self.ie_alpha_slider.setRange(1, 50)
+            self.ie_alpha_slider.setValue(10)
+            self.ie_alpha_slider.valueChanged.connect(self._ie_alpha_slider_moved)
+        layout.addWidget(self.ie_alpha_slider)
+        layout.addWidget(QLabel("β 滑块:"))
+        if not hasattr(self, 'ie_beta_slider'):
+            self.ie_beta_slider = QSlider(Qt.Horizontal)
+            self.ie_beta_slider.setRange(-255, 255)
+            self.ie_beta_slider.setValue(0)
+            self.ie_beta_slider.valueChanged.connect(self._ie_beta_slider_moved)
+        layout.addWidget(self.ie_beta_slider)
 
-    def _build_gray_math_param_page(self):
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
-        lay.addWidget(QLabel("计算方式:"), 0, 0)
-        self.ie_gray_math_combo = QComboBox()
-        self.ie_gray_math_combo.addItems(["平均", "log", "exp", "sqrt", "sqr"])
-        self.ie_gray_math_combo.currentIndexChanged.connect(self._ie_on_gray_math_changed)
-        lay.addWidget(self.ie_gray_math_combo, 0, 1)
-        lay.addWidget(QLabel("平均核大小:"), 1, 0)
-        self.ie_gray_math_kernel_spin = QSpinBox()
-        self.ie_gray_math_kernel_spin.setRange(1, 99)
-        self.ie_gray_math_kernel_spin.setSingleStep(2)
-        self.ie_gray_math_kernel_spin.setValue(3)
-        self.ie_gray_math_kernel_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_gray_math_kernel_spin, 1, 1)
-        self.ie_param_tabs.addTab(widget, "灰度值计算")
+    def _build_arith_param_widget(self, layout):
+        layout.addWidget(QLabel("操作:"))
+        if not hasattr(self, 'ie_arith_combo'):
+            self.ie_arith_combo = QComboBox()
+            self.ie_arith_combo.addItems(["加法 (add)", "减法 (subtract)"])
+            self.ie_arith_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_arith_combo)
+        layout.addWidget(QLabel("操作数来源:"))
+        if not hasattr(self, 'ie_operand_src_combo'):
+            self.ie_operand_src_combo = QComboBox()
+            self.ie_operand_src_combo.addItems(["使用标量值", "使用第二张图像"])
+            self.ie_operand_src_combo.currentIndexChanged.connect(self._ie_on_operand_src_changed)
+        layout.addWidget(self.ie_operand_src_combo)
+        layout.addWidget(QLabel("标量值:"))
+        if not hasattr(self, 'ie_scalar_spin'):
+            self.ie_scalar_spin = QSpinBox()
+            self.ie_scalar_spin.setRange(0, 255)
+            self.ie_scalar_spin.setValue(0)
+            self.ie_scalar_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_scalar_spin)
 
-    def _build_bc_param_page(self):
-        """亮度/对比度参数页。"""
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+    def _build_threshold_param_widget(self, layout):
+        layout.addWidget(QLabel("模式:"))
+        if not hasattr(self, 'ie_thr_mode_combo'):
+            self.ie_thr_mode_combo = QComboBox()
+            self.ie_thr_mode_combo.addItems([
+                "全局阈值 (Global)", "大津法 (Otsu)",
+                "自适应均值 (Adaptive Mean)", "自适应高斯 (Adaptive Gaussian)"
+            ])
+            self.ie_thr_mode_combo.currentIndexChanged.connect(self._ie_on_thr_mode_changed)
+        layout.addWidget(self.ie_thr_mode_combo)
+        layout.addWidget(QLabel("阈值:"))
+        if not hasattr(self, 'ie_thr_val_spin'):
+            self.ie_thr_val_spin = QSpinBox()
+            self.ie_thr_val_spin.setRange(0, 255)
+            self.ie_thr_val_spin.setValue(128)
+            self.ie_thr_val_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_thr_val_spin)
+        if not hasattr(self, 'ie_thr_val_slider'):
+            self.ie_thr_val_slider = QSlider(Qt.Horizontal)
+            self.ie_thr_val_slider.setRange(0, 255)
+            self.ie_thr_val_slider.setValue(128)
+            self.ie_thr_val_slider.valueChanged.connect(self._ie_thr_slider_moved)
+        layout.addWidget(self.ie_thr_val_slider)
+        layout.addWidget(QLabel("最大值:"))
+        if not hasattr(self, 'ie_thr_max_spin'):
+            self.ie_thr_max_spin = QSpinBox()
+            self.ie_thr_max_spin.setRange(1, 255)
+            self.ie_thr_max_spin.setValue(255)
+            self.ie_thr_max_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        layout.addWidget(self.ie_thr_max_spin)
 
-        lay.addWidget(QLabel("对比度 α:"), 0, 0)
-        self.ie_alpha_spin = QDoubleSpinBox()
-        self.ie_alpha_spin.setRange(0.1, 5.0)
-        self.ie_alpha_spin.setSingleStep(0.1)
-        self.ie_alpha_spin.setValue(1.0)
-        self.ie_alpha_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_alpha_spin, 0, 1)
+    # ===== 工作流辅助方法 =====
 
-        lay.addWidget(QLabel("亮度 β:"), 1, 0)
-        self.ie_beta_spin = QSpinBox()
-        self.ie_beta_spin.setRange(-255, 255)
-        self.ie_beta_spin.setValue(0)
-        self.ie_beta_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_beta_spin, 1, 1)
+    def _ie_filter_ops(self, text):
+        """搜索过滤操作面板算法卡片。"""
+        text = text.lower()
+        for key, card in self._ie_algo_cards.items():
+            from utils.image_editor import ImageEditor as _IE
+            label = _IE.STEP_LABELS.get(key, key).lower()
+            visible = text in label or text in key.lower()
+            card.setVisible(visible)
 
-        lay.addWidget(QLabel("α 滑块:"), 2, 0)
-        self.ie_alpha_slider = QSlider(Qt.Horizontal)
-        self.ie_alpha_slider.setRange(1, 50)
-        self.ie_alpha_slider.setValue(10)
-        self.ie_alpha_slider.valueChanged.connect(self._ie_alpha_slider_moved)
-        lay.addWidget(self.ie_alpha_slider, 2, 1)
+    def _ie_reset_workflow(self):
+        """重置工作流到默认状态。"""
+        # 移除所有处理节点
+        keys = list(self._ie_workflow_nodes.keys())
+        for key in keys:
+            self._ie_remove_node(key)
 
-        lay.addWidget(QLabel("β 滑块:"), 3, 0)
-        self.ie_beta_slider = QSlider(Qt.Horizontal)
-        self.ie_beta_slider.setRange(-255, 255)
-        self.ie_beta_slider.setValue(0)
-        self.ie_beta_slider.valueChanged.connect(self._ie_beta_slider_moved)
-        lay.addWidget(self.ie_beta_slider, 3, 1)
+        # 移除数据源节点
+        if hasattr(self, '_ie_data_source_node'):
+            self._ie_data_source_node.deleteLater()
 
-        self.ie_param_tabs.addTab(widget, "亮度/对比度")
+        # 清空画布
+        while self.ie_canvas_layout.count() > 0:
+            item = self.ie_canvas_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-    def _build_arith_param_page(self):
-        """加减法参数页"""
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        self.ie_canvas_layout.addStretch()
+        self._ie_workflow_nodes.clear()
 
-        lay.addWidget(QLabel("操作:"), 0, 0)
-        self.ie_arith_combo = QComboBox()
-        self.ie_arith_combo.addItems(["加法 (add)", "减法 (subtract)"])
-        self.ie_arith_combo.currentIndexChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_arith_combo, 0, 1)
+        # 重新初始化
+        from utils.image_editor import ImageEditor as _IE
+        self._ie_init_workflow_nodes(_IE)
 
-        lay.addWidget(QLabel("操作数来源:"), 1, 0)
-        self.ie_operand_src_combo = QComboBox()
-        self.ie_operand_src_combo.addItems(["使用标量值", "使用第二张图像"])
-        self.ie_operand_src_combo.currentIndexChanged.connect(self._ie_on_operand_src_changed)
-        lay.addWidget(self.ie_operand_src_combo, 1, 1)
+    def _ie_zoom(self, direction):
+        """缩放查看器图像。direction: 1=放大, -1=缩小, 0=适应窗口。"""
+        if direction == 0:
+            self._ie_zoom_level = 100
+        else:
+            self._ie_zoom_level = max(25, min(400, self._ie_zoom_level + direction * 25))
+        self.ie_zoom_label.setText(f"{self._ie_zoom_level}%")
+        # 重新刷新预览
+        self._ie_request_preview()
 
-        lay.addWidget(QLabel("标量值:"), 2, 0)
-        self.ie_scalar_spin = QSpinBox()
-        self.ie_scalar_spin.setRange(0, 255)
-        self.ie_scalar_spin.setValue(0)
-        self.ie_scalar_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_scalar_spin, 2, 1)
+    def _ie_get_step_order(self):
+        """从工作流节点获取已启用的步骤 key 列表（保持画布顺序）。"""
+        order = []
+        for i in range(self.ie_canvas_layout.count()):
+            item = self.ie_canvas_layout.itemAt(i)
+            if item and item.widget():
+                widget = item.widget()
+                step_key = widget.property("step_key")
+                if step_key and step_key in self._ie_workflow_nodes:
+                    info = self._ie_workflow_nodes[step_key]
+                    if info["enable_check"].isChecked():
+                        order.append(step_key)
+        return order
 
-        # 第二张图选择
-        self.ie_operand_widget = QWidget()
-        ow_lay = QVBoxLayout(self.ie_operand_widget)
-        ow_lay.setContentsMargins(0, 0, 0, 0)
-        btn_pick_operand = QPushButton("选择第二张图...")
-        btn_pick_operand.clicked.connect(self._ie_pick_operand)
-        ow_lay.addWidget(btn_pick_operand)
-        self.ie_operand_label = QLabel("未选择")
-        self.ie_operand_label.setStyleSheet("color: gray;")
-        self.ie_operand_label.setWordWrap(True)
-        ow_lay.addWidget(self.ie_operand_label)
-        lay.addWidget(self.ie_operand_widget, 3, 0, 1, 2)
-        self.ie_operand_widget.hide()
+    def _ie_move_node(self, step_key, new_idx):
+        """移动工作流节点到新位置。"""
+        if step_key not in self._ie_workflow_nodes:
+            return
+        info = self._ie_workflow_nodes[step_key]
+        widget = info["widget"]
+        cur_idx = self.ie_canvas_layout.indexOf(widget)
+        if cur_idx < 0 or cur_idx == new_idx:
+            return
 
-        self.ie_param_tabs.addTab(widget, "图像加/减法")
+        # 找到对应的箭头（节点后面紧跟的箭头）
+        arrow_idx = cur_idx + 1
 
-    def _build_threshold_param_page(self):
-        """阈值化参数。"""
-        widget = QWidget()
-        lay = QGridLayout(widget)
-        lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        # 移除节点和箭头
+        self.ie_canvas_layout.removeWidget(widget)
+        if arrow_idx < self.ie_canvas_layout.count():
+            arrow_item = self.ie_canvas_layout.itemAt(arrow_idx)
+            if arrow_item and arrow_item.widget():
+                arrow_widget = arrow_item.widget()
+                self.ie_canvas_layout.removeWidget(arrow_widget)
+            else:
+                arrow_widget = None
+        else:
+            arrow_widget = None
 
-        lay.addWidget(QLabel("模式:"), 0, 0)
-        self.ie_thr_mode_combo = QComboBox()
-        self.ie_thr_mode_combo.addItems([
-            "全局阈值 (Global)",
-            "大津法 (Otsu)",
-            "自适应均值 (Adaptive Mean)",
-            "自适应高斯 (Adaptive Gaussian)"
-        ])
-        self.ie_thr_mode_combo.currentIndexChanged.connect(self._ie_on_thr_mode_changed)
-        lay.addWidget(self.ie_thr_mode_combo, 0, 1)
+        # 重新插入（new_idx 可能因为移除而偏移）
+        target_idx = min(new_idx, self.ie_canvas_layout.count() - 1)  # -1 for stretch
+        self.ie_canvas_layout.insertWidget(target_idx, widget)
+        if arrow_widget:
+            self.ie_canvas_layout.insertWidget(target_idx + 1, arrow_widget)
 
-        lay.addWidget(QLabel("阈值:"), 1, 0)
-        self.ie_thr_val_spin = QSpinBox()
-        self.ie_thr_val_spin.setRange(0, 255)
-        self.ie_thr_val_spin.setValue(128)
-        self.ie_thr_val_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_thr_val_spin, 1, 1)
+        self._ie_request_preview()
 
-        self.ie_thr_val_slider = QSlider(Qt.Horizontal)
-        self.ie_thr_val_slider.setRange(0, 255)
-        self.ie_thr_val_slider.setValue(128)
-        self.ie_thr_val_slider.valueChanged.connect(self._ie_thr_slider_moved)
-        lay.addWidget(self.ie_thr_val_slider, 2, 0, 1, 2)
+    # ===== 帧导航 =====
 
-        lay.addWidget(QLabel("最大值:"), 3, 0)
-        self.ie_thr_max_spin = QSpinBox()
-        self.ie_thr_max_spin.setRange(1, 255)
-        self.ie_thr_max_spin.setValue(255)
-        self.ie_thr_max_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        lay.addWidget(self.ie_thr_max_spin, 3, 1)
+    def _ie_navigate_frame(self, direction):
+        """帧导航：first/prev/next/last。"""
+        n = len(self._ie_batch_files)
+        if n == 0:
+            return
+        cur = self.ie_frame_slider.value()
+        if direction == 'first':
+            cur = 0
+        elif direction == 'prev':
+            cur = max(0, cur - 1)
+        elif direction == 'next':
+            cur = min(n - 1, cur + 1)
+        elif direction == 'last':
+            cur = n - 1
+        self.ie_frame_slider.setValue(cur)
 
-        # Adaptive threshold parameters
-        self.ie_adapt_widget = QWidget()
-        aw_lay = QGridLayout(self.ie_adapt_widget)
-        aw_lay.setContentsMargins(0, 0, 0, 0)
-        aw_lay.addWidget(QLabel("块大小(奇数):"), 0, 0)
-        self.ie_thr_block_spin = QSpinBox()
-        self.ie_thr_block_spin.setRange(3, 199)
-        self.ie_thr_block_spin.setSingleStep(2)
-        self.ie_thr_block_spin.setValue(11)
-        self.ie_thr_block_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        aw_lay.addWidget(self.ie_thr_block_spin, 0, 1)
-        aw_lay.addWidget(QLabel("偏移 C:"), 1, 0)
-        self.ie_thr_c_spin = QSpinBox()
-        self.ie_thr_c_spin.setRange(-50, 50)
-        self.ie_thr_c_spin.setValue(2)
-        self.ie_thr_c_spin.valueChanged.connect(
-            lambda _: self._ie_request_preview())
-        aw_lay.addWidget(self.ie_thr_c_spin, 1, 1)
-        lay.addWidget(self.ie_adapt_widget, 4, 0, 1, 2)
-        self.ie_adapt_widget.hide()
+    def _ie_on_frame_slider(self, idx):
+        """帧滑块变化时加载对应帧。"""
+        n = len(self._ie_batch_files)
+        if n == 0 or idx >= n:
+            return
+        path = self._ie_batch_files[idx]
+        self.ie_single_path = path
+        if hasattr(self, 'ie_single_label'):
+            self.ie_single_label.setText(os.path.basename(path))
+        self._ie_load_orig_preview(path)
+        self._ie_request_preview()
+        self.ie_frame_label.setText(f"{idx + 1} / {n}")
 
-        self.ie_param_tabs.addTab(widget, "闃堝€煎寲")
+    def _ie_toggle_frame_play(self, checked):
+        """播放/暂停帧动画。"""
+        if checked:
+            fps = self.ie_fps_spin.value()
+            self._ie_frame_timer.setInterval(max(16, int(1000 / fps)))
+            self._ie_frame_timer.start()
+            self.ie_frame_play_btn.setText("⏸ 暂停")
+        else:
+            self._ie_frame_timer.stop()
+            self.ie_frame_play_btn.setText("▶ 播放")
+
+    def _ie_update_frame_nav(self):
+        """当帧列表变化时更新帧导航控件。"""
+        n = len(self._ie_batch_files)
+        self.ie_frame_slider.setRange(0, max(0, n - 1))
+        self.ie_frame_slider.setValue(0)
+        self.ie_frame_label.setText(f"{'1' if n > 0 else '0'} / {n}")
+        enabled = n > 0
+        self.ie_frame_first_btn.setEnabled(enabled)
+        self.ie_frame_prev_btn.setEnabled(enabled)
+        self.ie_frame_next_btn.setEnabled(enabled)
+        self.ie_frame_last_btn.setEnabled(enabled)
+        self.ie_frame_slider.setEnabled(enabled)
+        self.ie_frame_play_btn.setEnabled(enabled)
 
     # ------------------------------------------------------------
     # Image editor slots
@@ -6495,42 +8269,13 @@ class BubbleTomographyGUI(QMainWindow):
         single = (idx == 0)
         self.ie_single_widget.setVisible(single)
         self.ie_batch_widget.setVisible(not single)
+        # 更新工具栏运行按钮行为
+        if single:
+            self.ie_run_btn.setText("▶ 预览")
+        else:
+            self.ie_run_btn.setText("▶ 批量处理")
 
-    def _ie_on_step_selected(self, row):
-        """列表选中项变化：切换参数页。"""
-        if row < 0:
-            return
-        step_key = self.ie_step_list.item(row).data(Qt.UserRole)
-        idx_map = {
-            "crop": 0, "gray": 1, "mirror": 2, "rotate": 3,
-            "bit_depth": 4, "gray_math": 5, "bc": 6,
-            "arithmetic": 7, "threshold": 8
-        }
-        tab_idx = idx_map.get(step_key, 0)
-        if self.ie_param_tabs.currentIndex() != tab_idx:
-            self.ie_param_tabs.setCurrentIndex(tab_idx)
-
-    def _ie_on_param_tab_changed(self, idx):
-        """参数页切换时，同步高亮对应的步骤。"""
-        if idx < 0:
-            return
-        step_keys = [
-            "crop", "gray", "mirror", "rotate", "bit_depth", "gray_math",
-            "bc", "arithmetic", "threshold"
-        ]
-        target_key = step_keys[idx]
-        for row in range(self.ie_step_list.count()):
-            item = self.ie_step_list.item(row)
-            if item.data(Qt.UserRole) == target_key:
-                if self.ie_step_list.currentRow() != row:
-                    self.ie_step_list.blockSignals(True)
-                    self.ie_step_list.setCurrentRow(row)
-                    self.ie_step_list.blockSignals(False)
-                break
-
-    def _ie_on_step_reordered(self):
-        """拖拽排序后触发预览。"""
-        self._ie_request_preview()
+    # 旧的 step_list/param_tabs 相关 slot 已移除（DaVis工作流不需要）
 
     def _ie_on_rotate_mode_changed(self, idx):
         self.ie_rotate_angle_spin.setEnabled(idx == 3)
@@ -6590,13 +8335,19 @@ class BubbleTomographyGUI(QMainWindow):
             self._ie_request_preview()
 
     def _ie_load_orig_preview(self, path):
-        """在原图区域显示图像。"""
+        """在原图区域显示图像，同时更新工作流数据源节点信息。"""
         import cv2 as _cv2
         img = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
         if img is None:
             return
         h, w = img.shape[:2]
         self.ie_log.append(f"已加载 {os.path.basename(path)}  ({w}x{h})")
+        # 更新数据源节点信息
+        if hasattr(self, 'ie_source_info'):
+            self.ie_source_info.setText(os.path.basename(path))
+            self.ie_source_info.setStyleSheet("color: #4CAF50; font-size: 11px; border: none;")
+        if hasattr(self, 'ie_source_dim'):
+            self.ie_source_dim.setText(f"{w} × {h}  |  {img.dtype}  |  {img.ndim}D")
         pixmap = self._ie_ndarray_to_pixmap(img)
         if pixmap:
             self.ie_orig_label.setPixmap(
@@ -6608,11 +8359,20 @@ class BubbleTomographyGUI(QMainWindow):
         if d:
             self.ie_src_dir = d
             self.ie_src_label.setText(d)
-            self.ie_src_label.setStyleSheet("")
+            self.ie_src_label.setStyleSheet("color: #ddd;")
             from utils.image_editor import SUPPORTED_EXTS
-            cnt = sum(1 for f in Path(d).iterdir()
-                      if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS)
+            self._ie_batch_files = sorted(
+                str(f) for f in Path(d).iterdir()
+                if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
+            )
+            cnt = len(self._ie_batch_files)
             self.ie_log.append(f"输入目录: {d}  (共 {cnt} 张图像)")
+            self._ie_update_frame_nav()
+            # 自动加载第一帧
+            if cnt > 0:
+                self.ie_single_path = self._ie_batch_files[0]
+                self.ie_single_label.setText(os.path.basename(self.ie_single_path))
+                self._ie_load_orig_preview(self.ie_single_path)
 
     def _ie_pick_dst_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -6622,7 +8382,7 @@ class BubbleTomographyGUI(QMainWindow):
         if d:
             self.ie_dst_dir = d
             self.ie_dst_label.setText(d)
-            self.ie_dst_label.setStyleSheet("")
+            self.ie_dst_label.setStyleSheet("color: #ddd;")
             self.ie_log.append(f"输出目录: {d}")
 
     def _ie_pick_operand(self):
@@ -6634,85 +8394,35 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_operand_label.setText(os.path.basename(path))
             self._ie_request_preview()
 
-    def _ie_get_step_order(self):
-        """从 QListWidget 读取已勾选的步骤 key 列表（保持列表顺序）。"""
-        order = []
-        for i in range(self.ie_step_list.count()):
-            item = self.ie_step_list.item(i)
-            if item.checkState() == Qt.Checked:
-                order.append(item.data(Qt.UserRole))
-        return order
+    # 旧 _ie_get_step_order（基于 ie_step_list）已移除，新版在工作流画布上方定义
 
 
+    # _ie_sync_config_from_ui 已废弃——新工作流通过对话框直接更新 ie_config，
+    # 不再需要从 UI 控件同步。保留空方法以避免其他地方调用时出错。
     def _ie_sync_config_from_ui(self):
-        """从参数面板控件直接同步到 self.ie_config。"""
-        cfg = self.ie_config
+        """已废弃：新工作流通过对话框直接更新 ie_config，无需从 UI 同步。"""
+        pass
 
-        cfg.crop.enabled = True   # 由 step_order 控制是否执行
-        spins = self.ie_crop_spins
-        cfg.crop.x, cfg.crop.y = spins[0].value(), spins[1].value()
-        cfg.crop.w, cfg.crop.h = spins[2].value(), spins[3].value()
-
-        cfg.gray.enabled = True
-        # 灰度无可调参数
-
-        cfg.mirror.enabled = True
-        cfg.mirror.mode = ["horizontal", "vertical", "both"][self.ie_mirror_combo.currentIndex()]
-
-        cfg.rotate.enabled = True
-        rotate_modes = ["cw90", "ccw90", "180", "custom"]
-        cfg.rotate.mode = rotate_modes[self.ie_rotate_mode_combo.currentIndex()]
-        cfg.rotate.angle = self.ie_rotate_angle_spin.value()
-        cfg.rotate.expand = self.ie_rotate_expand_check.isChecked()
-        cfg.rotate.border_value = self.ie_rotate_border_spin.value()
-
-        cfg.bit_depth.enabled = True
-        bit_depth_values = [0, 24, 16, 12]
-        cfg.bit_depth.source_bits = bit_depth_values[self.ie_bit_depth_combo.currentIndex()]
-
-        cfg.gray_math.enabled = True
-        gray_math_ops = ["average", "log", "exp", "sqrt", "sqr"]
-        cfg.gray_math.operation = gray_math_ops[self.ie_gray_math_combo.currentIndex()]
-        cfg.gray_math.kernel_size = self.ie_gray_math_kernel_spin.value()
-
-        cfg.bc.enabled = True
-        cfg.bc.alpha = self.ie_alpha_spin.value()
-        cfg.bc.beta  = self.ie_beta_spin.value()
-
-        cfg.arithmetic.enabled = True
-        cfg.arithmetic.operation = ("add" if self.ie_arith_combo.currentIndex() == 0
-                                    else "subtract")
-        cfg.arithmetic.scalar_value = self.ie_scalar_spin.value()
-        cfg.arithmetic.operand_path = (self.ie_operand_path
-                                        if self.ie_operand_src_combo.currentIndex() == 1
-                                        else "")
-
-        cfg.threshold.enabled = True
-        mode_map = ["global", "otsu", "adaptive_mean", "adaptive_gaussian"]
-        cfg.threshold.mode = mode_map[self.ie_thr_mode_combo.currentIndex()]
-        cfg.threshold.threshold_value = self.ie_thr_val_spin.value()
-        cfg.threshold.max_value = self.ie_thr_max_spin.value()
-        cfg.threshold.block_size = self.ie_thr_block_spin.value()
-        cfg.threshold.C = self.ie_thr_c_spin.value()
+    # 旧的 _ie_sync_config_from_ui 方法已删除（引用了已不存在的旧版 UI 控件）
+    # 如果将来需要，应从 self.ie_config 属性中读取参数。
 
     def _ie_do_preview(self):
-        """实时预览（由 QTimer 触发）。"""
+        """处理（由"处理"按钮触发，不再自动预览）。"""
         import cv2 as _cv2
         if not self.ie_single_path or not os.path.isfile(self.ie_single_path):
             return
 
         step_order = self._ie_get_step_order()
         if not step_order:
-            # 未勾选任何步骤，显示原图
-            # No steps selected; show original image
             self._ie_current_preview = None
             return
 
-        self._ie_sync_config_from_ui()
+        # 不再调用 _ie_sync_config_from_ui()，
+        # 因为新工作流通过对话框直接更新 self.ie_config
         try:
             img = _cv2.imread(self.ie_single_path, _cv2.IMREAD_UNCHANGED)
             op_img = None
-            if self.ie_config.arithmetic.operand_path:
+            if hasattr(self, 'ie_config') and self.ie_config.arithmetic.operand_path:
                 op_img = _cv2.imread(self.ie_config.arithmetic.operand_path,
                                      _cv2.IMREAD_UNCHANGED)
             editor = ImageEditor(self.ie_config)
@@ -6724,34 +8434,90 @@ class BubbleTomographyGUI(QMainWindow):
                     pixmap.scaled(self.ie_preview_label.size(),
                                   Qt.KeepAspectRatio, Qt.SmoothTransformation))
             h, w = result.shape[:2]
+
+            # 更新颜色条
+            if hasattr(self, 'ie_result_colorbar'):
+                vmin, vmax = float(result.min()), float(result.max())
+                self.ie_result_colorbar.set_range(vmin, vmax)
+            if hasattr(self, 'ie_orig_colorbar'):
+                vmin, vmax = float(img.min()), float(img.max())
+                self.ie_orig_colorbar.set_range(vmin, vmax)
+
+            # 更新 image viewer 的原始图像数据（用于鼠标悬停像素值读取）
+            self.ie_preview_label.set_image_data(result)
+            self.ie_orig_label.set_image_data(img)
+
             steps_str = " -> ".join(
                 ImageEditor.STEP_LABELS.get(s, s) for s in step_order)
-            self.ie_log.append(f"预览: {steps_str}  输出: {w}x{h}")
+            self.ie_log.append(f"处理完成: {steps_str}  输出: {w}x{h}")
         except Exception as e:
-            self.ie_log.append(f"预览失败: {e}")
+            self.ie_log.append(f"处理失败: {e}")
+
+    def _ie_resolve_filename(self, original_path, index=None, step_order=None):
+        """根据输出文件名模式生成实际文件名。"""
+        import datetime
+        original = Path(original_path)
+        name = original.stem
+        ext = original.suffix
+
+        pattern = self.ie_filename_edit.text().strip() or "{original}_processed"
+
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        step_str = ""
+        if step_order:
+            step_str = "_".join(
+                ImageEditor.STEP_LABELS.get(s, s) for s in step_order
+            )[:20]  # 防止文件名过长
+
+        result = pattern
+        result = result.replace("{original}", name)
+        result = result.replace("{index}", f"{index:04d}" if index is not None else "0000")
+        result = result.replace("{step}", step_str)
+        result = result.replace("{date}", date_str)
+
+        # 确保有扩展名
+        if not Path(result).suffix:
+            result += ext
+        return result
 
     def _ie_save_single(self):
-        """保存单张处理结果"""
+        """保存单张处理结果（使用文件名模式）。"""
         import cv2 as _cv2
         if self._ie_current_preview is None:
-            QMessageBox.warning(self, "提示", "请先加载图像并调整参数（预览生成后再保存）")
+            QMessageBox.warning(self, "提示", "请先点击\"处理\"生成结果")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存处理结果", "",
-            "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp);;TIFF (*.tif)")
-        if path:
+        # 使用文件名模式自动生成路径
+        if self.ie_single_path:
+            out_name = self._ie_resolve_filename(self.ie_single_path)
+            out_dir = self.ie_dst_dir or os.path.dirname(self.ie_single_path)
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, out_name)
+        else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "保存处理结果", "",
+                "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp);;TIFF (*.tif)")
+            if not path:
+                return
+
+        try:
             _cv2.imwrite(path, self._ie_current_preview)
-            self.ie_log.append(f"已保存 {path}")
+            self.ie_log.append(f"已保存: {os.path.basename(path)}")
             QMessageBox.information(self, "完成", f"已保存至:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))
 
     def _ie_run_batch(self):
-        """启动批量处理。"""
+        """启动批量处理（自动创建输出文件夹）。"""
         if not self.ie_src_dir or not os.path.isdir(self.ie_src_dir):
             QMessageBox.warning(self, "提示", "请先选择输入目录")
             return
+
+        # 自动创建输出文件夹：若未设置则使用 {输入目录}/processed
         if not self.ie_dst_dir:
-            QMessageBox.warning(self, "提示", "请先选择输出目录")
-            return
+            self.ie_dst_dir = os.path.join(self.ie_src_dir, "processed")
+            self.ie_dst_label.setText(self.ie_dst_dir)
+            self.ie_log.append(f"自动设置输出目录: {self.ie_dst_dir}")
+
         os.makedirs(self.ie_dst_dir, exist_ok=True)
 
         step_order = self._ie_get_step_order()
@@ -6759,7 +8525,8 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "请至少勾选一个处理步骤")
             return
 
-        self._ie_sync_config_from_ui()
+        # 不再调用 _ie_sync_config_from_ui()，配置已通过对话框同步到 ie_config
+        filename_pattern = self.ie_filename_edit.text().strip() or "{original}_processed"
 
         self.ie_batch_run_btn.setEnabled(False)
         self.ie_stop_btn.setEnabled(True)
@@ -6769,7 +8536,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_log.append(f"   步骤: {' -> '.join(ImageEditor.STEP_LABELS.get(s, s) for s in step_order)}")
 
         self.ie_worker_thread = self._IEBatchWorker(
-            self.ie_src_dir, self.ie_dst_dir, self.ie_config, step_order)
+            self.ie_src_dir, self.ie_dst_dir,
+            self.ie_config, step_order, filename_pattern)
         self.ie_worker_thread.progress.connect(self._ie_on_batch_progress)
         self.ie_worker_thread.finished.connect(self._ie_on_batch_finished)
         self.ie_worker_thread.error.connect(self._ie_on_batch_error)
@@ -6810,10 +8578,13 @@ class BubbleTomographyGUI(QMainWindow):
         if img.dtype != np.uint8:
             img = np.clip(img.astype(np.float64), 0, 255).astype(np.uint8)
         if img.ndim == 2:
-            img_bgr = _cv2.cvtColor(img, _cv2.COLOR_GRAY2BGR)
+            img_rgb = _cv2.cvtColor(img, _cv2.COLOR_GRAY2RGB)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img_rgb = _cv2.cvtColor(img, _cv2.COLOR_BGRA2RGB)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img_rgb = _cv2.cvtColor(img, _cv2.COLOR_GRAY2RGB)
         else:
-            img_bgr = img
-        img_rgb = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB)
+            img_rgb = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
         h, w, ch = img_rgb.shape
         qimg = QImage(img_rgb.data.tobytes(), w, h, w * ch,
                       QImage.Format_RGB888)
@@ -6896,58 +8667,85 @@ class BubbleTomographyGUI(QMainWindow):
         elif page_idx == 5:
             self._piv2d_set_preview(path, self.piv2d_result_preview)
 
-    class _IEBatchWorker(QThread):
-        progress = pyqtSignal(int, int, str)   # done, total, filename
-        finished = pyqtSignal(int, int)         # success, total
-        error    = pyqtSignal(str)
 
-        def __init__(self, src_dir, dst_dir, config: "ImageEditConfig",
-                     step_order=None):
-            super().__init__()
-            self.src_dir = src_dir
-            self.dst_dir = dst_dir
-            self.config  = config
-            self.step_order = step_order or []
-            self._stop   = False
+def _ie_resolve_batch_filename(original_name, index, step_order, pattern):
+    """为批量处理解析文件名模式。"""
+    import datetime
+    from pathlib import Path
+    p = Path(original_name)
+    name = p.stem
+    ext = p.suffix
+    if not pattern:
+        pattern = "{original}_processed"
+    result = pattern
+    result = result.replace("{original}", name)
+    result = result.replace("{index}", f"{index:04d}")
+    if "{step}" in result and step_order:
+        step_str = "_".join(step_order)[:20]
+        result = result.replace("{step}", step_str)
+    if "{date}" in result:
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        result = result.replace("{date}", date_str)
+    if not Path(result).suffix:
+        result += ext
+    return result
 
-        def stop(self):
-            self._stop = True
 
-        def run(self):
-            try:
-                from utils.image_editor import ImageEditor, SUPPORTED_EXTS
-                import cv2 as _cv2
+class _IEBatchWorker(QThread):
+    progress = pyqtSignal(int, int, str)   # done, total, filename
+    finished = pyqtSignal(int, int)         # success, total
+    error    = pyqtSignal(str)
 
-                files = [
-                    f for f in Path(self.src_dir).iterdir()
-                    if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
-                ]
-                total   = len(files)
-                success = 0
+    def __init__(self, src_dir, dst_dir, config: "ImageEditConfig",
+                 step_order=None, filename_pattern="{original}_processed"):
+        super().__init__()
+        self.src_dir = src_dir
+        self.dst_dir = dst_dir
+        self.config  = config
+        self.step_order = step_order or []
+        self.filename_pattern = filename_pattern
+        self._stop   = False
 
-                # 预加载操作数图像
-                op_img = None
-                if (self.config.arithmetic.operand_path
-                        and os.path.isfile(self.config.arithmetic.operand_path)):
-                    op_img = _cv2.imread(self.config.arithmetic.operand_path,
-                                         _cv2.IMREAD_UNCHANGED)
+    def stop(self):
+        self._stop = True
 
-                editor = ImageEditor(self.config)
-                for i, f in enumerate(files):
-                    if self._stop:
-                        break
-                    dst = str(Path(self.dst_dir) / f.name)
-                    img = _cv2.imread(str(f), _cv2.IMREAD_UNCHANGED)
-                    if img is not None:
-                        result = editor.process(img, op_img,
-                                                step_order=self.step_order)
-                        _cv2.imwrite(dst, result)
-                        success += 1
-                    self.progress.emit(i + 1, total, f.name)
+    def run(self):
+        try:
+            from utils.image_editor import ImageEditor, SUPPORTED_EXTS
+            import cv2 as _cv2
 
-                self.finished.emit(success, total)
-            except Exception as e:
-                self.error.emit(str(e))
+            files = [
+                f for f in Path(self.src_dir).iterdir()
+                if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
+            ]
+            total   = len(files)
+            success = 0
+
+            # 预加载操作数图像
+            op_img = None
+            if (self.config.arithmetic.operand_path
+                    and os.path.isfile(self.config.arithmetic.operand_path)):
+                op_img = _cv2.imread(self.config.arithmetic.operand_path,
+                                     _cv2.IMREAD_UNCHANGED)
+
+            editor = ImageEditor(self.config)
+            for i, f in enumerate(files):
+                if self._stop:
+                    break
+                dst_name = _ie_resolve_batch_filename(
+                    f.name, i, self.step_order, self.filename_pattern)
+                dst = str(Path(self.dst_dir) / dst_name)
+                img = _cv2.imread(str(f), _cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    result = editor.process(img, op_img,
+                                            step_order=self.step_order)
+                    _cv2.imwrite(dst, result)
+                    success += 1
+                self.progress.emit(i + 1, total, f.name)
+
+            self.finished.emit(success, total)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 def run_gui():

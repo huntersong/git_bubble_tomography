@@ -418,7 +418,8 @@ if __name__ == '__main__':
 
     setup_logging(args.verbose)
 
-    if args.gui:
+    # 默认启动GUI（不传参数时）
+    if args.gui or len(sys.argv) == 1:
         run_gui()
     elif args.piv_demo:
         run_piv_demo()
