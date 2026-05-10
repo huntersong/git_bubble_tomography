@@ -328,6 +328,7 @@ A: 减小网格分辨率（如32?），增大光线采样步长，减少迭代次数。MART计算复杂度为O(N_
 如果本程序对您的研究有帮助，请引用：
 
 > MART算法: Gordon, R., Bender, R., & Herman, G. T. (1970). Algebraic reconstruction techniques (ART) for three-dimensional electron microscopy and X-ray photography. Journal of Theoretical Biology, 29(3), 471-481.
+> 气泡三维重建：Y. Song, G. Huang, J. Yin, D. Wang, Three-dimensional reconstruction of bubble geometry from single-perspective images based on ray tracing algorithm, Measurement Science and Technology, DOI 10.1088/1361-6501/ad7e43.(2024)
 
 ## 许可
 
