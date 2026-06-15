@@ -47,7 +47,10 @@ def run_demo():
     """运行演示（使用合成数据）"""
     import cv2
     from calibration.camera_calibrator import MultiCameraCalibrator
-    from mart.mart_reconstructor import MARTReconstructor, MARTConfig
+    from mart.mart_reconstructor import (
+        MARTReconstructor, SMARTReconstructor, ConvSMARTReconstructor,
+        ReconstructionConfig, MARTConfig, create_reconstructor
+    )
     from utils.image_processor import BubbleImageProcessor
     from visualization.visualizer import ResultVisualizer
 
@@ -180,17 +183,18 @@ def run_demo():
     print(f"  各相机投影已生成")
 
     # ===== 第三步: MART重建 =====
-    print("\n[3/4] 执行MART重建...")
+    print("\n[3/4] 执行层析重建 (默认MART)...")
 
-    config = MARTConfig(
+    config = ReconstructionConfig(
         grid_size=(grid_size, grid_size, grid_size),
         domain_size=(domain_size, domain_size, domain_size),
         relaxation_factor=0.5,
         max_iterations=20,  # 演示用，实际建议50+
-        voxel_threshold=0.3
+        voxel_threshold=0.3,
+        algorithm='MART',   # 可选: MART, SMART, ConvSMART
     )
 
-    reconstructor = MARTReconstructor(config)
+    reconstructor = create_reconstructor(config)
 
     # 准备相机参数
     camera_params_recon = {}

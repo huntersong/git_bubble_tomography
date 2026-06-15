@@ -10,6 +10,59 @@ from typing import Callable, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# 鲁棒图像加载：cv2.imread 无法处理某些 TIFF（例：12-bit/非标准BitsPerSample），
+# 此时回退到 PIL 读取。
+# ---------------------------------------------------------------------------
+
+def robust_imread(path: str, flags: int = cv2.IMREAD_UNCHANGED) -> "Optional[np.ndarray]":
+    """读取图像，优先使用 cv2，失败时回退到 PIL（兼容非标准位深 TIFF）。
+
+    参数:
+        path:  图像文件路径
+        flags: cv2 读取标志（默认为 IMREAD_UNCHANGED）
+               - IMREAD_UNCHANGED: 保持原始位深和通道
+               - IMREAD_GRAYSCALE: 强制灰度
+               - IMREAD_COLOR:     强制 BGR 彩色
+
+    返回:
+        numpy 数组，失败时返回 None
+    """
+    img = cv2.imread(path, flags)
+    if img is not None:
+        return img
+
+    # ---- cv2 失败，回退到 PIL ----
+    try:
+        from PIL import Image
+        pil_img = Image.open(path)
+        arr = np.array(pil_img)
+
+        if flags == cv2.IMREAD_COLOR or flags == cv2.IMREAD_ANYCOLOR:
+            # 需要 3 通道 BGR
+            if arr.ndim == 2:
+                return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+            if arr.shape[2] == 4:
+                return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        if flags == cv2.IMREAD_GRAYSCALE:
+            if arr.ndim == 3:
+                return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            return arr
+
+        # IMREAD_UNCHANGED：与 OpenCV 行为一致
+        #   - 灰度图：原样返回
+        #   - 彩色 3 通道：PIL→RGB，转 BGR 以匹配 OpenCV 惯例
+        #   - 彩色 4 通道：PIL→RGBA，转 BGRA 以匹配 OpenCV 惯例
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+        return arr
+    except Exception:
+        return None
+
 
 @dataclass
 class CropParams:
@@ -349,12 +402,12 @@ class ImageEditor:
         operand_path: Optional[str] = None,
     ) -> bool:
         try:
-            img = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
+            img = robust_imread(src_path)
             if img is None:
                 return False
             op_img = None
             if operand_path and os.path.isfile(operand_path):
-                op_img = cv2.imread(operand_path, cv2.IMREAD_UNCHANGED)
+                op_img = robust_imread(operand_path)
             result = self.process(img, op_img)
             os.makedirs(os.path.dirname(dst_path) or ".", exist_ok=True)
             cv2.imwrite(dst_path, result)
@@ -384,8 +437,17 @@ class ImageEditor:
 
     @staticmethod
     def to_qimage_compatible(img: np.ndarray) -> np.ndarray:
+        """Convert any image to a uint8 BGR array suitable for QImage display.
+        
+        Non-uint8 images are normalized to 0-255 using min-max scaling,
+        preserving the full dynamic range for preview.
+        """
         if img.dtype != np.uint8:
-            img = np.clip(img.astype(np.float64), 0, 255).astype(np.uint8)
+            vmin, vmax = float(img.min()), float(img.max())
+            if vmax > vmin:
+                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            else:
+                img = np.zeros(img.shape[:2], dtype=np.uint8)
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img

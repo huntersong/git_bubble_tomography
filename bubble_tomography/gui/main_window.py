@@ -21,13 +21,17 @@ from PyQt5.QtWidgets import (
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
     QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from calibration.camera_calibrator import MultiCameraCalibrator, CameraParams
-from mart.mart_reconstructor import MARTReconstructor, MARTConfig
+from mart.mart_reconstructor import (
+    MARTReconstructor, SMARTReconstructor, ConvSMARTReconstructor,
+    ReconstructionConfig, MARTConfig, create_reconstructor,
+    TomographicReconstructor,
+)
 from utils.image_processor import BubbleImageProcessor
 from visualization.visualizer import ResultVisualizer
 from particles.particle_reconstructor import (
@@ -42,7 +46,8 @@ from utils.image_editor import (
     ImageEditor, ImageEditConfig,
     CropParams, GrayParams, BrightnessContrastParams,
     MirrorParams, RotateParams, BitDepthParams, GrayMathParams,
-    ArithmeticParams, ThresholdParams
+    ArithmeticParams, ThresholdParams,
+    robust_imread,
 )
 
 
@@ -82,7 +87,7 @@ class PreviewImageLoader(QThread):
         self.detection_config = detection_config or {}
 
     def run(self):
-        image = cv2.imread(self.image_path, cv2.IMREAD_UNCHANGED)
+        image = robust_imread(self.image_path, cv2.IMREAD_UNCHANGED)
         if image is None:
             self.error.emit(self.request_id, self.image_path)
             return
@@ -115,7 +120,7 @@ class ReconstructionWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, reconstructor: MARTReconstructor,
+    def __init__(self, reconstructor: TomographicReconstructor,
                  projections: Dict[str, np.ndarray],
                  camera_params: Dict[str, dict]):
         super().__init__()
@@ -125,7 +130,8 @@ class ReconstructionWorker(QThread):
 
     def run(self):
         try:
-            self.progress.emit("开始 MART 重建...")
+            algo = self.reconstructor.config.algorithm
+            self.progress.emit(f"开始 {algo} 重建...")
             errors = []
 
             def callback(iteration, volume, error):
@@ -157,7 +163,7 @@ class BatchReconstructionWorker(QThread):
     all_done = pyqtSignal(dict)  # {timepoint_index: result}
     error = pyqtSignal(str)
 
-    def __init__(self, reconstructor: MARTReconstructor,
+    def __init__(self, reconstructor: TomographicReconstructor,
                  bubble_images_sequence: Dict[int, Dict[str, np.ndarray]],
                  camera_params: Dict[str, dict],
                  reference_images: Dict[str, np.ndarray],
@@ -343,7 +349,7 @@ class PIV2DPreviewWidget(QWidget):
         self._render()
 
     def set_image_path(self, path: str):
-        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        image = robust_imread(path, cv2.IMREAD_UNCHANGED)
         if image is None:
             return
         self.set_image_array(image, os.path.basename(path))
@@ -926,6 +932,18 @@ class FileTreePanel(QWidget):
         self._load_timer.setInterval(100)  # 防抖 100ms
         self._pending_path: str = ""
         self._load_timer.timeout.connect(self._emit_pending_signal)
+
+        # 文件系统监视器：工作目录内容变化时自动刷新
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_dir_changed)
+        self._fs_watcher.fileChanged.connect(self._on_file_changed)
+
+        # 防抖定时器：避免短时间内多次触发 refresh
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(500)  # 500ms 防抖
+        self._refresh_timer.timeout.connect(self.refresh)
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -1043,9 +1061,45 @@ class FileTreePanel(QWidget):
     # 公开接口
     # ------------------------------------------------------------------
     def set_work_dir(self, path: str):
-        """设置工作目录并刷新树。"""
+        """设置工作目录并刷新树，同时启动文件系统监视。"""
+        # 取消监视旧目录
+        old_dirs = self._fs_watcher.directories()
+        if old_dirs:
+            self._fs_watcher.removePaths(old_dirs)
+        old_files = self._fs_watcher.files()
+        if old_files:
+            self._fs_watcher.removePaths(old_files)
+
         self._work_dir = path
+
+        # 开始监视新工作目录
+        if path and os.path.isdir(path):
+            self._fs_watcher.addPath(path)
+            # 同时监视所有直属子目录
+            try:
+                for sub in Path(path).iterdir():
+                    if sub.is_dir() and not sub.name.startswith('.'):
+                        self._fs_watcher.addPath(str(sub))
+            except Exception:
+                pass
+
         self.refresh()
+
+    def watch_extra_dir(self, path: str):
+        """追加监视一个额外目录（如批处理输出目录）。"""
+        if path and os.path.isdir(path) and path not in self._fs_watcher.directories():
+            self._fs_watcher.addPath(path)
+
+    def _on_dir_changed(self, path: str):
+        """目录内容变化时触发防抖刷新，并确保新子目录被监视。"""
+        # 若是新增子目录，追加监视
+        if os.path.isdir(path) and path not in self._fs_watcher.directories():
+            self._fs_watcher.addPath(path)
+        self._refresh_timer.start()
+
+    def _on_file_changed(self, path: str):
+        """单个文件变化（如重命名后旧路径通知）时触发防抖刷新。"""
+        self._refresh_timer.start()
 
     def refresh(self):
         """重新扫描工作目录，重建树节点。"""
@@ -1059,6 +1113,14 @@ class FileTreePanel(QWidget):
         self._path_label.setText(self._work_dir)
 
         root_dir = Path(self._work_dir)
+
+        # 刷新后重新同步监视的子目录列表
+        watched_dirs = set(self._fs_watcher.directories())
+        for sub in root_dir.iterdir():
+            if sub.is_dir() and not sub.name.startswith('.'):
+                s = str(sub)
+                if s not in watched_dirs:
+                    self._fs_watcher.addPath(s)
 
         # 先收集根目录下直属图片
         root_images = sorted(
@@ -1319,6 +1381,9 @@ class FileTreePanel(QWidget):
 class ImagePreviewPanel(QWidget):
     """窗口最右侧：显示文件树中选中的图片（大图预览），可折叠。"""
 
+    # 信号：面板折叠/展开状态变化，参数(bool)表示是否展开
+    collapse_state_changed = pyqtSignal(bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_path: str = ""
@@ -1421,12 +1486,14 @@ class ImagePreviewPanel(QWidget):
             self.expand()
 
     def collapse(self):
-        """折叠预览面板，只保留标题栏。"""
+        """折叠预览面板，只保留标题栏（收缩到最右边）。"""
         self._expanded = False
         self._expanded_width = self.width()
         self._content.hide()
         self._collapse_btn.setText("▸")
-        self.setFixedWidth(self._title_bar.sizeHint().width() + 16)
+        # 收缩到仅标题栏窄条（约10px），紧贴最右边
+        self.setFixedWidth(10)
+        self.collapse_state_changed.emit(False)
 
     def expand(self):
         """展开预览面板。"""
@@ -1437,6 +1504,7 @@ class ImagePreviewPanel(QWidget):
         # 重新适配图片
         if hasattr(self, '_orig_pixmap') and not self._orig_pixmap.isNull():
             self._apply_pixmap()
+        self.collapse_state_changed.emit(True)
 
     def is_expanded(self) -> bool:
         return self._expanded
@@ -1456,8 +1524,15 @@ class ImagePreviewPanel(QWidget):
         try:
             pix = QPixmap(img_path)
             if pix.isNull():
-                img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+                img = robust_imread(img_path, cv2.IMREAD_UNCHANGED)
                 if img is not None:
+                    # 非8位图像先归一化到0-255以便显示
+                    if img.dtype != np.uint8:
+                        vmin, vmax = float(img.min()), float(img.max())
+                        if vmax > vmin:
+                            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                        else:
+                            img = np.zeros(img.shape[:2], dtype=np.uint8)
                     if img.ndim == 2:
                         img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
                     elif img.ndim == 3 and img.shape[2] == 4:
@@ -1853,7 +1928,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 数据存储
         self.calibrator: Optional[MultiCameraCalibrator] = None
-        self.reconstructor: Optional[MARTReconstructor] = None
+        self.reconstructor: Optional[TomographicReconstructor] = None
         self.image_processor = BubbleImageProcessor()
         self.visualizer = ResultVisualizer()
 
@@ -2043,6 +2118,9 @@ class BubbleTomographyGUI(QMainWindow):
         self._file_tree_panel.image_selected.connect(self._preview_panel.load_image)
         self._file_tree_panel.group_selected.connect(self._preview_panel.load_image)
 
+        # 同步面板自带折叠按钮的状态
+        self._preview_panel.collapse_state_changed.connect(self._sync_preview_toggle_state_from_panel)
+
         main_layout.addWidget(self._nav_panel)
         main_layout.addWidget(self._file_tree_panel)
         main_layout.addWidget(self.content_stack, stretch=1)
@@ -2116,8 +2194,15 @@ class BubbleTomographyGUI(QMainWindow):
         label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         try:
-            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            img = robust_imread(img_path, cv2.IMREAD_UNCHANGED)
             if img is not None:
+                # 非8位图像先归一化到0-255以便显示
+                if img.dtype != np.uint8:
+                    vmin, vmax = float(img.min()), float(img.max())
+                    if vmax > vmin:
+                        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    else:
+                        img = np.zeros(img.shape[:2], dtype=np.uint8)
                 if img.ndim == 2:
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
                 elif img.ndim == 3 and img.shape[2] == 4:
@@ -2221,6 +2306,15 @@ class BubbleTomographyGUI(QMainWindow):
         nav_to_ie.triggered.connect(lambda: self._navigate_to(5))
         window_menu.addAction(nav_to_ie)
 
+        window_menu.addSeparator()
+
+        # "图片预览 适应窗口" 切换（可勾选）
+        self._toggle_preview_action = QAction("图片预览 适应窗口", self)
+        self._toggle_preview_action.setCheckable(True)
+        self._toggle_preview_action.setChecked(True)
+        self._toggle_preview_action.triggered.connect(self._on_toggle_preview)
+        window_menu.addAction(self._toggle_preview_action)
+
         # ===== 帮助菜单 =====
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -2233,6 +2327,61 @@ class BubbleTomographyGUI(QMainWindow):
         about_action = QAction("关于", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
+
+        # ---- 菜单栏右侧：预览切换按钮 ----
+        corner_widget = QWidget()
+        corner_widget.setStyleSheet("background: transparent;")
+        corner_layout = QHBoxLayout(corner_widget)
+        corner_layout.setContentsMargins(0, 0, 8, 0)
+        corner_layout.setSpacing(0)
+
+        self._preview_toggle_btn = QPushButton("图片预览 适应窗口")
+        self._preview_toggle_btn.setCheckable(True)
+        self._preview_toggle_btn.setChecked(True)
+        self._preview_toggle_btn.setFixedHeight(24)
+        self._preview_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._preview_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e2d3d;
+                color: #bdc3c7;
+                border: 1px solid #34495e;
+                border-radius: 3px;
+                padding: 2px 12px;
+                font-size: 12px;
+            }
+            QPushButton:checked {
+                color: #3498db;
+                border-color: #3498db;
+            }
+            QPushButton:hover {
+                color: #ecf0f1;
+                border-color: #4a6785;
+            }
+        """)
+        self._preview_toggle_btn.clicked.connect(self._on_toggle_preview)
+        corner_layout.addWidget(self._preview_toggle_btn)
+        menubar.setCornerWidget(corner_widget, Qt.TopRightCorner)
+
+    def _on_toggle_preview(self):
+        """切换右侧预览面板的可见性。"""
+        if self._preview_panel.is_expanded():
+            self._preview_panel.collapse()
+        else:
+            self._preview_panel.expand()
+        self._sync_preview_toggle_state()
+
+    def _sync_preview_toggle_state(self):
+        """同步菜单项和按钮的勾选状态到预览面板。"""
+        visible = self._preview_panel.is_expanded()
+        self._toggle_preview_action.setChecked(visible)
+        if hasattr(self, '_preview_toggle_btn'):
+            self._preview_toggle_btn.setChecked(visible)
+
+    def _sync_preview_toggle_state_from_panel(self, expanded: bool):
+        """由面板信号触发：同步菜单和按钮状态。"""
+        self._toggle_preview_action.setChecked(expanded)
+        if hasattr(self, '_preview_toggle_btn'):
+            self._preview_toggle_btn.setChecked(expanded)
 
     def _apply_global_style(self):
         """应用全局样式 — DaVis 10 深色主题。"""
@@ -3010,64 +3159,119 @@ class BubbleTomographyGUI(QMainWindow):
         left_layout.addWidget(image_group)
 
         # 重建参数
-        recon_group = QGroupBox("MART重建参数")
+        recon_group = QGroupBox("层析重建参数")
         grid = QGridLayout()
 
-        grid.addWidget(QLabel("网格X:"), 0, 0)
+        # --- 算法选择 ---
+        grid.addWidget(QLabel("重建算法:"), 0, 0)
+        self.recon_algo_combo = QComboBox()
+        self.recon_algo_combo.addItems(["MART", "SMART", "Conv-SMART"])
+        self.recon_algo_combo.setCurrentIndex(0)
+        self.recon_algo_combo.setToolTip(
+            "MART: 逐光线乘法重建(经典)\n"
+            "SMART: 同步乘法重建(更稳定)\n"
+            "Conv-SMART: 卷积加速SMART(最快)"
+        )
+        self.recon_algo_combo.currentIndexChanged.connect(
+            self._on_recon_algo_changed
+        )
+        grid.addWidget(self.recon_algo_combo, 0, 1)
+
+        grid.addWidget(QLabel("网格X:"), 1, 0)
         self.grid_x = QSpinBox()
         self.grid_x.setRange(16, 256)
         self.grid_x.setValue(64)
-        grid.addWidget(self.grid_x, 0, 1)
+        grid.addWidget(self.grid_x, 1, 1)
 
-        grid.addWidget(QLabel("网格Y:"), 1, 0)
+        grid.addWidget(QLabel("网格Y:"), 2, 0)
         self.grid_y = QSpinBox()
         self.grid_y.setRange(16, 256)
         self.grid_y.setValue(64)
-        grid.addWidget(self.grid_y, 1, 1)
+        grid.addWidget(self.grid_y, 2, 1)
 
-        grid.addWidget(QLabel("网格Z:"), 2, 0)
+        grid.addWidget(QLabel("网格Z:"), 3, 0)
         self.grid_z = QSpinBox()
         self.grid_z.setRange(16, 256)
         self.grid_z.setValue(64)
-        grid.addWidget(self.grid_z, 2, 1)
+        grid.addWidget(self.grid_z, 3, 1)
 
-        grid.addWidget(QLabel("域尺寸X (mm):"), 3, 0)
+        grid.addWidget(QLabel("域尺寸X (mm):"), 4, 0)
         self.domain_x = QDoubleSpinBox()
         self.domain_x.setRange(1, 200)
         self.domain_x.setValue(20.0)
-        grid.addWidget(self.domain_x, 3, 1)
+        grid.addWidget(self.domain_x, 4, 1)
 
-        grid.addWidget(QLabel("域尺寸Y (mm):"), 4, 0)
+        grid.addWidget(QLabel("域尺寸Y (mm):"), 5, 0)
         self.domain_y = QDoubleSpinBox()
         self.domain_y.setRange(1, 200)
         self.domain_y.setValue(20.0)
-        grid.addWidget(self.domain_y, 4, 1)
+        grid.addWidget(self.domain_y, 5, 1)
 
-        grid.addWidget(QLabel("域尺寸Z (mm):"), 5, 0)
+        grid.addWidget(QLabel("域尺寸Z (mm):"), 6, 0)
         self.domain_z = QDoubleSpinBox()
         self.domain_z.setRange(1, 200)
         self.domain_z.setValue(20.0)
-        grid.addWidget(self.domain_z, 5, 1)
+        grid.addWidget(self.domain_z, 6, 1)
 
-        grid.addWidget(QLabel("松弛因子:"), 6, 0)
+        grid.addWidget(QLabel("松弛因子:"), 7, 0)
         self.relax_spin = QDoubleSpinBox()
         self.relax_spin.setRange(0.01, 1.0)
         self.relax_spin.setValue(0.5)
         self.relax_spin.setSingleStep(0.05)
-        grid.addWidget(self.relax_spin, 6, 1)
+        grid.addWidget(self.relax_spin, 7, 1)
 
-        grid.addWidget(QLabel("最大迭代次数:"), 7, 0)
+        grid.addWidget(QLabel("最大迭代次数:"), 8, 0)
         self.iter_spin = QSpinBox()
         self.iter_spin.setRange(1, 200)
         self.iter_spin.setValue(50)
-        grid.addWidget(self.iter_spin, 7, 1)
+        grid.addWidget(self.iter_spin, 8, 1)
 
-        grid.addWidget(QLabel("体素阈值:"), 8, 0)
+        grid.addWidget(QLabel("体素阈值:"), 9, 0)
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.01, 0.5)
         self.threshold_spin.setValue(0.1)
         self.threshold_spin.setSingleStep(0.01)
-        grid.addWidget(self.threshold_spin, 8, 1)
+        grid.addWidget(self.threshold_spin, 9, 1)
+
+        # --- Conv-SMART 专属参数 ---
+        self.convsmart_group = QGroupBox("Conv-SMART 参数")
+        conv_grid = QGridLayout()
+
+        conv_grid.addWidget(QLabel("卷积核尺寸:"), 0, 0)
+        self.conv_kernel_spin = QSpinBox()
+        self.conv_kernel_spin.setRange(3, 15)
+        self.conv_kernel_spin.setValue(5)
+        self.conv_kernel_spin.setSingleStep(2)
+        self.conv_kernel_spin.setToolTip("PSF卷积核边长（奇数），越大越平滑")
+        conv_grid.addWidget(self.conv_kernel_spin, 0, 1)
+
+        conv_grid.addWidget(QLabel("PSF类型:"), 1, 0)
+        self.psf_type_combo = QComboBox()
+        self.psf_type_combo.addItems(["gaussian", "tophat", "empirical"])
+        self.psf_type_combo.setToolTip(
+            "gaussian: 高斯PSF（通用）\n"
+            "tophat: 均匀圆盘PSF\n"
+            "empirical: 经验PSF（需标定数据）"
+        )
+        conv_grid.addWidget(self.psf_type_combo, 1, 1)
+
+        conv_grid.addWidget(QLabel("PSF sigma (体素):"), 2, 0)
+        self.psf_sigma_spin = QDoubleSpinBox()
+        self.psf_sigma_spin.setRange(0.3, 5.0)
+        self.psf_sigma_spin.setValue(1.0)
+        self.psf_sigma_spin.setSingleStep(0.1)
+        self.psf_sigma_spin.setToolTip("高斯PSF的标准差（体素单位）")
+        conv_grid.addWidget(self.psf_sigma_spin, 2, 1)
+
+        conv_grid.addWidget(QLabel("FFT卷积:"), 3, 0)
+        self.fft_conv_check = QCheckBox("启用FFT加速")
+        self.fft_conv_check.setChecked(True)
+        self.fft_conv_check.setToolTip("启用FFT卷积可大幅提升速度")
+        conv_grid.addWidget(self.fft_conv_check, 3, 1)
+
+        self.convsmart_group.setLayout(conv_grid)
+        self.convsmart_group.setVisible(False)  # 默认隐藏
+        grid.addWidget(self.convsmart_group, 10, 0, 1, 2)
 
         recon_group.setLayout(grid)
         left_layout.addWidget(recon_group)
@@ -4055,7 +4259,7 @@ class BubbleTomographyGUI(QMainWindow):
             return
 
         image_path = self._single_calib_files[0]
-        image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        image = robust_imread(image_path, cv2.IMREAD_UNCHANGED)
         if image is None:
             QMessageBox.warning(self, "警告", "无法读取已加载的标定图像")
             return
@@ -4957,6 +5161,12 @@ class BubbleTomographyGUI(QMainWindow):
                 f"已加?{len(self.camera_reference_images)} 张背晏考图"
             )
 
+    def _on_recon_algo_changed(self, index):
+        """重建算法切换时，显示/隐藏Conv-SMART专属参数"""
+        algo = self.recon_algo_combo.currentText()
+        is_conv = algo == "Conv-SMART"
+        self.convsmart_group.setVisible(is_conv)
+
     def _run_reconstruction(self):
         """执行重建（自动判断单帧或批量）。"""
         if self.bubble_timepoint_images:
@@ -5021,18 +5231,25 @@ class BubbleTomographyGUI(QMainWindow):
         except Exception:
             pass
 
-        # 配置MART重建?
-        config = MARTConfig(
+        # 配置重建参数（根据算法类型）
+        algo_name = self.recon_algo_combo.currentText()
+        config = ReconstructionConfig(
             grid_size=(self.grid_x.value(), self.grid_y.value(),
                        self.grid_z.value()),
             domain_size=(self.domain_x.value(), self.domain_y.value(),
                          self.domain_z.value()),
             relaxation_factor=self.relax_spin.value(),
             max_iterations=self.iter_spin.value(),
-            voxel_threshold=self.threshold_spin.value()
+            voxel_threshold=self.threshold_spin.value(),
+            algorithm=algo_name,
+            # Conv-SMART 专属参数
+            conv_kernel_size=self.conv_kernel_spin.value(),
+            psf_type=self.psf_type_combo.currentText(),
+            psf_sigma=self.psf_sigma_spin.value(),
+            use_fft_convolution=self.fft_conv_check.isChecked(),
         )
 
-        self.reconstructor = MARTReconstructor(config)
+        self.reconstructor = create_reconstructor(config)
 
         # Start worker thread
         self.progress_bar.setVisible(True)
@@ -5085,17 +5302,22 @@ class BubbleTomographyGUI(QMainWindow):
             threshold_method=self.threshold_method_combo.currentText()
         )
 
-        config = MARTConfig(
+        config = ReconstructionConfig(
             grid_size=(self.grid_x.value(), self.grid_y.value(),
                        self.grid_z.value()),
             domain_size=(self.domain_x.value(), self.domain_y.value(),
                          self.domain_z.value()),
             relaxation_factor=self.relax_spin.value(),
             max_iterations=self.iter_spin.value(),
-            voxel_threshold=self.threshold_spin.value()
+            voxel_threshold=self.threshold_spin.value(),
+            algorithm=self.recon_algo_combo.currentText(),
+            conv_kernel_size=self.conv_kernel_spin.value(),
+            psf_type=self.psf_type_combo.currentText(),
+            psf_sigma=self.psf_sigma_spin.value(),
+            use_fft_convolution=self.fft_conv_check.isChecked(),
         )
 
-        self.reconstructor = MARTReconstructor(config)
+        self.reconstructor = create_reconstructor(config)
 
         total = len(self.bubble_timepoint_images)
         self.bubble_batch_results.clear()
@@ -6777,8 +6999,8 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择两帧图像")
             return
 
-        img1 = _cv2.imread(self.piv2d_frame1_path, _cv2.IMREAD_UNCHANGED)
-        img2 = _cv2.imread(self.piv2d_frame2_path, _cv2.IMREAD_UNCHANGED)
+        img1 = robust_imread(self.piv2d_frame1_path, _cv2.IMREAD_UNCHANGED)
+        img2 = robust_imread(self.piv2d_frame2_path, _cv2.IMREAD_UNCHANGED)
         if img1 is None or img2 is None:
             QMessageBox.warning(self, "提示", "图像读取失败")
             return
@@ -6869,7 +7091,7 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _piv2d_set_preview(self, path: str, label: QLabel):
         import cv2 as _cv2
-        img = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+        img = robust_imread(path, _cv2.IMREAD_UNCHANGED)
         if img is None:
             return
         if hasattr(label, "set_image_array"):
@@ -6914,7 +7136,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._piv2d_set_preview(overlay_path, self.piv2d_result_preview)
             return
 
-        image = cv2.imread(str(files[0]), cv2.IMREAD_UNCHANGED)
+        image = robust_imread(str(files[0]), cv2.IMREAD_UNCHANGED)
         if image is None:
             self._piv2d_set_preview(overlay_path, self.piv2d_result_preview)
             return
@@ -8337,7 +8559,7 @@ class BubbleTomographyGUI(QMainWindow):
     def _ie_load_orig_preview(self, path):
         """在原图区域显示图像，同时更新工作流数据源节点信息。"""
         import cv2 as _cv2
-        img = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+        img = robust_imread(path, _cv2.IMREAD_UNCHANGED)
         if img is None:
             return
         h, w = img.shape[:2]
@@ -8420,10 +8642,10 @@ class BubbleTomographyGUI(QMainWindow):
         # 不再调用 _ie_sync_config_from_ui()，
         # 因为新工作流通过对话框直接更新 self.ie_config
         try:
-            img = _cv2.imread(self.ie_single_path, _cv2.IMREAD_UNCHANGED)
+            img = robust_imread(self.ie_single_path, _cv2.IMREAD_UNCHANGED)
             op_img = None
             if hasattr(self, 'ie_config') and self.ie_config.arithmetic.operand_path:
-                op_img = _cv2.imread(self.ie_config.arithmetic.operand_path,
+                op_img = robust_imread(self.ie_config.arithmetic.operand_path,
                                      _cv2.IMREAD_UNCHANGED)
             editor = ImageEditor(self.ie_config)
             result = editor.process(img, op_img, step_order=step_order)
@@ -8502,6 +8724,9 @@ class BubbleTomographyGUI(QMainWindow):
         try:
             _cv2.imwrite(path, self._ie_current_preview)
             self.ie_log.append(f"已保存: {os.path.basename(path)}")
+            # 保存后刷新文件树
+            self._file_tree_panel.watch_extra_dir(os.path.dirname(path))
+            self._file_tree_panel.refresh()
             QMessageBox.information(self, "完成", f"已保存至:\n{path}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))
@@ -8520,6 +8745,9 @@ class BubbleTomographyGUI(QMainWindow):
 
         os.makedirs(self.ie_dst_dir, exist_ok=True)
 
+        # 让文件树监视输出目录（若它在工作目录下，会被自动发现；若在外部则追加监视）
+        self._file_tree_panel.watch_extra_dir(self.ie_dst_dir)
+
         step_order = self._ie_get_step_order()
         if not step_order:
             QMessageBox.warning(self, "提示", "请至少勾选一个处理步骤")
@@ -8535,7 +8763,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_log.append(f"开始批量处理: {self.ie_src_dir}")
         self.ie_log.append(f"   步骤: {' -> '.join(ImageEditor.STEP_LABELS.get(s, s) for s in step_order)}")
 
-        self.ie_worker_thread = self._IEBatchWorker(
+        self.ie_worker_thread = _IEBatchWorker(
             self.ie_src_dir, self.ie_dst_dir,
             self.ie_config, step_order, filename_pattern)
         self.ie_worker_thread.progress.connect(self._ie_on_batch_progress)
@@ -8559,6 +8787,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_progress_bar.setVisible(False)
         self.ie_log.append(
             f"批量处理完成: {success}/{total} 成功  输出: {self.ie_dst_dir}")
+        # 批处理完成后主动刷新文件树（确保立即显示新文件）
+        self._file_tree_panel.refresh()
         QMessageBox.information(self, "完成",
                                 f"批量处理完成!\n成功: {success}/{total}\n输出目录: {self.ie_dst_dir}")
 
@@ -8571,12 +8801,16 @@ class BubbleTomographyGUI(QMainWindow):
 
     @staticmethod
     def _ie_ndarray_to_pixmap(img: np.ndarray) -> "Optional[QPixmap]":
-        """numpy 数组转 QPixmap。"""
+        """numpy 数组转 QPixmap（自动归一化非8位图像到0-255显示）。"""
         import cv2 as _cv2
         if img is None:
             return None
         if img.dtype != np.uint8:
-            img = np.clip(img.astype(np.float64), 0, 255).astype(np.uint8)
+            vmin, vmax = float(img.min()), float(img.max())
+            if vmax <= vmin:
+                img = np.zeros(img.shape[:2], dtype=np.uint8)
+            else:
+                img = _cv2.normalize(img, None, 0, 255, _cv2.NORM_MINMAX, dtype=_cv2.CV_8U)
         if img.ndim == 2:
             img_rgb = _cv2.cvtColor(img, _cv2.COLOR_GRAY2RGB)
         elif img.ndim == 3 and img.shape[2] == 4:
@@ -8711,7 +8945,7 @@ class _IEBatchWorker(QThread):
 
     def run(self):
         try:
-            from utils.image_editor import ImageEditor, SUPPORTED_EXTS
+            from utils.image_editor import ImageEditor, SUPPORTED_EXTS, robust_imread
             import cv2 as _cv2
 
             files = [
@@ -8725,7 +8959,7 @@ class _IEBatchWorker(QThread):
             op_img = None
             if (self.config.arithmetic.operand_path
                     and os.path.isfile(self.config.arithmetic.operand_path)):
-                op_img = _cv2.imread(self.config.arithmetic.operand_path,
+                op_img = robust_imread(self.config.arithmetic.operand_path,
                                      _cv2.IMREAD_UNCHANGED)
 
             editor = ImageEditor(self.config)
@@ -8735,7 +8969,7 @@ class _IEBatchWorker(QThread):
                 dst_name = _ie_resolve_batch_filename(
                     f.name, i, self.step_order, self.filename_pattern)
                 dst = str(Path(self.dst_dir) / dst_name)
-                img = _cv2.imread(str(f), _cv2.IMREAD_UNCHANGED)
+                img = robust_imread(str(f), _cv2.IMREAD_UNCHANGED)
                 if img is not None:
                     result = editor.process(img, op_img,
                                             step_order=self.step_order)
