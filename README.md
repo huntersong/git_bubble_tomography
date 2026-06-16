@@ -2,9 +2,16 @@
 #3. 结果可视化：查看点云、体素切片、投影对比、综合报告、批量结果概览
 #4. Particle Tracking / PIV：批量加载粒子图像、粒子3D重建、速度场计算、时间点切换 #目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV， #PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里。
 
-#封装的软件都在 branch分支的\bubble_tomography_exe文件夹里。 通过直接打开exe文件启动，
+{
+    修改记录：
+    
+    #封装的软件都在 branch分支的\bubble_tomography_exe文件夹里。 通过直接打开exe文件启动，
 
-#PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里
+    #PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里
+
+    1、20260615修改了图像处理模块的预览模块显示功能，可以缩小到最小尺寸。
+
+}
 
 } #本程序基于Python3.7开发，依赖PyQt5、numpy、opencv-python、scipy、matplotlib、scikit-image、tqdm
 
