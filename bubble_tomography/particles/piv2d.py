@@ -41,11 +41,18 @@ class PIV2DCalculator:
         self,
         frame1: np.ndarray,
         frame2: np.ndarray,
+        exclusion_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         img1 = self._to_gray_float(frame1)
         img2 = self._to_gray_float(frame2)
         if img1.shape != img2.shape:
             raise ValueError("两帧图像尺寸必须一致")
+
+        mask = None
+        if exclusion_mask is not None:
+            mask = np.asarray(exclusion_mask, dtype=bool)
+            if mask.shape != img1.shape:
+                raise ValueError("无粒子区域掩膜尺寸必须与图像一致")
 
         ws = int(self.config.window_size)
         sr = int(self.config.search_radius)
@@ -65,6 +72,7 @@ class PIV2DCalculator:
         v = np.zeros_like(y_grid, dtype=np.float32)
         snr = np.zeros_like(x_grid, dtype=np.float32)
         valid = np.zeros_like(x_grid, dtype=bool)
+        skipped_mask = np.zeros_like(x_grid, dtype=bool)
 
         for iy, cy in enumerate(centers_y):
             y1 = cy - half
@@ -72,6 +80,10 @@ class PIV2DCalculator:
             for ix, cx in enumerate(centers_x):
                 x1 = cx - half
                 x2 = x1 + ws
+
+                if mask is not None and mask[int(cy), int(cx)]:
+                    skipped_mask[iy, ix] = True
+                    continue
 
                 win1 = img1[y1:y2, x1:x2]
                 sy1 = max(0, y1 - sr)
@@ -118,6 +130,7 @@ class PIV2DCalculator:
             "speed": speed,
             "snr": snr,
             "valid": valid,
+            "excluded": skipped_mask,
             "grid_shape": np.array(x_grid.shape, dtype=np.int32),
         }
 
@@ -209,6 +222,7 @@ class PIV2DCalculator:
         self,
         src_dir: str,
         dst_dir: str,
+        exclusion_mask: Optional[np.ndarray] = None,
         progress_callback=None,
         stop_checker=None,
     ) -> Tuple[int, int, List[str]]:
@@ -232,7 +246,7 @@ class PIV2DCalculator:
             if img1 is None or img2 is None:
                 continue
 
-            result = self.compute_velocity_field(img1, img2)
+            result = self.compute_velocity_field(img1, img2, exclusion_mask=exclusion_mask)
             overlay = self.render_overlay(img1, result)
             summary = self.summarize_result(result)
 
@@ -251,6 +265,7 @@ class PIV2DCalculator:
                 speed=result["speed"],
                 snr=result["snr"],
                 valid=result["valid"],
+                excluded=result.get("excluded", np.zeros_like(result["valid"], dtype=bool)),
             )
             with open(txt_path, "w", encoding="utf-8") as f:
                 for key, value in summary.items():

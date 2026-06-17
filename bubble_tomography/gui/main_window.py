@@ -298,11 +298,12 @@ class BatchPIV2DWorker(QThread):
     finished = pyqtSignal(int, int, list)
     error = pyqtSignal(str)
 
-    def __init__(self, src_dir: str, dst_dir: str, config: PIV2DConfig):
+    def __init__(self, src_dir: str, dst_dir: str, config: PIV2DConfig, exclusion_mask: Optional[np.ndarray] = None):
         super().__init__()
         self.src_dir = src_dir
         self.dst_dir = dst_dir
         self.config = config
+        self.exclusion_mask = None if exclusion_mask is None else np.asarray(exclusion_mask, dtype=bool).copy()
         self._stop = False
 
     def stop(self):
@@ -314,6 +315,7 @@ class BatchPIV2DWorker(QThread):
             success, total, outputs = calculator.process_batch_directory(
                 self.src_dir,
                 self.dst_dir,
+                exclusion_mask=self.exclusion_mask,
                 progress_callback=lambda done, total, name: self.progress.emit(done, total, name),
                 stop_checker=lambda: self._stop,
             )
@@ -325,6 +327,8 @@ class BatchPIV2DWorker(QThread):
 class PIV2DPreviewWidget(QWidget):
     """Grayscale image preview with colorbar, pixel readout, and optional vectors."""
 
+    mask_changed = pyqtSignal(object)
+
     def __init__(self, placeholder: str = "预览区域", parent=None):
         super().__init__(parent)
         self._image = None
@@ -333,6 +337,10 @@ class PIV2DPreviewWidget(QWidget):
         self._vector_scale = 0.15
         self._vector_color_mode = "speed"
         self._colorbar = None
+        self._exclusion_mask = None
+        self._mask_selection_enabled = False
+        self._mask_press = None
+        self._mask_drag_patch = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -340,6 +348,8 @@ class PIV2DPreviewWidget(QWidget):
         self.canvas = FigureCanvas(self.figure)
         self.axes = self.figure.add_subplot(111)
         self.canvas.setMinimumSize(260, 200)
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
+        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         layout.addWidget(self.canvas, stretch=1)
 
@@ -358,12 +368,16 @@ class PIV2DPreviewWidget(QWidget):
         self._image = self._to_gray(image)
         self._result = None
         self._title = title or self._title
+        if self._exclusion_mask is not None and self._exclusion_mask.shape != self._image.shape[:2]:
+            self._exclusion_mask = None
         self._render()
 
     def set_vector_result(self, image: np.ndarray, result: dict, title: str = ""):
         self._image = self._to_gray(image)
         self._result = result
         self._title = title or "速度矢量"
+        if self._exclusion_mask is not None and self._exclusion_mask.shape != self._image.shape[:2]:
+            self._exclusion_mask = None
         self._render()
 
     def set_vector_style(self, scale: float, color_mode: str):
@@ -374,10 +388,41 @@ class PIV2DPreviewWidget(QWidget):
     def clear(self, text: Optional[str] = None):
         self._image = None
         self._result = None
+        self._exclusion_mask = None
         if text:
             self._title = text
         self.info_label.setText("灰度值: --")
         self._render()
+
+    def begin_mask_selection(self):
+        if self._image is None:
+            return False
+        self._mask_selection_enabled = True
+        self._mask_press = None
+        self.info_label.setText("拖拽选择无粒子区域")
+        return True
+
+    def set_exclusion_mask(self, mask: Optional[np.ndarray]):
+        if mask is None:
+            self._exclusion_mask = None
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            if self._image is not None and mask.shape != self._image.shape[:2]:
+                return
+            self._exclusion_mask = mask.copy()
+        self._render()
+
+    def clear_exclusion_mask(self):
+        self._mask_selection_enabled = False
+        self._mask_press = None
+        self._exclusion_mask = None
+        self.mask_changed.emit(None)
+        self._render()
+
+    def exclusion_mask(self) -> Optional[np.ndarray]:
+        if self._exclusion_mask is None:
+            return None
+        return self._exclusion_mask.copy()
 
     def _render(self):
         self.figure.clear()
@@ -395,10 +440,21 @@ class PIV2DPreviewWidget(QWidget):
         self.axes.set_title(self._title, fontsize=10)
         self.axes.set_axis_off()
 
+        self._draw_exclusion_mask()
+
         if self._result is not None:
             self._draw_vectors()
 
         self.canvas.draw_idle()
+
+    def _draw_exclusion_mask(self):
+        if self._exclusion_mask is None or self._image is None:
+            return
+        if self._exclusion_mask.shape != self._image.shape[:2] or not np.any(self._exclusion_mask):
+            return
+        overlay = np.zeros((*self._exclusion_mask.shape, 4), dtype=np.float32)
+        overlay[self._exclusion_mask] = [1.0, 0.0, 0.0, 0.28]
+        self.axes.imshow(overlay, origin="upper")
 
     def _draw_vectors(self):
         result = self._result
@@ -433,7 +489,49 @@ class PIV2DPreviewWidget(QWidget):
                 angles="xy", scale_units="xy", scale=1, width=0.003,
             )
 
+    def _on_mouse_press(self, event):
+        if not self._mask_selection_enabled or self._image is None or event.inaxes is not self.axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._mask_press = (float(event.xdata), float(event.ydata))
+        self._remove_drag_patch()
+
+    def _on_mouse_release(self, event):
+        if not self._mask_selection_enabled or self._image is None or self._mask_press is None:
+            return
+        if event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
+            self._mask_press = None
+            self._remove_drag_patch()
+            return
+
+        h, w = self._image.shape[:2]
+        x0, y0 = self._mask_press
+        x1, y1 = float(event.xdata), float(event.ydata)
+        x_min = max(0, min(w, int(np.floor(min(x0, x1)))))
+        x_max = max(0, min(w, int(np.ceil(max(x0, x1)))))
+        y_min = max(0, min(h, int(np.floor(min(y0, y1)))))
+        y_max = max(0, min(h, int(np.ceil(max(y0, y1)))))
+
+        self._mask_selection_enabled = False
+        self._mask_press = None
+        self._remove_drag_patch()
+
+        if x_max <= x_min or y_max <= y_min:
+            self.info_label.setText("无粒子区域未改变")
+            return
+
+        if self._exclusion_mask is None:
+            self._exclusion_mask = np.zeros((h, w), dtype=bool)
+        self._exclusion_mask[y_min:y_max, x_min:x_max] = True
+        self.mask_changed.emit(self._exclusion_mask.copy())
+        self.info_label.setText(f"已添加无粒子区域: x={x_min}:{x_max}, y={y_min}:{y_max}")
+        self._render()
+
     def _on_mouse_move(self, event):
+        if self._mask_selection_enabled and self._image is not None and self._mask_press is not None:
+            self._update_drag_patch(event)
+            return
         if self._image is None or event.inaxes is not self.axes:
             self.info_label.setText("灰度值: --")
             return
@@ -448,6 +546,34 @@ class PIV2DPreviewWidget(QWidget):
             self.info_label.setText(f"x={x}  y={y}  灰度值={value:.3f}")
         else:
             self.info_label.setText("灰度值: --")
+
+    def _update_drag_patch(self, event):
+        if event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
+            return
+        from matplotlib.patches import Rectangle
+
+        x0, y0 = self._mask_press
+        x1, y1 = float(event.xdata), float(event.ydata)
+        self._remove_drag_patch()
+        self._mask_drag_patch = Rectangle(
+            (min(x0, x1), min(y0, y1)),
+            abs(x1 - x0),
+            abs(y1 - y0),
+            fill=False,
+            edgecolor="#ff2d2d",
+            linewidth=1.5,
+            linestyle="--",
+        )
+        self.axes.add_patch(self._mask_drag_patch)
+        self.canvas.draw_idle()
+
+    def _remove_drag_patch(self):
+        if self._mask_drag_patch is not None:
+            try:
+                self._mask_drag_patch.remove()
+            except ValueError:
+                pass
+            self._mask_drag_patch = None
 
     @staticmethod
     def _to_gray(image: np.ndarray) -> np.ndarray:
@@ -1976,6 +2102,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_worker_thread = None
         self._piv2d_last_result: Optional[dict] = None
         self._piv2d_last_image: Optional[np.ndarray] = None
+        self._piv2d_exclusion_mask: Optional[np.ndarray] = None
 
         # 工作目录
         self._work_dir: str = ""
@@ -6813,10 +6940,24 @@ class BubbleTomographyGUI(QMainWindow):
         viz_layout.addWidget(self.piv2d_vector_scale_spin, 0, 1)
         viz_layout.addWidget(QLabel("颜色组:"), 1, 0)
         self.piv2d_vector_color_combo = QComboBox()
-        self.piv2d_vector_color_combo.addItems(["鎸夐€熷害褰╄壊", "绾㈣壊", "缁胯壊", "钃濊壊", "榛勮壊", "鐧借壊"])
+        self.piv2d_vector_color_combo.addItems(["按速度彩色", "红色", "绿色", "蓝色", "黄色", "白色"])
         self.piv2d_vector_color_combo.currentIndexChanged.connect(self._piv2d_refresh_vector_preview)
         viz_layout.addWidget(self.piv2d_vector_color_combo, 1, 1)
         left_layout.addWidget(viz_group)
+
+        mask_group = QGroupBox("无粒子区域")
+        mask_layout = QVBoxLayout(mask_group)
+        self.piv2d_mask_info_label = QLabel("未设置")
+        self.piv2d_mask_info_label.setWordWrap(True)
+        self.piv2d_mask_info_label.setStyleSheet("color: gray;")
+        mask_layout.addWidget(self.piv2d_mask_info_label)
+        btn_add_mask = QPushButton("添加无粒子区域")
+        btn_add_mask.clicked.connect(self._piv2d_begin_mask_selection)
+        mask_layout.addWidget(btn_add_mask)
+        btn_clear_mask = QPushButton("清除无粒子区域")
+        btn_clear_mask.clicked.connect(self._piv2d_clear_mask)
+        mask_layout.addWidget(btn_clear_mask)
+        left_layout.addWidget(mask_group)
 
         action_group = QGroupBox("执行")
         action_layout = QVBoxLayout(action_group)
@@ -6845,6 +6986,7 @@ class BubbleTomographyGUI(QMainWindow):
         top_layout = QHBoxLayout(top_widget)
         self.piv2d_frame1_preview = PIV2DPreviewWidget("第1帧预览")
         self.piv2d_frame1_preview.setMinimumSize(self._sp(260), self._sp(220))
+        self.piv2d_frame1_preview.mask_changed.connect(self._piv2d_on_mask_changed)
         top_layout.addWidget(self.piv2d_frame1_preview)
         self.piv2d_frame2_preview = PIV2DPreviewWidget("第2帧预览")
         self.piv2d_frame2_preview.setMinimumSize(self._sp(260), self._sp(220))
@@ -6993,6 +7135,47 @@ class BubbleTomographyGUI(QMainWindow):
             max_displacement=self.piv2d_maxdisp_spin.value(),
         )
 
+    def _piv2d_begin_mask_selection(self):
+        if not hasattr(self, "piv2d_frame1_preview"):
+            return
+        if not self.piv2d_frame1_preview.begin_mask_selection():
+            QMessageBox.warning(self, "提示", "请先选择并预览第1帧图像")
+            return
+        self.piv2d_log.append("请在第1帧预览图中拖拽选择无粒子区域")
+
+    def _piv2d_on_mask_changed(self, mask):
+        self._piv2d_exclusion_mask = None if mask is None else np.asarray(mask, dtype=bool).copy()
+        self._piv2d_update_mask_info()
+        if hasattr(self, "piv2d_result_preview"):
+            self.piv2d_result_preview.set_exclusion_mask(self._piv2d_exclusion_mask)
+
+    def _piv2d_clear_mask(self):
+        self._piv2d_exclusion_mask = None
+        if hasattr(self, "piv2d_frame1_preview"):
+            self.piv2d_frame1_preview.clear_exclusion_mask()
+        if hasattr(self, "piv2d_result_preview"):
+            self.piv2d_result_preview.set_exclusion_mask(None)
+        self._piv2d_update_mask_info()
+        self.piv2d_log.append("已清除无粒子区域")
+
+    def _piv2d_update_mask_info(self):
+        if not hasattr(self, "piv2d_mask_info_label"):
+            return
+        if self._piv2d_exclusion_mask is None or not np.any(self._piv2d_exclusion_mask):
+            self.piv2d_mask_info_label.setText("未设置")
+            return
+        count = int(np.sum(self._piv2d_exclusion_mask))
+        h, w = self._piv2d_exclusion_mask.shape
+        self.piv2d_mask_info_label.setText(f"已屏蔽 {count} 像素 ({count / max(1, h * w) * 100:.1f}%)")
+
+    def _piv2d_mask_for_image(self, image: np.ndarray) -> Optional[np.ndarray]:
+        if self._piv2d_exclusion_mask is None:
+            return None
+        if self._piv2d_exclusion_mask.shape != image.shape[:2]:
+            self.piv2d_log.append("无粒子区域尺寸与当前图像不一致，已忽略")
+            return None
+        return self._piv2d_exclusion_mask
+
     def _piv2d_run_single(self):
         import cv2 as _cv2
         if not self.piv2d_frame1_path or not self.piv2d_frame2_path:
@@ -7007,7 +7190,8 @@ class BubbleTomographyGUI(QMainWindow):
 
         try:
             calculator = PIV2DCalculator(self._piv2d_get_config())
-            result = calculator.compute_velocity_field(img1, img2)
+            exclusion_mask = self._piv2d_mask_for_image(img1)
+            result = calculator.compute_velocity_field(img1, img2, exclusion_mask=exclusion_mask)
             summary = calculator.summarize_result(result)
             self._piv2d_last_result = result
             self._piv2d_last_image = img1
@@ -7043,6 +7227,21 @@ class BubbleTomographyGUI(QMainWindow):
             return
         os.makedirs(self.piv2d_dst_dir, exist_ok=True)
 
+        batch_mask = self._piv2d_exclusion_mask
+        if batch_mask is not None:
+            first_file = next(
+                (
+                    p for p in sorted(Path(self.piv2d_src_dir).iterdir())
+                    if p.is_file() and p.suffix.lower() in PIV2D_EXTS
+                ),
+                None,
+            )
+            if first_file is not None:
+                first_image = robust_imread(str(first_file), cv2.IMREAD_UNCHANGED)
+                if first_image is not None and batch_mask.shape != first_image.shape[:2]:
+                    QMessageBox.warning(self, "提示", "无粒子区域尺寸与批量图像不一致，请重新选择或清除该区域")
+                    return
+
         self.piv2d_progress.setValue(0)
         self.piv2d_progress.setVisible(True)
         self.piv2d_batch_run_btn.setEnabled(False)
@@ -7053,6 +7252,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.piv2d_src_dir,
             self.piv2d_dst_dir,
             self._piv2d_get_config(),
+            exclusion_mask=batch_mask,
         )
         self.piv2d_worker_thread.progress.connect(self._piv2d_on_batch_progress)
         self.piv2d_worker_thread.finished.connect(self._piv2d_on_batch_finished)
@@ -7096,6 +7296,8 @@ class BubbleTomographyGUI(QMainWindow):
             return
         if hasattr(label, "set_image_array"):
             label.set_image_array(img, os.path.basename(path))
+            if label is getattr(self, "piv2d_frame1_preview", None):
+                label.set_exclusion_mask(self._piv2d_exclusion_mask)
             return
         pixmap = self._ie_ndarray_to_pixmap(img)
         if pixmap:
@@ -7115,6 +7317,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._piv2d_vector_color_mode(),
         )
         self.piv2d_result_preview.set_vector_result(image, result, title)
+        self.piv2d_result_preview.set_exclusion_mask(self._piv2d_mask_for_image(image))
 
     def _piv2d_refresh_vector_preview(self, *_):
         if self._piv2d_last_image is None or self._piv2d_last_result is None:
@@ -7150,6 +7353,7 @@ class BubbleTomographyGUI(QMainWindow):
             "speed": data["speed"],
             "snr": data["snr"],
             "valid": data["valid"],
+            "excluded": data["excluded"] if "excluded" in data.files else np.zeros_like(data["valid"], dtype=bool),
         }
         self._piv2d_last_image = image
         self._piv2d_last_result = result
