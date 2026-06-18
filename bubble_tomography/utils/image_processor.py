@@ -14,6 +14,9 @@ import cv2
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from .cpu_parallel import default_worker_count, limited_opencv_threads
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +225,8 @@ class BubbleImageProcessor:
                                  camera_params: Dict[str, dict],
                                  reference_images: Optional[Dict[str, np.ndarray]] = None,
                                  projection_type: str = 'soft_edge',
-                                 manual_threshold: Optional[float] = None
+                                 manual_threshold: Optional[float] = None,
+                                 max_workers: Optional[int] = None
                                  ) -> Dict[str, np.ndarray]:
         """
         完整的图像预处理流程：去背景 → 分割 → 计算投影
@@ -276,6 +280,62 @@ class BubbleImageProcessor:
             logger.info(f"  相机 {cam_id}: 气泡像素占比 "
                         f"{np.mean(binary > 0) * 100:.1f}%")
         
+        return projections
+
+    def prepare_projection_data(self,
+                                 camera_images: Dict[str, np.ndarray],
+                                 camera_params: Dict[str, dict],
+                                 reference_images: Optional[Dict[str, np.ndarray]] = None,
+                                 projection_type: str = 'soft_edge',
+                                 manual_threshold: Optional[float] = None,
+                                 max_workers: Optional[int] = None
+                                 ) -> Dict[str, np.ndarray]:
+        """Prepare projection images with conservative CPU parallelism."""
+        worker_count = default_worker_count(max_workers)
+        if len(camera_images) <= 1:
+            worker_count = 1
+
+        def process_camera(cam_id: str, image: np.ndarray) -> Tuple[str, np.ndarray, float]:
+            logger.info("Preprocessing camera %s image...", cam_id)
+
+            if cam_id in camera_params:
+                cp = camera_params[cam_id]
+                K = np.array(cp['camera_matrix'])
+                D = cp.get('dist_coeffs', None)
+                if D is not None:
+                    image = self.undistort_image(image, K, np.array(D))
+
+            ref_img = None
+            if reference_images and cam_id in reference_images:
+                ref_img = reference_images[cam_id]
+
+            foreground = self.remove_background(image, cam_id, ref_img)
+            binary = self.segment_bubbles(foreground, manual_threshold)
+            proj = self.compute_projection(binary, projection_type)
+            return cam_id, proj, float(np.mean(binary > 0) * 100.0)
+
+        projections = {}
+        if worker_count <= 1:
+            for cam_id, image in camera_images.items():
+                cam_id, proj, bubble_ratio = process_camera(cam_id, image)
+                projections[cam_id] = proj
+                logger.info("  Camera %s: bubble pixel ratio %.1f%%",
+                            cam_id, bubble_ratio)
+            return projections
+
+        logger.info("Parallel image preprocessing: cameras=%d, workers=%d",
+                    len(camera_images), worker_count)
+        with limited_opencv_threads(), ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(process_camera, cam_id, image)
+                for cam_id, image in camera_images.items()
+            ]
+            for future in as_completed(futures):
+                cam_id, proj, bubble_ratio = future.result()
+                projections[cam_id] = proj
+                logger.info("  Camera %s: bubble pixel ratio %.1f%%",
+                            cam_id, bubble_ratio)
+
         return projections
 
     def set_background(self, camera_id: str, background: np.ndarray):

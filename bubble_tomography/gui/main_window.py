@@ -8,6 +8,7 @@ import json
 import re
 import cv2
 import numpy as np
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -49,6 +50,7 @@ from utils.image_editor import (
     ArithmeticParams, ThresholdParams,
     robust_imread,
 )
+from utils.cpu_parallel import default_worker_count, limited_opencv_threads
 
 
 class CalibrationWorker(QThread):
@@ -3572,7 +3574,7 @@ class BubbleTomographyGUI(QMainWindow):
         img_layout.addWidget(btn_load_particles_batch)
 
         self.particle_batch_info = QLabel(
-            "?????????????????????????\n"
+            "每个相机选择一组按时间排序的粒子图像。\n"
             "系统会按时间顺序对齐各相机序列，并可分别指定第1帧和第2帧。"
         )
         self.particle_batch_info.setStyleSheet("color: gray; font-size: 11px;")
@@ -3596,67 +3598,67 @@ class BubbleTomographyGUI(QMainWindow):
 
         frame_select_group = QGroupBox("第1帧 / 第2帧设置")
         frame_select_layout = QGridLayout(frame_select_group)
-        frame_select_layout.addWidget(QLabel("?1?:"), 0, 0)
+        frame_select_layout.addWidget(QLabel("第1帧:"), 0, 0)
         self.piv_frame1_combo = QComboBox()
         self.piv_frame1_combo.setEnabled(False)
         self.piv_frame1_combo.currentIndexChanged.connect(
             lambda idx: self._on_particle_frame_combo_changed(1, idx)
         )
         frame_select_layout.addWidget(self.piv_frame1_combo, 0, 1)
-        frame_select_layout.addWidget(QLabel("?2?:"), 1, 0)
+        frame_select_layout.addWidget(QLabel("第2帧:"), 1, 0)
         self.piv_frame2_combo = QComboBox()
         self.piv_frame2_combo.setEnabled(False)
         self.piv_frame2_combo.currentIndexChanged.connect(
             lambda idx: self._on_particle_frame_combo_changed(2, idx)
         )
         frame_select_layout.addWidget(self.piv_frame2_combo, 1, 1)
-        self.piv_frame_select_info = QLabel("?????")
+        self.piv_frame_select_info = QLabel("未加载时间序列")
         self.piv_frame_select_info.setStyleSheet("color: #666;")
         self.piv_frame_select_info.setWordWrap(True)
         frame_select_layout.addWidget(self.piv_frame_select_info, 2, 0, 1, 2)
         img_layout.addWidget(frame_select_group)
 
-        # ??????????
+        # 单帧手动加载
         single_frame_layout = QHBoxLayout()
-        btn_load_frame1 = QPushButton("??: ???1?...")
+        btn_load_frame1 = QPushButton("手动加载第1帧...")
         btn_load_frame1.clicked.connect(self._load_particle_frame1)
         single_frame_layout.addWidget(btn_load_frame1)
 
-        btn_load_frame2 = QPushButton("??: ???2?...")
+        btn_load_frame2 = QPushButton("手动加载第2帧...")
         btn_load_frame2.clicked.connect(self._load_particle_frame2)
         single_frame_layout.addWidget(btn_load_frame2)
         img_layout.addLayout(single_frame_layout)
 
-        self.particle_status = QLabel("???????")
+        self.particle_status = QLabel("尚未加载粒子图像")
         self.particle_status.setStyleSheet("color: gray;")
         img_layout.addWidget(self.particle_status)
 
         img_group.setLayout(img_layout)
         left_layout.addWidget(img_group)
 
-        # ??????
-        det_group = QGroupBox("??????")
+        # 粒子检测参数
+        det_group = QGroupBox("粒子检测参数")
         det_grid = QGridLayout()
-        det_grid.addWidget(QLabel("???? (px?):"), 0, 0)
+        det_grid.addWidget(QLabel("最小面积 (px²):"), 0, 0)
         self.p_min_area = QDoubleSpinBox()
         self.p_min_area.setRange(0.5, 100)
         self.p_min_area.setValue(2.0)
         det_grid.addWidget(self.p_min_area, 0, 1)
 
-        det_grid.addWidget(QLabel("???? (px?):"), 1, 0)
+        det_grid.addWidget(QLabel("最大面积 (px²):"), 1, 0)
         self.p_max_area = QDoubleSpinBox()
         self.p_max_area.setRange(10, 2000)
         self.p_max_area.setValue(200.0)
         det_grid.addWidget(self.p_max_area, 1, 1)
 
-        det_grid.addWidget(QLabel("?????:"), 2, 0)
+        det_grid.addWidget(QLabel("圆度阈值:"), 2, 0)
         self.p_circularity = QDoubleSpinBox()
         self.p_circularity.setRange(0.1, 1.0)
         self.p_circularity.setValue(0.5)
         self.p_circularity.setSingleStep(0.05)
         det_grid.addWidget(self.p_circularity, 2, 1)
 
-        det_grid.addWidget(QLabel("????? (px):"), 3, 0)
+        det_grid.addWidget(QLabel("极线阈值 (px):"), 3, 0)
         self.p_epipolar = QDoubleSpinBox()
         self.p_epipolar.setRange(0.5, 20)
         self.p_epipolar.setValue(3.0)
@@ -3665,8 +3667,8 @@ class BubbleTomographyGUI(QMainWindow):
         det_group.setLayout(det_grid)
         left_layout.addWidget(det_group)
 
-        # ?????
-        vel_group = QGroupBox("?????")
+        # 速度场参数
+        vel_group = QGroupBox("速度场参数")
         vel_grid = QGridLayout()
         vel_grid.addWidget(QLabel("dt (s):"), 0, 0)
         self.piv_dt = QDoubleSpinBox()
@@ -3676,21 +3678,21 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv_dt.setSingleStep(0.0001)
         vel_grid.addWidget(self.piv_dt, 0, 1)
 
-        vel_grid.addWidget(QLabel("????? (mm):"), 1, 0)
+        vel_grid.addWidget(QLabel("查询窗口尺寸 (mm):"), 1, 0)
         self.piv_interrog = QDoubleSpinBox()
         self.piv_interrog.setRange(0.5, 20)
         self.piv_interrog.setValue(2.0)
         self.piv_interrog.setSingleStep(0.5)
         vel_grid.addWidget(self.piv_interrog, 1, 1)
 
-        vel_grid.addWidget(QLabel("???:"), 2, 0)
+        vel_grid.addWidget(QLabel("重叠率:"), 2, 0)
         self.piv_overlap = QDoubleSpinBox()
         self.piv_overlap.setRange(0.0, 0.75)
         self.piv_overlap.setValue(0.5)
         self.piv_overlap.setSingleStep(0.1)
         vel_grid.addWidget(self.piv_overlap, 2, 1)
 
-        vel_grid.addWidget(QLabel("SNR??:"), 3, 0)
+        vel_grid.addWidget(QLabel("SNR 阈值:"), 3, 0)
         self.piv_snr = QDoubleSpinBox()
         self.piv_snr.setRange(0.5, 5.0)
         self.piv_snr.setValue(1.2)
@@ -3700,10 +3702,10 @@ class BubbleTomographyGUI(QMainWindow):
         vel_group.setLayout(vel_grid)
         left_layout.addWidget(vel_group)
 
-        # ????
+        # 操作按钮
         piv_btn_layout = QHBoxLayout()
 
-        btn_reconstruct_p = QPushButton("????3D??")
+        btn_reconstruct_p = QPushButton("粒子3D重建")
         btn_reconstruct_p.setStyleSheet(
             "QPushButton { background-color: #FF9800; color: white; "
             "font-size: 13px; padding: 8px; border-radius: 5px; }"
@@ -3712,7 +3714,7 @@ class BubbleTomographyGUI(QMainWindow):
         btn_reconstruct_p.clicked.connect(self._run_particle_reconstruction)
         piv_btn_layout.addWidget(btn_reconstruct_p)
 
-        btn_piv_all = QPushButton("????????")
+        btn_piv_all = QPushButton("批量计算速度场")
         btn_piv_all.setStyleSheet(
             "QPushButton { background-color: #E65100; color: white; "
             "font-size: 13px; padding: 8px; border-radius: 5px; }"
@@ -3723,7 +3725,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         left_layout.addLayout(piv_btn_layout)
 
-        btn_velocity = QPushButton("???????????")
+        btn_velocity = QPushButton("计算当前双帧速度场")
         btn_velocity.setStyleSheet(
             "QPushButton { background-color: #9C27B0; color: white; "
             "font-size: 13px; padding: 8px; border-radius: 5px; }"
@@ -3955,7 +3957,7 @@ class BubbleTomographyGUI(QMainWindow):
         for cam_id, label in self._particle_sequence_info_labels.items():
             paths = self.particle_sequence_paths.get(cam_id, [])
             if paths:
-                label.setText(f"已加?{len(paths)} 张\n首张: {os.path.basename(paths[0])}")
+                label.setText(f"已加载 {len(paths)} 张\n首张: {os.path.basename(paths[0])}")
                 label.setStyleSheet("color: green;")
             else:
                 label.setText("未加载")
@@ -3966,7 +3968,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            f"选择 {cam_id} 的粒子图像序?",
+            f"选择 {cam_id} 的粒子图像序列",
             "",
             "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;所有文件 (*)"
         )
@@ -4022,15 +4024,15 @@ class BubbleTomographyGUI(QMainWindow):
             self._set_particle_frame_by_index(1, default_f1)
             self._set_particle_frame_by_index(2, default_f2)
             self.particle_status.setText(
-                f"已?{len(self.particle_timepoint_images)} 丗间点?"
-                f"{len(active)} ???"
+                f"已对齐 {len(self.particle_timepoint_images)} 个时间点，"
+                f"{len(active)} 个相机"
             )
             self.particle_status.setStyleSheet("color: green; font-weight: bold;")
             if update_log:
                 self.piv_log.append(
                     f"=== 粒子序列对齐完成 ===\n"
                     f"相机数量: {len(active)}\n"
-                    f"时间点数? {len(self.particle_timepoint_images)}\n"
+                    f"时间点数: {len(self.particle_timepoint_images)}\n"
                     f"序列长度: {seq_lengths}\n"
                 )
         else:
@@ -4090,8 +4092,8 @@ class BubbleTomographyGUI(QMainWindow):
             return self.particle_timepoint_names.get(idx, f"t{idx}")
 
         self.piv_frame_select_info.setText(
-            f"当前双帧: ??= {_name(self.piv_frame1_combo)}?"
-            f"绗?甯?= {_name(self.piv_frame2_combo)}"
+            f"当前双帧: 第1帧 = {_name(self.piv_frame1_combo)}\n"
+            f"第2帧 = {_name(self.piv_frame2_combo)}"
         )
 
     def _refresh_particle_camera_previews(self):
@@ -6125,7 +6127,7 @@ class BubbleTomographyGUI(QMainWindow):
                           c='yellow', s=1, alpha=0.3, label='背面点云')
                 has_content = True
 
-            # ???
+            # 生成速度场报告
             if self.rt_processor.bubble_all_face_direction is not None and \
                self.rt_processor.bubble_all_position_face_world is not None:
                 pos = self.rt_processor.bubble_all_position_face_world[::10, :3]
@@ -6561,7 +6563,7 @@ class BubbleTomographyGUI(QMainWindow):
                     f"第二帧重建 {len(self.particles_3d_frame2)} 个粒子"
                 )
 
-            # ???
+            # 显示粒子三维点云预览
             if self.particles_3d_frame1:
                 self.visualizer.plot_particle_positions_3d(
                     self.particles_3d_frame1,
@@ -6576,11 +6578,11 @@ class BubbleTomographyGUI(QMainWindow):
 
             QMessageBox.information(self, "完成",
                 f"粒子重建完成!\n"
-                f"???: {len(self.particles_3d_frame1)} ??\n"
-                f"???: {len(self.particles_3d_frame2)} ??")
+                f"第一帧: {len(self.particles_3d_frame1)} 个粒子\n"
+                f"第二帧: {len(self.particles_3d_frame2)} 个粒子")
         except Exception as e:
             QMessageBox.critical(self, "错误", str(e))
-            self.piv_log.append(f"??: {e}")
+            self.piv_log.append(f"错误: {e}")
         finally:
             self.progress_bar.setVisible(False)
 
@@ -6663,7 +6665,7 @@ class BubbleTomographyGUI(QMainWindow):
                 vf = result['velocity_result']['velocity_field']
                 speed = np.linalg.norm(vf, axis=-1)
                 self.piv_log.append(
-                    f"  ?? {name} -> {n2} | "
+                    f"  帧对 {name} -> {n2} | "
                     f"粒子: {len(result['particles_3d_frame1'])} / "
                     f"{len(result['particles_3d_frame2'])} | "
                     f"平均速度: {speed.mean():.2f} mm/s"
@@ -6680,7 +6682,7 @@ class BubbleTomographyGUI(QMainWindow):
             f"成功处理 {total} 组\n"
             f"请使用底部时间点滑块切换查看各时刻结果"
         )
-        self.statusBar().showMessage(f"??PIV??: {total} ?")
+        self.statusBar().showMessage(f"批量PIV完成: {total} 组")
         QMessageBox.information(self, "完成",
             f"批量PIV处理完成!\n成功处理 {total} 组\n"
             f"请使用底部时间点滑块切换查看结果")
@@ -6767,7 +6769,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.piv_log.append(f"平均速度: {speed.mean():.2f} mm/s")
             self.piv_log.append(f"最大速度: {speed.max():.2f} mm/s")
 
-            # ???
+            # 生成速度场报告
             self.visualizer.create_velocity_report(
                 self._velocity_result,
                 self.particles_3d_frame1,
@@ -6794,7 +6796,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "错误", str(e))
-            self.piv_log.append(f"??: {e}")
+            self.piv_log.append(f"错误: {e}")
         finally:
             self.progress_bar.setVisible(False)
 
@@ -7809,6 +7811,12 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_dst_label = QLabel("未选择")
         self.ie_dst_label.setStyleSheet("color: #888; border: none;")
         bg_lay.addWidget(self.ie_dst_label)
+        bg_lay.addWidget(QLabel("CPU workers"))
+        self.ie_workers_spin = QSpinBox()
+        self.ie_workers_spin.setRange(1, default_worker_count(os.cpu_count()))
+        self.ie_workers_spin.setValue(default_worker_count())
+        self.ie_workers_spin.setToolTip("Parallel image-processing workers; default leaves CPU cores free.")
+        bg_lay.addWidget(self.ie_workers_spin)
         sb_lay.addWidget(self.ie_batch_widget)
         self.ie_batch_widget.hide()
 
@@ -8969,7 +8977,8 @@ class BubbleTomographyGUI(QMainWindow):
 
         self.ie_worker_thread = _IEBatchWorker(
             self.ie_src_dir, self.ie_dst_dir,
-            self.ie_config, step_order, filename_pattern)
+            self.ie_config, step_order, filename_pattern,
+            max_workers=self.ie_workers_spin.value())
         self.ie_worker_thread.progress.connect(self._ie_on_batch_progress)
         self.ie_worker_thread.finished.connect(self._ie_on_batch_finished)
         self.ie_worker_thread.error.connect(self._ie_on_batch_error)
@@ -9135,13 +9144,15 @@ class _IEBatchWorker(QThread):
     error    = pyqtSignal(str)
 
     def __init__(self, src_dir, dst_dir, config: "ImageEditConfig",
-                 step_order=None, filename_pattern="{original}_processed"):
+                 step_order=None, filename_pattern="{original}_processed",
+                 max_workers=None):
         super().__init__()
         self.src_dir = src_dir
         self.dst_dir = dst_dir
         self.config  = config
         self.step_order = step_order or []
         self.filename_pattern = filename_pattern
+        self.max_workers = max_workers
         self._stop   = False
 
     def stop(self):
@@ -9166,20 +9177,52 @@ class _IEBatchWorker(QThread):
                 op_img = robust_imread(self.config.arithmetic.operand_path,
                                      _cv2.IMREAD_UNCHANGED)
 
-            editor = ImageEditor(self.config)
-            for i, f in enumerate(files):
-                if self._stop:
-                    break
+            worker_count = default_worker_count(self.max_workers)
+            if total <= 1:
+                worker_count = 1
+
+            def process_one(index, file_path):
+                editor = ImageEditor(self.config)
                 dst_name = _ie_resolve_batch_filename(
-                    f.name, i, self.step_order, self.filename_pattern)
+                    file_path.name, index, self.step_order, self.filename_pattern)
                 dst = str(Path(self.dst_dir) / dst_name)
-                img = robust_imread(str(f), _cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    result = editor.process(img, op_img,
-                                            step_order=self.step_order)
-                    _cv2.imwrite(dst, result)
-                    success += 1
-                self.progress.emit(i + 1, total, f.name)
+                img = robust_imread(str(file_path), _cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    return index, file_path.name, False
+                result = editor.process(img, op_img, step_order=self.step_order)
+                ok = _cv2.imwrite(dst, result)
+                return index, file_path.name, bool(ok)
+
+            if worker_count <= 1:
+                for i, f in enumerate(files):
+                    if self._stop:
+                        break
+                    _, fname, ok = process_one(i, f)
+                    if ok:
+                        success += 1
+                    self.progress.emit(i + 1, total, fname)
+                self.finished.emit(success, total)
+                return
+
+            completed = 0
+            next_index = 0
+            in_flight = set()
+            with limited_opencv_threads(), ThreadPoolExecutor(max_workers=worker_count) as executor:
+                while (next_index < total or in_flight) and not self._stop:
+                    while next_index < total and len(in_flight) < worker_count and not self._stop:
+                        in_flight.add(executor.submit(process_one, next_index, files[next_index]))
+                        next_index += 1
+
+                    if not in_flight:
+                        break
+
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        _, fname, ok = future.result()
+                        completed += 1
+                        if ok:
+                            success += 1
+                        self.progress.emit(completed, total, fname)
 
             self.finished.emit(success, total)
         except Exception as e:
