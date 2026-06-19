@@ -6,6 +6,7 @@ import sys
 import os
 import json
 import re
+import time
 import cv2
 import numpy as np
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -300,12 +301,20 @@ class BatchPIV2DWorker(QThread):
     finished = pyqtSignal(int, int, list)
     error = pyqtSignal(str)
 
-    def __init__(self, src_dir: str, dst_dir: str, config: PIV2DConfig, exclusion_mask: Optional[np.ndarray] = None):
+    def __init__(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        config: PIV2DConfig,
+        exclusion_mask: Optional[np.ndarray] = None,
+        frame_pairs: Optional[List[tuple]] = None,
+    ):
         super().__init__()
         self.src_dir = src_dir
         self.dst_dir = dst_dir
         self.config = config
         self.exclusion_mask = None if exclusion_mask is None else np.asarray(exclusion_mask, dtype=bool).copy()
+        self.frame_pairs = frame_pairs
         self._stop = False
 
     def stop(self):
@@ -318,6 +327,7 @@ class BatchPIV2DWorker(QThread):
                 self.src_dir,
                 self.dst_dir,
                 exclusion_mask=self.exclusion_mask,
+                frame_pairs=self.frame_pairs,
                 progress_callback=lambda done, total, name: self.progress.emit(done, total, name),
                 stop_checker=lambda: self._stop,
             )
@@ -341,8 +351,11 @@ class PIV2DPreviewWidget(QWidget):
         self._colorbar = None
         self._exclusion_mask = None
         self._mask_selection_enabled = False
+        self._mask_shape = "rectangle"
         self._mask_press = None
         self._mask_drag_patch = None
+        self._mask_polygon_points = []
+        self._correlation_window_size = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -359,6 +372,9 @@ class PIV2DPreviewWidget(QWidget):
         self.info_label.setStyleSheet("color: #444; font-family: Consolas;")
         layout.addWidget(self.info_label)
         self._render()
+
+    def set_correlation_window_size(self, size: Optional[int]):
+        self._correlation_window_size = None if size is None else int(size)
 
     def set_image_path(self, path: str):
         image = robust_imread(path, cv2.IMREAD_UNCHANGED)
@@ -396,12 +412,21 @@ class PIV2DPreviewWidget(QWidget):
         self.info_label.setText("灰度值: --")
         self._render()
 
-    def begin_mask_selection(self):
+    def begin_mask_selection(self, shape: str = "rectangle"):
         if self._image is None:
             return False
+        self._mask_shape = shape
         self._mask_selection_enabled = True
         self._mask_press = None
-        self.info_label.setText("拖拽选择无粒子区域")
+        self._mask_polygon_points = []
+        self._remove_drag_patch()
+        hints = {
+            "rectangle": "拖拽选择矩形无粒子区域",
+            "circle": "拖拽选择圆形无粒子区域",
+            "triangle": "拖拽选择三角形无粒子区域",
+            "polygon": "左键添加多边形顶点，双击结束",
+        }
+        self.info_label.setText(hints.get(shape, "选择无粒子区域"))
         return True
 
     def set_exclusion_mask(self, mask: Optional[np.ndarray]):
@@ -417,6 +442,7 @@ class PIV2DPreviewWidget(QWidget):
     def clear_exclusion_mask(self):
         self._mask_selection_enabled = False
         self._mask_press = None
+        self._mask_polygon_points = []
         self._exclusion_mask = None
         self.mask_changed.emit(None)
         self._render()
@@ -492,10 +518,23 @@ class PIV2DPreviewWidget(QWidget):
             )
 
     def _on_mouse_press(self, event):
+        if self._is_right_button(event):
+            self._show_context_menu(event)
+            return
+
         if not self._mask_selection_enabled or self._image is None or event.inaxes is not self.axes:
             return
         if event.xdata is None or event.ydata is None:
             return
+
+        if self._mask_shape == "polygon":
+            self._mask_polygon_points.append((float(event.xdata), float(event.ydata)))
+            if getattr(event, "dblclick", False) and len(self._mask_polygon_points) >= 3:
+                self._finish_polygon_mask()
+            else:
+                self._draw_polygon_preview()
+            return
+
         self._mask_press = (float(event.xdata), float(event.ydata))
         self._remove_drag_patch()
 
@@ -523,12 +562,8 @@ class PIV2DPreviewWidget(QWidget):
             self.info_label.setText("无粒子区域未改变")
             return
 
-        if self._exclusion_mask is None:
-            self._exclusion_mask = np.zeros((h, w), dtype=bool)
-        self._exclusion_mask[y_min:y_max, x_min:x_max] = True
-        self.mask_changed.emit(self._exclusion_mask.copy())
-        self.info_label.setText(f"已添加无粒子区域: x={x_min}:{x_max}, y={y_min}:{y_max}")
-        self._render()
+        mask = self._shape_mask_from_bounds(x_min, x_max, y_min, y_max)
+        self._apply_mask(mask, f"已添加{self._mask_shape_label()}无粒子区域: x={x_min}:{x_max}, y={y_min}:{y_max}")
 
     def _on_mouse_move(self, event):
         if self._mask_selection_enabled and self._image is not None and self._mask_press is not None:
@@ -552,15 +587,56 @@ class PIV2DPreviewWidget(QWidget):
     def _update_drag_patch(self, event):
         if event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
             return
-        from matplotlib.patches import Rectangle
+        from matplotlib.patches import Circle, Polygon, Rectangle
 
         x0, y0 = self._mask_press
         x1, y1 = float(event.xdata), float(event.ydata)
         self._remove_drag_patch()
-        self._mask_drag_patch = Rectangle(
-            (min(x0, x1), min(y0, y1)),
-            abs(x1 - x0),
-            abs(y1 - y0),
+        if self._mask_shape == "circle":
+            self._mask_drag_patch = Circle(
+                ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+                max(1.0, min(abs(x1 - x0), abs(y1 - y0)) / 2.0),
+                fill=False,
+                edgecolor="#ff2d2d",
+                linewidth=1.5,
+                linestyle="--",
+            )
+        elif self._mask_shape == "triangle":
+            points = [
+                ((x0 + x1) / 2.0, min(y0, y1)),
+                (min(x0, x1), max(y0, y1)),
+                (max(x0, x1), max(y0, y1)),
+            ]
+            self._mask_drag_patch = Polygon(
+                points,
+                closed=True,
+                fill=False,
+                edgecolor="#ff2d2d",
+                linewidth=1.5,
+                linestyle="--",
+            )
+        else:
+            self._mask_drag_patch = Rectangle(
+                (min(x0, x1), min(y0, y1)),
+                abs(x1 - x0),
+                abs(y1 - y0),
+                fill=False,
+                edgecolor="#ff2d2d",
+                linewidth=1.5,
+                linestyle="--",
+            )
+        self.axes.add_patch(self._mask_drag_patch)
+        self.canvas.draw_idle()
+
+    def _draw_polygon_preview(self):
+        from matplotlib.patches import Polygon
+
+        self._remove_drag_patch()
+        if not self._mask_polygon_points:
+            return
+        self._mask_drag_patch = Polygon(
+            self._mask_polygon_points,
+            closed=False,
             fill=False,
             edgecolor="#ff2d2d",
             linewidth=1.5,
@@ -576,6 +652,86 @@ class PIV2DPreviewWidget(QWidget):
             except ValueError:
                 pass
             self._mask_drag_patch = None
+
+    @staticmethod
+    def _is_right_button(event) -> bool:
+        button = getattr(event, "button", None)
+        return button == 3 or str(button).lower().endswith("right")
+
+    def _shape_mask_from_bounds(self, x_min: int, x_max: int, y_min: int, y_max: int) -> np.ndarray:
+        h, w = self._image.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        if self._mask_shape == "circle":
+            center = ((x_min + x_max) // 2, (y_min + y_max) // 2)
+            radius = max(1, min(x_max - x_min, y_max - y_min) // 2)
+            cv2.circle(mask, center, radius, 1, thickness=-1)
+        elif self._mask_shape == "triangle":
+            points = np.array(
+                [
+                    [(x_min + x_max) // 2, y_min],
+                    [x_min, y_max],
+                    [x_max, y_max],
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillPoly(mask, [points], 1)
+        else:
+            mask[y_min:y_max, x_min:x_max] = 1
+        return mask.astype(bool)
+
+    def _finish_polygon_mask(self):
+        if self._image is None or len(self._mask_polygon_points) < 3:
+            self.info_label.setText("多边形至少需要3个顶点")
+            return
+        h, w = self._image.shape[:2]
+        points = np.array(
+            [
+                [int(np.clip(round(x), 0, w - 1)), int(np.clip(round(y), 0, h - 1))]
+                for x, y in self._mask_polygon_points
+            ],
+            dtype=np.int32,
+        )
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [points], 1)
+        self._mask_selection_enabled = False
+        self._mask_press = None
+        self._mask_polygon_points = []
+        self._remove_drag_patch()
+        self._apply_mask(mask.astype(bool), "已添加多边形无粒子区域")
+
+    def _apply_mask(self, mask: np.ndarray, message: str):
+        if self._image is None or mask is None or not np.any(mask):
+            self.info_label.setText("无粒子区域未改变")
+            return
+        h, w = self._image.shape[:2]
+        if self._exclusion_mask is None:
+            self._exclusion_mask = np.zeros((h, w), dtype=bool)
+        self._exclusion_mask |= mask.astype(bool)
+        self.mask_changed.emit(self._exclusion_mask.copy())
+        self.info_label.setText(message)
+        self._render()
+
+    def _show_context_menu(self, event):
+        menu = QMenu(self)
+        text = (
+            f"当前互相关窗口尺寸: {self._correlation_window_size} px"
+            if self._correlation_window_size
+            else "当前互相关窗口尺寸: 未设置"
+        )
+        action = menu.addAction(text)
+        action.setEnabled(False)
+        if getattr(event, "guiEvent", None) is not None:
+            menu.exec_(self.canvas.mapToGlobal(event.guiEvent.pos()))
+        else:
+            menu.exec_(self.canvas.mapToGlobal(self.canvas.rect().center()))
+
+    def _mask_shape_label(self) -> str:
+        return {
+            "rectangle": "矩形",
+            "circle": "圆形",
+            "triangle": "三角形",
+            "polygon": "多边形",
+        }.get(self._mask_shape, "几何")
 
     @staticmethod
     def _to_gray(image: np.ndarray) -> np.ndarray:
@@ -2105,6 +2261,10 @@ class BubbleTomographyGUI(QMainWindow):
         self._piv2d_last_result: Optional[dict] = None
         self._piv2d_last_image: Optional[np.ndarray] = None
         self._piv2d_exclusion_mask: Optional[np.ndarray] = None
+        self._piv2d_processing_start = 0.0
+        self._piv2d_processing_prefix = "二维PIV"
+        self._piv2d_elapsed_timer = QTimer(self)
+        self._piv2d_elapsed_timer.timeout.connect(self._piv2d_update_elapsed_time)
 
         # 工作目录
         self._work_dir: str = ""
@@ -2265,6 +2425,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
+        self.processing_time_label = QLabel("处理时间: --")
+        self.statusBar().addPermanentWidget(self.processing_time_label)
 
     def _make_separator(self):
         """创建分隔线。"""
@@ -6828,6 +6990,8 @@ class BubbleTomographyGUI(QMainWindow):
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setFixedWidth(self._sp(380))
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -6887,6 +7051,28 @@ class BubbleTomographyGUI(QMainWindow):
         mode_layout.addWidget(timeline_hint, 2, 0, 1, 2)
         left_layout.addWidget(mode_group)
 
+        batch_pair_group = QGroupBox("批量帧对")
+        batch_pair_layout = QGridLayout(batch_pair_group)
+        batch_pair_layout.addWidget(QLabel("组合方式:"), 0, 0)
+        self.piv2d_batch_pair_mode_combo = QComboBox()
+        self.piv2d_batch_pair_mode_combo.addItems([
+            "连续相邻 (1-2, 2-3, 3-4)",
+            "两两分组 (1-2, 3-4, 5-6)",
+            "自定义帧对",
+        ])
+        self.piv2d_batch_pair_mode_combo.currentIndexChanged.connect(self._piv2d_on_batch_pair_mode_changed)
+        batch_pair_layout.addWidget(self.piv2d_batch_pair_mode_combo, 0, 1)
+        batch_pair_layout.addWidget(QLabel("自定义:"), 1, 0)
+        self.piv2d_batch_pairs_edit = QLineEdit()
+        self.piv2d_batch_pairs_edit.setPlaceholderText("例如: 1-2, 3-4, 5-6 或 1,2,3,4")
+        self.piv2d_batch_pairs_edit.setEnabled(False)
+        batch_pair_layout.addWidget(self.piv2d_batch_pairs_edit, 1, 1)
+        self.piv2d_batch_pair_hint = QLabel("编号按输入目录中排序后的图像序号，从 1 开始。")
+        self.piv2d_batch_pair_hint.setWordWrap(True)
+        self.piv2d_batch_pair_hint.setStyleSheet("color: gray; font-size: 11px;")
+        batch_pair_layout.addWidget(self.piv2d_batch_pair_hint, 2, 0, 1, 2)
+        left_layout.addWidget(batch_pair_group)
+
         cfg_group = QGroupBox("互相关参数")
         cfg_layout = QGridLayout(cfg_group)
         cfg_layout.addWidget(QLabel("窗口尺寸:"), 0, 0)
@@ -6894,6 +7080,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_win_spin.setRange(8, 256)
         self.piv2d_win_spin.setSingleStep(4)
         self.piv2d_win_spin.setValue(32)
+        self.piv2d_win_spin.valueChanged.connect(self._piv2d_sync_correlation_window_size)
         cfg_layout.addWidget(self.piv2d_win_spin, 0, 1)
         cfg_layout.addWidget(QLabel("重叠率:"), 1, 0)
         self.piv2d_overlap_spin = QDoubleSpinBox()
@@ -6929,6 +7116,67 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_maxdisp_spin.setRange(1.0, 500.0)
         self.piv2d_maxdisp_spin.setValue(32.0)
         cfg_layout.addWidget(self.piv2d_maxdisp_spin, 6, 1)
+        self.piv2d_adaptive_check = QCheckBox("自适应多重网格 / 窗口变形")
+        self.piv2d_adaptive_check.toggled.connect(self._piv2d_on_adaptive_toggled)
+        cfg_layout.addWidget(self.piv2d_adaptive_check, 7, 0, 1, 2)
+        cfg_layout.addWidget(QLabel("窗口序列:"), 8, 0)
+        self.piv2d_adaptive_windows_edit = QLineEdit("64,32,16")
+        self.piv2d_adaptive_windows_edit.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_adaptive_windows_edit, 8, 1)
+        cfg_layout.addWidget(QLabel("残差搜索半径:"), 9, 0)
+        self.piv2d_adaptive_residual_spin = QSpinBox()
+        self.piv2d_adaptive_residual_spin.setRange(1, 64)
+        self.piv2d_adaptive_residual_spin.setValue(6)
+        self.piv2d_adaptive_residual_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_adaptive_residual_spin, 9, 1)
+        self.piv2d_flow_check = QCheckBox("光流像素级细化")
+        self.piv2d_flow_check.toggled.connect(self._piv2d_on_flow_toggled)
+        cfg_layout.addWidget(self.piv2d_flow_check, 10, 0, 1, 2)
+        cfg_layout.addWidget(QLabel("光流层数:"), 11, 0)
+        self.piv2d_flow_levels_spin = QSpinBox()
+        self.piv2d_flow_levels_spin.setRange(1, 8)
+        self.piv2d_flow_levels_spin.setValue(3)
+        self.piv2d_flow_levels_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_flow_levels_spin, 11, 1)
+        cfg_layout.addWidget(QLabel("光流窗口:"), 12, 0)
+        self.piv2d_flow_winsize_spin = QSpinBox()
+        self.piv2d_flow_winsize_spin.setRange(5, 99)
+        self.piv2d_flow_winsize_spin.setSingleStep(2)
+        self.piv2d_flow_winsize_spin.setValue(15)
+        self.piv2d_flow_winsize_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_flow_winsize_spin, 12, 1)
+        cfg_layout.addWidget(QLabel("光流迭代:"), 13, 0)
+        self.piv2d_flow_iterations_spin = QSpinBox()
+        self.piv2d_flow_iterations_spin.setRange(1, 20)
+        self.piv2d_flow_iterations_spin.setValue(3)
+        self.piv2d_flow_iterations_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_flow_iterations_spin, 13, 1)
+        self.piv2d_outlier_check = QCheckBox("剔除不合理矢量")
+        self.piv2d_outlier_check.toggled.connect(self._piv2d_on_outlier_toggled)
+        cfg_layout.addWidget(self.piv2d_outlier_check, 14, 0, 1, 2)
+        self.piv2d_replace_outlier_check = QCheckBox("对剔除矢量进行插值替换")
+        self.piv2d_replace_outlier_check.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_replace_outlier_check, 15, 0, 1, 2)
+        cfg_layout.addWidget(QLabel("局部残差阈值:"), 16, 0)
+        self.piv2d_outlier_median_spin = QDoubleSpinBox()
+        self.piv2d_outlier_median_spin.setRange(0.0, 1e6)
+        self.piv2d_outlier_median_spin.setDecimals(3)
+        self.piv2d_outlier_median_spin.setValue(3.0)
+        self.piv2d_outlier_median_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_outlier_median_spin, 16, 1)
+        cfg_layout.addWidget(QLabel("速度上限:"), 17, 0)
+        self.piv2d_outlier_speed_spin = QDoubleSpinBox()
+        self.piv2d_outlier_speed_spin.setRange(0.0, 1e9)
+        self.piv2d_outlier_speed_spin.setDecimals(3)
+        self.piv2d_outlier_speed_spin.setValue(0.0)
+        self.piv2d_outlier_speed_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_outlier_speed_spin, 17, 1)
+        cfg_layout.addWidget(QLabel("插值迭代:"), 18, 0)
+        self.piv2d_outlier_interp_spin = QSpinBox()
+        self.piv2d_outlier_interp_spin.setRange(1, 50)
+        self.piv2d_outlier_interp_spin.setValue(5)
+        self.piv2d_outlier_interp_spin.setEnabled(False)
+        cfg_layout.addWidget(self.piv2d_outlier_interp_spin, 18, 1)
         left_layout.addWidget(cfg_group)
 
         viz_group = QGroupBox("矢量显示")
@@ -6949,6 +7197,12 @@ class BubbleTomographyGUI(QMainWindow):
 
         mask_group = QGroupBox("无粒子区域")
         mask_layout = QVBoxLayout(mask_group)
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(QLabel("几何形状:"))
+        self.piv2d_mask_shape_combo = QComboBox()
+        self.piv2d_mask_shape_combo.addItems(["矩形", "圆形", "三角形", "多边形"])
+        shape_row.addWidget(self.piv2d_mask_shape_combo, stretch=1)
+        mask_layout.addLayout(shape_row)
         self.piv2d_mask_info_label = QLabel("未设置")
         self.piv2d_mask_info_label.setWordWrap(True)
         self.piv2d_mask_info_label.setStyleSheet("color: gray;")
@@ -6989,14 +7243,17 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_frame1_preview = PIV2DPreviewWidget("第1帧预览")
         self.piv2d_frame1_preview.setMinimumSize(self._sp(260), self._sp(220))
         self.piv2d_frame1_preview.mask_changed.connect(self._piv2d_on_mask_changed)
+        self.piv2d_frame1_preview.set_correlation_window_size(self.piv2d_win_spin.value())
         top_layout.addWidget(self.piv2d_frame1_preview)
         self.piv2d_frame2_preview = PIV2DPreviewWidget("第2帧预览")
         self.piv2d_frame2_preview.setMinimumSize(self._sp(260), self._sp(220))
+        self.piv2d_frame2_preview.set_correlation_window_size(self.piv2d_win_spin.value())
         top_layout.addWidget(self.piv2d_frame2_preview)
         preview_splitter.addWidget(top_widget)
 
         self.piv2d_result_preview = PIV2DPreviewWidget("速度场预览")
         self.piv2d_result_preview.setMinimumSize(self._sp(500), self._sp(280))
+        self.piv2d_result_preview.set_correlation_window_size(self.piv2d_win_spin.value())
         preview_splitter.addWidget(self.piv2d_result_preview)
 
         self.piv2d_log = QTextEdit()
@@ -7079,6 +7336,10 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_single_widget.setVisible(single)
         self.piv2d_batch_widget.setVisible(not single)
 
+    def _piv2d_on_batch_pair_mode_changed(self, idx):
+        if hasattr(self, "piv2d_batch_pairs_edit"):
+            self.piv2d_batch_pairs_edit.setEnabled(idx == 2)
+
     def _piv2d_open_frame1(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择第1帧图像", "", "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
@@ -7135,15 +7396,119 @@ class BubbleTomographyGUI(QMainWindow):
             pixel_scale=self.piv2d_scale_spin.value(),
             snr_threshold=self.piv2d_snr_spin.value(),
             max_displacement=self.piv2d_maxdisp_spin.value(),
+            adaptive_enabled=self.piv2d_adaptive_check.isChecked() if hasattr(self, "piv2d_adaptive_check") else False,
+            adaptive_window_sizes=self._piv2d_adaptive_window_sizes(),
+            adaptive_residual_search_radius=(
+                self.piv2d_adaptive_residual_spin.value()
+                if hasattr(self, "piv2d_adaptive_residual_spin")
+                else 6
+            ),
+            optical_flow_enabled=self.piv2d_flow_check.isChecked() if hasattr(self, "piv2d_flow_check") else False,
+            optical_flow_levels=(
+                self.piv2d_flow_levels_spin.value()
+                if hasattr(self, "piv2d_flow_levels_spin")
+                else 3
+            ),
+            optical_flow_winsize=(
+                self._piv2d_odd_value(self.piv2d_flow_winsize_spin.value())
+                if hasattr(self, "piv2d_flow_winsize_spin")
+                else 15
+            ),
+            optical_flow_iterations=(
+                self.piv2d_flow_iterations_spin.value()
+                if hasattr(self, "piv2d_flow_iterations_spin")
+                else 3
+            ),
+            outlier_filter_enabled=(
+                self.piv2d_outlier_check.isChecked()
+                if hasattr(self, "piv2d_outlier_check")
+                else False
+            ),
+            outlier_replace_enabled=(
+                self.piv2d_replace_outlier_check.isChecked()
+                if hasattr(self, "piv2d_replace_outlier_check")
+                else False
+            ),
+            outlier_median_threshold=(
+                self.piv2d_outlier_median_spin.value()
+                if hasattr(self, "piv2d_outlier_median_spin")
+                else 3.0
+            ),
+            outlier_max_speed=(
+                self.piv2d_outlier_speed_spin.value()
+                if hasattr(self, "piv2d_outlier_speed_spin")
+                else 0.0
+            ),
+            outlier_interp_iterations=(
+                self.piv2d_outlier_interp_spin.value()
+                if hasattr(self, "piv2d_outlier_interp_spin")
+                else 5
+            ),
         )
+
+    def _piv2d_adaptive_window_sizes(self) -> tuple:
+        if not hasattr(self, "piv2d_adaptive_windows_edit"):
+            return (self.piv2d_win_spin.value(),)
+        values = [int(x) for x in re.findall(r"\d+", self.piv2d_adaptive_windows_edit.text())]
+        values = [v for v in values if v >= 8]
+        if not values:
+            values = [self.piv2d_win_spin.value()]
+        return tuple(values)
+
+    def _piv2d_on_adaptive_toggled(self, checked):
+        if hasattr(self, "piv2d_adaptive_windows_edit"):
+            self.piv2d_adaptive_windows_edit.setEnabled(checked)
+        if hasattr(self, "piv2d_adaptive_residual_spin"):
+            self.piv2d_adaptive_residual_spin.setEnabled(checked)
+
+    def _piv2d_on_flow_toggled(self, checked):
+        if checked and hasattr(self, "piv2d_adaptive_check"):
+            self.piv2d_adaptive_check.setChecked(True)
+        for name in ("piv2d_flow_levels_spin", "piv2d_flow_winsize_spin", "piv2d_flow_iterations_spin"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(checked)
+
+    def _piv2d_on_outlier_toggled(self, checked):
+        for name in (
+            "piv2d_replace_outlier_check",
+            "piv2d_outlier_median_spin",
+            "piv2d_outlier_speed_spin",
+            "piv2d_outlier_interp_spin",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(checked)
+
+    @staticmethod
+    def _piv2d_odd_value(value: int) -> int:
+        value = int(value)
+        return value if value % 2 == 1 else value + 1
+
+    def _piv2d_mask_shape(self) -> str:
+        values = ["rectangle", "circle", "triangle", "polygon"]
+        if not hasattr(self, "piv2d_mask_shape_combo"):
+            return "rectangle"
+        return values[self.piv2d_mask_shape_combo.currentIndex()]
+
+    def _piv2d_sync_correlation_window_size(self, *_):
+        size = self.piv2d_win_spin.value() if hasattr(self, "piv2d_win_spin") else None
+        for preview_name in ("piv2d_frame1_preview", "piv2d_frame2_preview", "piv2d_result_preview"):
+            preview = getattr(self, preview_name, None)
+            if hasattr(preview, "set_correlation_window_size"):
+                preview.set_correlation_window_size(size)
 
     def _piv2d_begin_mask_selection(self):
         if not hasattr(self, "piv2d_frame1_preview"):
             return
-        if not self.piv2d_frame1_preview.begin_mask_selection():
+        shape = self._piv2d_mask_shape()
+        if not self.piv2d_frame1_preview.begin_mask_selection(shape):
             QMessageBox.warning(self, "提示", "请先选择并预览第1帧图像")
             return
-        self.piv2d_log.append("请在第1帧预览图中拖拽选择无粒子区域")
+        if shape == "polygon":
+            self.piv2d_log.append("请在第1帧预览图中左键添加多边形顶点，双击结束")
+        else:
+            self.piv2d_log.append("请在第1帧预览图中拖拽选择无粒子区域")
 
     def _piv2d_on_mask_changed(self, mask):
         self._piv2d_exclusion_mask = None if mask is None else np.asarray(mask, dtype=bool).copy()
@@ -7178,6 +7543,79 @@ class BubbleTomographyGUI(QMainWindow):
             return None
         return self._piv2d_exclusion_mask
 
+    def _piv2d_batch_files(self) -> List[Path]:
+        if not self.piv2d_src_dir or not os.path.isdir(self.piv2d_src_dir):
+            return []
+        return sorted(
+            p for p in Path(self.piv2d_src_dir).iterdir()
+            if p.is_file() and p.suffix.lower() in PIV2D_EXTS
+        )
+
+    def _piv2d_build_batch_pairs(self, files: List[Path]) -> Optional[List[tuple]]:
+        mode = self.piv2d_batch_pair_mode_combo.currentIndex() if hasattr(self, "piv2d_batch_pair_mode_combo") else 0
+        n = len(files)
+        if mode == 0:
+            pairs = [(i, i + 1) for i in range(max(0, n - 1))]
+        elif mode == 1:
+            pairs = [(i, i + 1) for i in range(0, n - 1, 2)]
+        else:
+            pairs = self._piv2d_parse_custom_batch_pairs(
+                self.piv2d_batch_pairs_edit.text() if hasattr(self, "piv2d_batch_pairs_edit") else "",
+                n,
+            )
+        if not pairs:
+            return None
+        return pairs
+
+    def _piv2d_parse_custom_batch_pairs(self, text: str, image_count: int) -> List[tuple]:
+        text = text.strip()
+        if not text:
+            raise ValueError("请输入自定义帧对，例如: 1-2, 3-4, 5-6")
+
+        pair_matches = re.findall(r"(\d+)\s*[-:~>]\s*(\d+)", text)
+        if pair_matches:
+            pairs = [(int(a) - 1, int(b) - 1) for a, b in pair_matches]
+        else:
+            nums = [int(x) for x in re.findall(r"\d+", text)]
+            if len(nums) < 2 or len(nums) % 2 != 0:
+                raise ValueError("自定义数列需要成对输入，例如: 1,2,3,4 或 1-2,3-4")
+            pairs = [(nums[i] - 1, nums[i + 1] - 1) for i in range(0, len(nums), 2)]
+
+        invalid = [
+            (a + 1, b + 1)
+            for a, b in pairs
+            if a < 0 or b < 0 or a >= image_count or b >= image_count or a == b
+        ]
+        if invalid:
+            raise ValueError(f"自定义帧对超出范围或重复同一帧: {invalid[0][0]}-{invalid[0][1]}")
+        return pairs
+
+    def _piv2d_start_processing_timer(self, prefix: str, progress_max: int = 0):
+        self._piv2d_processing_prefix = prefix
+        self._piv2d_processing_start = time.perf_counter()
+        self.processing_time_label.setText(f"{prefix} 处理时间: 0.0 s")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, progress_max)
+        self.progress_bar.setValue(0)
+        if progress_max == 0:
+            self.progress_bar.setFormat(f"{prefix}处理中")
+        else:
+            self.progress_bar.setFormat(f"{prefix}: %p%")
+        self._piv2d_elapsed_timer.start(200)
+
+    def _piv2d_update_elapsed_time(self):
+        if self._piv2d_processing_start <= 0:
+            return
+        elapsed = time.perf_counter() - self._piv2d_processing_start
+        self.processing_time_label.setText(f"{self._piv2d_processing_prefix} 处理时间: {elapsed:.1f} s")
+
+    def _piv2d_finish_processing_timer(self, progress_value: Optional[int] = None):
+        self._piv2d_elapsed_timer.stop()
+        self._piv2d_update_elapsed_time()
+        if progress_value is not None:
+            self.progress_bar.setValue(progress_value)
+        self.progress_bar.setVisible(False)
+
     def _piv2d_run_single(self):
         import cv2 as _cv2
         if not self.piv2d_frame1_path or not self.piv2d_frame2_path:
@@ -7190,6 +7628,7 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "图像读取失败")
             return
 
+        self._piv2d_start_processing_timer("单组二维PIV", 0)
         try:
             calculator = PIV2DCalculator(self._piv2d_get_config())
             exclusion_mask = self._piv2d_mask_for_image(img1)
@@ -7201,6 +7640,14 @@ class BubbleTomographyGUI(QMainWindow):
 
             self.piv2d_log.append("=== 二维PIV单组计算完成 ===")
             self.piv2d_log.append(
+                f"算法: {result.get('algorithm', 'fixed')}  "
+                f"窗口序列: {list(result.get('window_sizes', [self.piv2d_win_spin.value()]))}"
+            )
+            outlier_count = int(np.sum(result.get("outlier", np.zeros_like(result["valid"], dtype=bool))))
+            replaced_count = int(np.sum(result.get("replaced", np.zeros_like(result["valid"], dtype=bool))))
+            if outlier_count or replaced_count:
+                self.piv2d_log.append(f"矢量后处理: 剔除 {outlier_count} 个, 插值替换 {replaced_count} 个")
+            self.piv2d_log.append(
                 f"有效矢量: {summary['valid_count']}/{summary['total_count']}  "
                 f"平均速度: {summary['mean_speed']:.3f}  最大速度: {summary['max_speed']:.3f}"
             )
@@ -7210,6 +7657,8 @@ class BubbleTomographyGUI(QMainWindow):
         except Exception as e:
             self.piv2d_log.append(f"二维PIV失败: {e}")
             QMessageBox.critical(self, "二维PIV错误", str(e))
+        finally:
+            self._piv2d_finish_processing_timer()
 
     def _piv2d_run_batch(self):
         if not self.piv2d_src_dir or not os.path.isdir(self.piv2d_src_dir):
@@ -7229,15 +7678,22 @@ class BubbleTomographyGUI(QMainWindow):
             return
         os.makedirs(self.piv2d_dst_dir, exist_ok=True)
 
+        batch_files = self._piv2d_batch_files()
+        if len(batch_files) < 2:
+            QMessageBox.warning(self, "提示", "输入目录中至少需要2张可用图像")
+            return
+        try:
+            batch_pairs = self._piv2d_build_batch_pairs(batch_files)
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", str(exc))
+            return
+        if not batch_pairs:
+            QMessageBox.warning(self, "提示", "没有可计算的双帧组合")
+            return
+
         batch_mask = self._piv2d_exclusion_mask
         if batch_mask is not None:
-            first_file = next(
-                (
-                    p for p in sorted(Path(self.piv2d_src_dir).iterdir())
-                    if p.is_file() and p.suffix.lower() in PIV2D_EXTS
-                ),
-                None,
-            )
+            first_file = batch_files[batch_pairs[0][0]]
             if first_file is not None:
                 first_image = robust_imread(str(first_file), cv2.IMREAD_UNCHANGED)
                 if first_image is not None and batch_mask.shape != first_image.shape[:2]:
@@ -7248,13 +7704,30 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_progress.setVisible(True)
         self.piv2d_batch_run_btn.setEnabled(False)
         self.piv2d_stop_btn.setEnabled(True)
-        self.piv2d_log.append(f"=== 开始批量二维PIV ===\n输入: {self.piv2d_src_dir}\n输出: {self.piv2d_dst_dir}")
+        self._piv2d_start_processing_timer("批量二维PIV", 100)
+        pair_preview = ", ".join(f"{a + 1}-{b + 1}" for a, b in batch_pairs[:8])
+        if len(batch_pairs) > 8:
+            pair_preview += ", ..."
+        config = self._piv2d_get_config()
+        algo_text = (
+            f"自适应多重网格 {list(config.adaptive_window_sizes)}"
+            if config.adaptive_enabled
+            else f"固定窗口 {config.window_size}"
+        )
+        self.piv2d_log.append(
+            f"=== 开始批量二维PIV ===\n"
+            f"输入: {self.piv2d_src_dir}\n"
+            f"输出: {self.piv2d_dst_dir}\n"
+            f"算法: {algo_text}\n"
+            f"帧对: {pair_preview}  (共 {len(batch_pairs)} 组)"
+        )
 
         self.piv2d_worker_thread = BatchPIV2DWorker(
             self.piv2d_src_dir,
             self.piv2d_dst_dir,
-            self._piv2d_get_config(),
+            config,
             exclusion_mask=batch_mask,
+            frame_pairs=batch_pairs,
         )
         self.piv2d_worker_thread.progress.connect(self._piv2d_on_batch_progress)
         self.piv2d_worker_thread.finished.connect(self._piv2d_on_batch_finished)
@@ -7269,10 +7742,13 @@ class BubbleTomographyGUI(QMainWindow):
     def _piv2d_on_batch_progress(self, done, total, name):
         pct = int(done / total * 100) if total > 0 else 0
         self.piv2d_progress.setValue(pct)
+        self.progress_bar.setValue(pct)
+        self.progress_bar.setFormat(f"批量二维PIV: {pct}%")
         self.piv2d_log.append(f"[{done}/{total}] {name}")
 
     def _piv2d_on_batch_finished(self, success, total, outputs):
         self.piv2d_progress.setVisible(False)
+        self._piv2d_finish_processing_timer(100)
         self.piv2d_batch_run_btn.setEnabled(True)
         self.piv2d_stop_btn.setEnabled(False)
         self.piv2d_log.append(f"批量二维PIV完成: {success}/{total}")
@@ -7286,6 +7762,7 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _piv2d_on_batch_error(self, msg):
         self.piv2d_progress.setVisible(False)
+        self._piv2d_finish_processing_timer()
         self.piv2d_batch_run_btn.setEnabled(True)
         self.piv2d_stop_btn.setEnabled(False)
         self.piv2d_log.append(f"批量二维PIV出错: {msg}")
@@ -7341,7 +7818,9 @@ class BubbleTomographyGUI(QMainWindow):
             self._piv2d_set_preview(overlay_path, self.piv2d_result_preview)
             return
 
-        image = robust_imread(str(files[0]), cv2.IMREAD_UNCHANGED)
+        source_stem = overlay.name.split("_to_", 1)[0]
+        source_file = next((p for p in files if p.stem == source_stem), files[0])
+        image = robust_imread(str(source_file), cv2.IMREAD_UNCHANGED)
         if image is None:
             self._piv2d_set_preview(overlay_path, self.piv2d_result_preview)
             return
@@ -7355,7 +7834,24 @@ class BubbleTomographyGUI(QMainWindow):
             "speed": data["speed"],
             "snr": data["snr"],
             "valid": data["valid"],
+            "u_px": data["u_px"] if "u_px" in data.files else data["u"],
+            "v_px": data["v_px"] if "v_px" in data.files else data["v"],
+            "valid_original": data["valid_original"] if "valid_original" in data.files else data["valid"],
+            "outlier": data["outlier"] if "outlier" in data.files else np.zeros_like(data["valid"], dtype=bool),
+            "replaced": data["replaced"] if "replaced" in data.files else np.zeros_like(data["valid"], dtype=bool),
             "excluded": data["excluded"] if "excluded" in data.files else np.zeros_like(data["valid"], dtype=bool),
+            "algorithm": str(data["algorithm"]) if "algorithm" in data.files else "fixed",
+            "window_sizes": data["window_sizes"] if "window_sizes" in data.files else np.array([self.piv2d_win_spin.value()]),
+            "optical_flow_residual_u_px": (
+                data["optical_flow_residual_u_px"]
+                if "optical_flow_residual_u_px" in data.files
+                else np.zeros_like(data["valid"], dtype=np.float32)
+            ),
+            "optical_flow_residual_v_px": (
+                data["optical_flow_residual_v_px"]
+                if "optical_flow_residual_v_px" in data.files
+                else np.zeros_like(data["valid"], dtype=np.float32)
+            ),
         }
         self._piv2d_last_image = image
         self._piv2d_last_result = result
