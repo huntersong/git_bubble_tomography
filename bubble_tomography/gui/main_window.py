@@ -348,6 +348,8 @@ class PIV2DPreviewWidget(QWidget):
         self._title = placeholder
         self._vector_scale = 0.15
         self._vector_color_mode = "speed"
+        self._vector_width = 0.003
+        self._vector_arrow_shape = "standard"
         self._colorbar = None
         self._exclusion_mask = None
         self._mask_selection_enabled = False
@@ -398,9 +400,11 @@ class PIV2DPreviewWidget(QWidget):
             self._exclusion_mask = None
         self._render()
 
-    def set_vector_style(self, scale: float, color_mode: str):
+    def set_vector_style(self, scale: float, color_mode: str, width: float = 0.003, arrow_shape: str = "standard"):
         self._vector_scale = float(scale)
         self._vector_color_mode = color_mode
+        self._vector_width = float(width)
+        self._vector_arrow_shape = arrow_shape
         self._render()
 
     def clear(self, text: Optional[str] = None):
@@ -500,7 +504,8 @@ class PIV2DPreviewWidget(QWidget):
             quiver = self.axes.quiver(
                 x, y, u, v, colors,
                 cmap="jet", angles="xy", scale_units="xy", scale=1,
-                width=0.003,
+                width=self._vector_width,
+                **self._quiver_arrow_kwargs(),
             )
             self.figure.colorbar(quiver, ax=self.axes, fraction=0.046, pad=0.10)
         else:
@@ -514,8 +519,18 @@ class PIV2DPreviewWidget(QWidget):
             self.axes.quiver(
                 x, y, u, v,
                 color=color_map.get(self._vector_color_mode, "#d32f2f"),
-                angles="xy", scale_units="xy", scale=1, width=0.003,
+                angles="xy", scale_units="xy", scale=1, width=self._vector_width,
+                **self._quiver_arrow_kwargs(),
             )
+
+    def _quiver_arrow_kwargs(self) -> dict:
+        if self._vector_arrow_shape == "thin":
+            return {"headwidth": 3.0, "headlength": 4.0, "headaxislength": 3.5}
+        if self._vector_arrow_shape == "wide":
+            return {"headwidth": 6.0, "headlength": 7.0, "headaxislength": 6.0}
+        if self._vector_arrow_shape == "line":
+            return {"headwidth": 0.0, "headlength": 0.0, "headaxislength": 0.0}
+        return {"headwidth": 4.0, "headlength": 5.0, "headaxislength": 4.5}
 
     def _on_mouse_press(self, event):
         if self._is_right_button(event):
@@ -713,17 +728,47 @@ class PIV2DPreviewWidget(QWidget):
 
     def _show_context_menu(self, event):
         menu = QMenu(self)
-        text = (
+        window_text = (
             f"当前互相关窗口尺寸: {self._correlation_window_size} px"
             if self._correlation_window_size
             else "当前互相关窗口尺寸: 未设置"
         )
-        action = menu.addAction(text)
-        action.setEnabled(False)
+        for text in self._context_info_lines(event, window_text):
+            action = menu.addAction(text)
+            action.setEnabled(False)
         if getattr(event, "guiEvent", None) is not None:
             menu.exec_(self.canvas.mapToGlobal(event.guiEvent.pos()))
         else:
             menu.exec_(self.canvas.mapToGlobal(self.canvas.rect().center()))
+
+    def _context_info_lines(self, event, window_text: str) -> List[str]:
+        lines = [window_text]
+        if event.xdata is None or event.ydata is None or self._image is None:
+            lines.append("当前位置: --")
+            return lines
+
+        x = float(event.xdata)
+        y = float(event.ydata)
+        lines.append(f"当前位置: x={x:.1f}, y={y:.1f}")
+        if self._result is None or "valid" not in self._result or not np.any(self._result["valid"]):
+            lines.append("当前矢量: --")
+            return lines
+
+        valid = self._result["valid"]
+        xv = self._result["x"][valid]
+        yv = self._result["y"][valid]
+        dist2 = (xv - x) ** 2 + (yv - y) ** 2
+        idx = int(np.argmin(dist2))
+        nearest_x = float(xv[idx])
+        nearest_y = float(yv[idx])
+        flat_u = self._result["u"][valid]
+        flat_v = self._result["v"][valid]
+        flat_speed = self._result["speed"][valid]
+        lines.append(
+            f"最近矢量: x={nearest_x:.1f}, y={nearest_y:.1f}, "
+            f"U={float(flat_u[idx]):.3f}, V={float(flat_v[idx]):.3f}, |V|={float(flat_speed[idx]):.3f}"
+        )
+        return lines
 
     def _mask_shape_label(self) -> str:
         return {
@@ -2260,6 +2305,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_worker_thread = None
         self._piv2d_last_result: Optional[dict] = None
         self._piv2d_last_image: Optional[np.ndarray] = None
+        self._piv2d_result_outputs: List[str] = []
+        self._piv2d_loading_result_timeline = False
         self._piv2d_exclusion_mask: Optional[np.ndarray] = None
         self._piv2d_processing_start = 0.0
         self._piv2d_processing_prefix = "二维PIV"
@@ -7193,6 +7240,19 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_vector_color_combo.addItems(["按速度彩色", "红色", "绿色", "蓝色", "黄色", "白色"])
         self.piv2d_vector_color_combo.currentIndexChanged.connect(self._piv2d_refresh_vector_preview)
         viz_layout.addWidget(self.piv2d_vector_color_combo, 1, 1)
+        viz_layout.addWidget(QLabel("线宽:"), 2, 0)
+        self.piv2d_vector_width_spin = QDoubleSpinBox()
+        self.piv2d_vector_width_spin.setRange(0.001, 0.03)
+        self.piv2d_vector_width_spin.setDecimals(3)
+        self.piv2d_vector_width_spin.setSingleStep(0.001)
+        self.piv2d_vector_width_spin.setValue(0.003)
+        self.piv2d_vector_width_spin.valueChanged.connect(self._piv2d_refresh_vector_preview)
+        viz_layout.addWidget(self.piv2d_vector_width_spin, 2, 1)
+        viz_layout.addWidget(QLabel("箭头形状:"), 3, 0)
+        self.piv2d_vector_arrow_combo = QComboBox()
+        self.piv2d_vector_arrow_combo.addItems(["标准箭头", "细箭头", "宽箭头", "无箭头线段"])
+        self.piv2d_vector_arrow_combo.currentIndexChanged.connect(self._piv2d_refresh_vector_preview)
+        viz_layout.addWidget(self.piv2d_vector_arrow_combo, 3, 1)
         left_layout.addWidget(viz_group)
 
         mask_group = QGroupBox("无粒子区域")
@@ -7251,10 +7311,22 @@ class BubbleTomographyGUI(QMainWindow):
         top_layout.addWidget(self.piv2d_frame2_preview)
         preview_splitter.addWidget(top_widget)
 
+        result_widget = QWidget()
+        result_layout = QVBoxLayout(result_widget)
+        result_layout.setContentsMargins(0, 0, 0, 0)
         self.piv2d_result_preview = PIV2DPreviewWidget("速度场预览")
         self.piv2d_result_preview.setMinimumSize(self._sp(500), self._sp(280))
         self.piv2d_result_preview.set_correlation_window_size(self.piv2d_win_spin.value())
-        preview_splitter.addWidget(self.piv2d_result_preview)
+        result_layout.addWidget(self.piv2d_result_preview, stretch=1)
+        result_timeline_row = QHBoxLayout()
+        result_timeline_row.addWidget(QLabel("结果时间轴:"))
+        self.piv2d_result_timeline = QListWidget()
+        self.piv2d_result_timeline.setMaximumHeight(self._sp(86))
+        self.piv2d_result_timeline.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.piv2d_result_timeline.currentRowChanged.connect(self._piv2d_on_result_timeline_selected)
+        result_timeline_row.addWidget(self.piv2d_result_timeline, stretch=1)
+        result_layout.addLayout(result_timeline_row)
+        preview_splitter.addWidget(result_widget)
 
         self.piv2d_log = QTextEdit()
         self.piv2d_log.setReadOnly(True)
@@ -7637,6 +7709,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._piv2d_last_result = result
             self._piv2d_last_image = img1
             self._piv2d_show_vector_result(img1, result, "单组速度矢量")
+            self._piv2d_set_single_result_timeline()
 
             self.piv2d_log.append("=== 二维PIV单组计算完成 ===")
             self.piv2d_log.append(
@@ -7752,8 +7825,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_batch_run_btn.setEnabled(True)
         self.piv2d_stop_btn.setEnabled(False)
         self.piv2d_log.append(f"批量二维PIV完成: {success}/{total}")
-        if outputs:
-            self._piv2d_load_batch_vector_preview(outputs[0])
+        self._piv2d_set_batch_result_timeline(outputs)
         QMessageBox.information(
             self,
             "完成",
@@ -7788,15 +7860,64 @@ class BubbleTomographyGUI(QMainWindow):
             return "speed"
         return values[self.piv2d_vector_color_combo.currentIndex()]
 
+    def _piv2d_vector_arrow_shape(self) -> str:
+        values = ["standard", "thin", "wide", "line"]
+        if not hasattr(self, "piv2d_vector_arrow_combo"):
+            return "standard"
+        return values[self.piv2d_vector_arrow_combo.currentIndex()]
+
     def _piv2d_show_vector_result(self, image: np.ndarray, result: dict, title: str):
         if not hasattr(self.piv2d_result_preview, "set_vector_result"):
             return
         self.piv2d_result_preview.set_vector_style(
             self.piv2d_vector_scale_spin.value(),
             self._piv2d_vector_color_mode(),
+            self.piv2d_vector_width_spin.value() if hasattr(self, "piv2d_vector_width_spin") else 0.003,
+            self._piv2d_vector_arrow_shape(),
         )
         self.piv2d_result_preview.set_vector_result(image, result, title)
         self.piv2d_result_preview.set_exclusion_mask(self._piv2d_mask_for_image(image))
+
+    def _piv2d_set_single_result_timeline(self):
+        if not hasattr(self, "piv2d_result_timeline"):
+            return
+        self._piv2d_result_outputs = []
+        self._piv2d_loading_result_timeline = True
+        self.piv2d_result_timeline.clear()
+        item = QListWidgetItem("单组结果")
+        item.setData(Qt.UserRole, "")
+        self.piv2d_result_timeline.addItem(item)
+        self.piv2d_result_timeline.setCurrentRow(0)
+        self._piv2d_loading_result_timeline = False
+
+    def _piv2d_set_batch_result_timeline(self, outputs: List[str]):
+        if not hasattr(self, "piv2d_result_timeline"):
+            return
+        self._piv2d_result_outputs = list(outputs or [])
+        self._piv2d_loading_result_timeline = True
+        self.piv2d_result_timeline.clear()
+        for idx, output in enumerate(self._piv2d_result_outputs, start=1):
+            overlay = Path(output)
+            label = overlay.name.replace("_overlay.png", "")
+            item = QListWidgetItem(f"{idx:03d} | {label}")
+            item.setData(Qt.UserRole, str(overlay))
+            self.piv2d_result_timeline.addItem(item)
+        self._piv2d_loading_result_timeline = False
+        if self._piv2d_result_outputs:
+            self.piv2d_result_timeline.setCurrentRow(0)
+
+    def _piv2d_on_result_timeline_selected(self, row: int):
+        if self._piv2d_loading_result_timeline or row < 0:
+            return
+        item = self.piv2d_result_timeline.item(row) if hasattr(self, "piv2d_result_timeline") else None
+        if item is None:
+            return
+        output = item.data(Qt.UserRole)
+        if output:
+            self._piv2d_load_batch_vector_preview(str(output))
+            self.piv2d_log.append(f"显示二维PIV结果: {item.text()}")
+        elif self._piv2d_last_image is not None and self._piv2d_last_result is not None:
+            self._piv2d_show_vector_result(self._piv2d_last_image, self._piv2d_last_result, "单组速度矢量")
 
     def _piv2d_refresh_vector_preview(self, *_):
         if self._piv2d_last_image is None or self._piv2d_last_result is None:
