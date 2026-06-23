@@ -1,7 +1,8 @@
 numpy>=1.21.0
-opencv-python>=4.5.0
+opencv-contrib-python>=4.11.0,<5
 scipy>=1.7.0
 matplotlib>=3.4.0
 scikit-image>=0.18.0
 tqdm>=4.62.0
 PyQt5>=5.15.0
+pyinstaller>=6.0

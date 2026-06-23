@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
     QFileDialog, QProgressBar, QTextEdit, QSplitter,
     QMessageBox, QScrollArea, QGridLayout, QCheckBox, QSlider,
-    QStatusBar, QToolBar, QAction, QFrame, QListWidget,
+    QStatusBar, QToolBar, QAction, QActionGroup, QFrame, QListWidget,
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
     QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy
 )
@@ -1260,6 +1260,7 @@ class FileTreePanel(QWidget):
         self._load_timer.setSingleShot(True)
         self._load_timer.setInterval(100)  # 防抖 100ms
         self._pending_path: str = ""
+        self._theme: Dict[str, str] = {}
         self._load_timer.timeout.connect(self._emit_pending_signal)
 
         # 文件系统监视器：工作目录内容变化时自动刷新
@@ -1275,6 +1276,52 @@ class FileTreePanel(QWidget):
 
         self._build_ui()
 
+    def apply_theme(self, theme: Dict[str, str]):
+        """Apply the host window theme to this standalone panel."""
+        self._theme = theme
+        self.setStyleSheet(f"background-color: {theme['sidebar']};")
+        self._header.setStyleSheet(f"background-color: {theme['sidebar_header']};")
+        self._title.setStyleSheet(
+            f"color: {theme['text_main']}; font-size: 12px; font-weight: bold;"
+        )
+        tool_btn_style = f"""
+            QPushButton {{
+                background: transparent; color: {theme['text_secondary']};
+                border: none; font-size: 14px;
+            }}
+            QPushButton:hover {{ color: {theme['text_main']}; }}
+            QPushButton:checked {{ color: {theme['accent']}; }}
+        """
+        self._refresh_btn.setStyleSheet(tool_btn_style)
+        self._expand_btn.setStyleSheet(tool_btn_style)
+        self._path_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; font-size: 10px; padding: 3px 8px; "
+            f"background-color: {theme['sidebar_path']};"
+        )
+        self._tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background-color: {theme['sidebar']};
+                color: {theme['text_secondary']};
+                border: none;
+                font-size: 12px;
+            }}
+            QTreeWidget::item {{
+                padding: 3px 4px;
+                border-radius: 3px;
+            }}
+            QTreeWidget::item:hover {{
+                background-color: {theme['hover']};
+                color: {theme['text_main']};
+            }}
+            QTreeWidget::item:selected {{
+                background-color: {theme['accent']};
+                color: {theme['accent_text']};
+            }}
+            QTreeWidget::branch {{
+                background-color: {theme['sidebar']};
+            }}
+        """)
+
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
@@ -1284,15 +1331,15 @@ class FileTreePanel(QWidget):
         layout.setSpacing(0)
 
         # 标题行
-        header = QWidget()
-        header.setStyleSheet("background-color: #1e2d3d;")
-        header_layout = QHBoxLayout(header)
+        self._header = QWidget()
+        self._header.setStyleSheet("background-color: #1e2d3d;")
+        header_layout = QHBoxLayout(self._header)
         header_layout.setContentsMargins(8, 6, 6, 6)
         header_layout.setSpacing(4)
 
-        title = QLabel("📁 文件树")
-        title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
-        header_layout.addWidget(title, stretch=1)
+        self._title = QLabel("📁 文件树")
+        self._title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
+        header_layout.addWidget(self._title, stretch=1)
 
         # 刷新按钮
         self._refresh_btn = QPushButton("⟳")
@@ -1324,7 +1371,7 @@ class FileTreePanel(QWidget):
         self._expand_btn.clicked.connect(self._toggle_expand_all)
         header_layout.addWidget(self._expand_btn)
 
-        layout.addWidget(header)
+        layout.addWidget(self._header)
 
         # 路径标签
         self._path_label = QLabel("未设置工作目录")
@@ -1469,7 +1516,7 @@ class FileTreePanel(QWidget):
             group_item.setText(0, f"📂 {root_dir.name}  ({len(root_images)} 张)")
             group_item.setData(0, Qt.UserRole, str(root_dir))
             group_item.setData(0, Qt.UserRole + 1, "group")
-            group_item.setForeground(0, QColor("#3498db"))
+            group_item.setForeground(0, QColor(self._theme.get("accent", "#3498db")))
             group_item.setExpanded(False)
             for img_path in root_images:
                 self._add_image_item(group_item, img_path)
@@ -1486,7 +1533,7 @@ class FileTreePanel(QWidget):
             group_item.setText(0, f"📂 {sub.name}  ({len(imgs)} 张)")
             group_item.setData(0, Qt.UserRole, str(sub))
             group_item.setData(0, Qt.UserRole + 1, "group")
-            group_item.setForeground(0, QColor("#3498db"))
+            group_item.setForeground(0, QColor(self._theme.get("accent", "#3498db")))
             group_item.setExpanded(False)
             for img_path in imgs:
                 self._add_image_item(group_item, img_path)
@@ -1557,11 +1604,17 @@ class FileTreePanel(QWidget):
         kind = item.data(0, Qt.UserRole + 1)
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
+        theme = self._theme or {
+            "sidebar_header": "#1e2d3d",
+            "text_main": "#ecf0f1",
+            "border": "#34495e",
+            "accent": "#2980b9",
+        }
+        menu.setStyleSheet(f"""
             QMenu {
-                background-color: #1e2d3d;
-                color: #ecf0f1;
-                border: 1px solid #34495e;
+                background-color: {theme['sidebar_header']};
+                color: {theme['text_main']};
+                border: 1px solid {theme['border']};
                 padding: 4px;
             }
             QMenu::item {
@@ -1569,11 +1622,11 @@ class FileTreePanel(QWidget):
                 border-radius: 3px;
             }
             QMenu::item:selected {
-                background-color: #2980b9;
+                background-color: {theme['accent']};
             }
             QMenu::separator {
                 height: 1px;
-                background: #34495e;
+                background: {theme['border']};
                 margin: 4px 8px;
             }
         """)
@@ -1720,6 +1773,48 @@ class ImagePreviewPanel(QWidget):
         self._expanded_width: int = 320   # 展开时宽度（会被主窗口 setFixedWidth 覆盖）
         self._build_ui()
 
+    def apply_theme(self, theme: Dict[str, str]):
+        """Apply the host window theme to this standalone panel."""
+        self.setStyleSheet(f"background-color: {theme['sidebar']};")
+        self._title_bar.setStyleSheet(f"background-color: {theme['sidebar_header']};")
+        tool_btn_style = f"""
+            QPushButton {{
+                background: transparent; color: {theme['text_secondary']};
+                border: none; font-size: 14px; font-weight: bold;
+            }}
+            QPushButton:hover {{ color: {theme['text_main']}; }}
+        """
+        self._collapse_btn.setStyleSheet(tool_btn_style)
+        self._title.setStyleSheet(
+            f"color: {theme['text_main']}; font-size: 12px; font-weight: bold;"
+        )
+        self._fit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {theme['text_secondary']};
+                border: 1px solid {theme['border']}; font-size: 11px;
+                border-radius: 3px;
+            }}
+            QPushButton:checked {{ color: {theme['accent']}; border-color: {theme['accent']}; }}
+            QPushButton:hover {{ color: {theme['text_main']}; }}
+        """)
+        self._scroll.setStyleSheet(f"""
+            QScrollArea {{ background-color: {theme['background']}; border: none; }}
+            QScrollBar:vertical {{
+                background: {theme['sidebar']}; width: 8px; border-radius: 4px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {theme['border']}; border-radius: 4px; min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {theme['hover']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+        """)
+        self._img_label.setStyleSheet(
+            f"background-color: {theme['background']}; color: {theme['text_secondary']}; font-size: 12px;"
+        )
+        self._path_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; font-size: 10px; padding: 2px 6px;"
+        )
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1747,9 +1842,9 @@ class ImagePreviewPanel(QWidget):
         self._collapse_btn.clicked.connect(self._toggle_collapse)
         tb_layout.addWidget(self._collapse_btn)
 
-        title = QLabel("🖼 图片预览")
-        title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
-        tb_layout.addWidget(title, stretch=1)
+        self._title = QLabel("🖼 图片预览")
+        self._title.setStyleSheet("color: #ecf0f1; font-size: 12px; font-weight: bold;")
+        tb_layout.addWidget(self._title, stretch=1)
 
         self._fit_btn = QPushButton("适应窗口")
         self._fit_btn.setCheckable(True)
@@ -2252,6 +2347,7 @@ class BubbleTomographyGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ui_scale = self._detect_ui_scale()
+        self.current_theme = "midnight"
         self.setWindowTitle("三维多相流场测量软件")
         self.setMinimumSize(1200, 800)
 
@@ -2346,13 +2442,13 @@ class BubbleTomographyGUI(QMainWindow):
         nav_layout.setSpacing(self._sp(4))
 
         # ??
-        title_label = QLabel("三维多相流场测量软件")
-        title_label.setAlignment(Qt.AlignCenter)
-        title_label.setStyleSheet(
+        self._nav_title_label = QLabel("三维多相流场测量软件")
+        self._nav_title_label.setAlignment(Qt.AlignCenter)
+        self._nav_title_label.setStyleSheet(
             "color: #ecf0f1; font-size: 14px; font-weight: bold; "
             "padding: 8px 0px 16px 0px;"
         )
-        nav_layout.addWidget(title_label)
+        nav_layout.addWidget(self._nav_title_label)
 
         nav_layout.addWidget(self._make_separator())
 
@@ -2407,10 +2503,10 @@ class BubbleTomographyGUI(QMainWindow):
         nav_layout.addStretch()
 
         # 版本信息
-        ver_label = QLabel("v1.0")
-        ver_label.setAlignment(Qt.AlignCenter)
-        ver_label.setStyleSheet("color: #7f8c8d; font-size: 11px; padding: 8px;")
-        nav_layout.addWidget(ver_label)
+        self._nav_version_label = QLabel("v1.0")
+        self._nav_version_label.setAlignment(Qt.AlignCenter)
+        self._nav_version_label.setStyleSheet("color: #7f8c8d; font-size: 11px; padding: 8px;")
+        nav_layout.addWidget(self._nav_version_label)
 
         # === 右侧内?(QStackedWidget) ===
         self.content_stack = QStackedWidget()
@@ -2646,6 +2742,27 @@ class BubbleTomographyGUI(QMainWindow):
 
         window_menu.addSeparator()
 
+        theme_menu = window_menu.addMenu("主题")
+        self._theme_action_group = QActionGroup(self)
+        self._theme_action_group.setExclusive(True)
+
+        theme_actions = [
+            ("midnight", "macOS 极客暗黑风 (Midnight Industrial)"),
+            ("silicon", "macOS 科研高亮风 (Silicon Light)"),
+        ]
+        for theme_key, theme_label in theme_actions:
+            theme_action = QAction(theme_label, self)
+            theme_action.setCheckable(True)
+            theme_action.setData(theme_key)
+            theme_action.setChecked(theme_key == self.current_theme)
+            theme_action.triggered.connect(
+                lambda checked=False, key=theme_key: self._set_theme(key)
+            )
+            self._theme_action_group.addAction(theme_action)
+            theme_menu.addAction(theme_action)
+
+        window_menu.addSeparator()
+
         # "图片预览 适应窗口" 切换（可勾选）
         self._toggle_preview_action = QAction("图片预览 适应窗口", self)
         self._toggle_preview_action.setCheckable(True)
@@ -2721,9 +2838,219 @@ class BubbleTomographyGUI(QMainWindow):
         if hasattr(self, '_preview_toggle_btn'):
             self._preview_toggle_btn.setChecked(expanded)
 
+    def _theme_palette(self) -> Dict[str, str]:
+        """Return the active macOS-inspired UI palette."""
+        palettes = {
+            "midnight": {
+                "background": "#1E1E20",
+                "sidebar": "#28282B",
+                "sidebar_header": "#242428",
+                "sidebar_path": "#232326",
+                "surface": "#323236",
+                "surface_alt": "#3A3A3F",
+                "input": "#323236",
+                "hover": "#3A3A3F",
+                "pressed": "#46464C",
+                "border": "#4A4A50",
+                "text_main": "#F5F5F7",
+                "text_secondary": "#98989D",
+                "accent": "#0A84FF",
+                "accent_hover": "#2997FF",
+                "accent_text": "#FFFFFF",
+                "success": "#32D74B",
+                "warning": "#FF9F0A",
+                "danger": "#FF453A",
+                "shadow": "rgba(0, 0, 0, 70)",
+            },
+            "silicon": {
+                "background": "#F5F5F7",
+                "sidebar": "#EBEBF0",
+                "sidebar_header": "#E2E2E7",
+                "sidebar_path": "#F0F0F4",
+                "surface": "#FFFFFF",
+                "surface_alt": "#F2F2F6",
+                "input": "#FFFFFF",
+                "hover": "#E5F0FF",
+                "pressed": "#D7E8FF",
+                "border": "#D2D2D7",
+                "text_main": "#1D1D1F",
+                "text_secondary": "#86868B",
+                "accent": "#0066CC",
+                "accent_hover": "#0A74D9",
+                "accent_text": "#FFFFFF",
+                "success": "#248A3D",
+                "warning": "#B26A00",
+                "danger": "#D70015",
+                "shadow": "rgba(0, 0, 0, 26)",
+            },
+        }
+        return palettes.get(self.current_theme, palettes["midnight"])
+
+    def _map_theme_stylesheet(self, stylesheet: str) -> str:
+        """Map the legacy dark stylesheet onto the selected theme palette."""
+        p = self._theme_palette()
+        replacements = {
+            "#1e1e1e": p["background"],
+            "#2b2b2b": p["sidebar"],
+            "#3c3c3c": p["surface"],
+            "#4a4a4a": p["hover"],
+            "#555": p["border"],
+            "#666": p["text_secondary"],
+            "#333": p["surface_alt"],
+            "#444": p["border"],
+            "#888": p["text_secondary"],
+            "#aaa": p["text_secondary"],
+            "#ccc": p["text_main"],
+            "#ddd": p["text_main"],
+            "#eee": p["text_main"],
+            "#fff": p["accent_text"],
+            "#2196F3": p["accent"],
+            "#42A5F5": p["accent_hover"],
+            "#4CAF50": p["success"],
+        }
+        for old, new in replacements.items():
+            stylesheet = stylesheet.replace(old, new)
+        stylesheet += f"""
+            QMainWindow {{
+                background-color: {p['background']};
+            }}
+            QWidget {{
+                background-color: {p['background']};
+                color: {p['text_main']};
+            }}
+            QMenuBar, QMenu, QStatusBar, QToolBar {{
+                background-color: {p['sidebar']};
+                color: {p['text_main']};
+            }}
+            QGroupBox, QTabWidget::pane {{
+                background-color: {p['surface']};
+                color: {p['text_main']};
+                border-color: {p['border']};
+            }}
+            QLineEdit, QTextEdit, QListWidget, QTreeWidget,
+            QComboBox, QSpinBox, QDoubleSpinBox {{
+                background-color: {p['input']};
+                color: {p['text_main']};
+                border-color: {p['border']};
+            }}
+            QPushButton {{
+                background-color: {p['surface_alt']};
+                color: {p['text_main']};
+                border-color: {p['border']};
+            }}
+            QPushButton:hover {{
+                background-color: {p['hover']};
+                border-color: {p['accent_hover']};
+            }}
+            QPushButton:checked {{
+                background-color: {p['accent']};
+                color: {p['accent_text']};
+                border-color: {p['accent']};
+            }}
+            QTabWidget::tab:selected, QListWidget::item:selected,
+            QTreeWidget::item:selected, QComboBox QAbstractItemView::item:selected {{
+                background-color: {p['accent']};
+                color: {p['accent_text']};
+            }}
+        """
+        return stylesheet
+
+    def _set_theme(self, theme_key: str):
+        """Switch application theme from the Window > Theme menu."""
+        if theme_key not in {"midnight", "silicon"}:
+            return
+        self.current_theme = theme_key
+        if hasattr(self, "_theme_action_group"):
+            for action in self._theme_action_group.actions():
+                action.setChecked(action.data() == theme_key)
+        self._apply_global_style()
+        self._apply_scaled_fonts()
+        self.statusBar().showMessage(
+            "已切换主题: "
+            + (
+                "macOS 极客暗黑风 (Midnight Industrial)"
+                if theme_key == "midnight"
+                else "macOS 科研高亮风 (Silicon Light)"
+            ),
+            3000,
+        )
+
+    def _preview_toggle_stylesheet(self, theme: Dict[str, str]) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {theme['sidebar_header']};
+                color: {theme['text_secondary']};
+                border: 1px solid {theme['border']};
+                border-radius: 3px;
+                padding: 2px 12px;
+                font-size: 12px;
+            }}
+            QPushButton:checked {{
+                color: {theme['accent']};
+                border-color: {theme['accent']};
+            }}
+            QPushButton:hover {{
+                color: {theme['text_main']};
+                border-color: {theme['accent_hover']};
+            }}
+        """
+
+    def _nav_button_stylesheet(self, theme: Dict[str, str]) -> str:
+        return f"""
+            QPushButton {{
+                text-align: left;
+                padding: 8px 14px;
+                border: none;
+                border-radius: 6px;
+                color: {theme['text_secondary']};
+                font-size: 13px;
+                background-color: transparent;
+            }}
+            QPushButton:hover {{
+                background-color: {theme['hover']};
+                color: {theme['text_main']};
+            }}
+            QPushButton:checked {{
+                background-color: {theme['accent']};
+                color: {theme['accent_text']};
+                font-weight: bold;
+            }}
+        """
+
+    def _apply_theme_to_fixed_widgets(self):
+        """Refresh widgets that use local stylesheets outside the global theme."""
+        theme = self._theme_palette()
+        if hasattr(self, "_nav_panel"):
+            self._nav_panel.setStyleSheet(f"""
+                QWidget#navPanel {{
+                    background-color: {theme['sidebar']};
+                }}
+            """)
+        if hasattr(self, "_nav_buttons"):
+            nav_style = self._nav_button_stylesheet(theme)
+            for btn in self._nav_buttons.values():
+                btn.setStyleSheet(nav_style)
+        if hasattr(self, "_nav_title_label"):
+            self._nav_title_label.setStyleSheet(
+                f"color: {theme['text_main']}; font-size: 14px; font-weight: bold; "
+                "padding: 8px 0px 16px 0px;"
+            )
+        if hasattr(self, "_nav_version_label"):
+            self._nav_version_label.setStyleSheet(
+                f"color: {theme['text_secondary']}; font-size: 11px; padding: 8px;"
+            )
+        if hasattr(self, "_preview_toggle_btn"):
+            self._preview_toggle_btn.setStyleSheet(
+                self._scale_stylesheet(self._preview_toggle_stylesheet(theme))
+            )
+        if hasattr(self, "_file_tree_panel"):
+            self._file_tree_panel.apply_theme(theme)
+        if hasattr(self, "_preview_panel"):
+            self._preview_panel.apply_theme(theme)
+
     def _apply_global_style(self):
         """应用全局样式 — DaVis 10 深色主题。"""
-        self.setStyleSheet(self._scale_stylesheet("""
+        stylesheet = """
             /* === 全局字体 === */
             * {
                 font-family: "Microsoft YaHei", "SimHei", "Segoe UI", sans-serif;
@@ -3034,7 +3361,11 @@ class BubbleTomographyGUI(QMainWindow):
                 border: 1px solid #444;
                 padding: 4px;
             }
-        """))
+        """
+        self.setStyleSheet(
+            self._scale_stylesheet(self._map_theme_stylesheet(stylesheet))
+        )
+        self._apply_theme_to_fixed_widgets()
 
     # 注：_navigate_to 定义在文件末尾（使用正确的页面索引映射）
 
