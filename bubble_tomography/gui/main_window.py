@@ -1261,6 +1261,7 @@ class FileTreePanel(QWidget):
         self._load_timer.setInterval(100)  # 防抖 100ms
         self._pending_path: str = ""
         self._theme: Dict[str, str] = {}
+        self._extra_dirs = set()
         self._load_timer.timeout.connect(self._emit_pending_signal)
 
         # 文件系统监视器：工作目录内容变化时自动刷新
@@ -1463,80 +1464,68 @@ class FileTreePanel(QWidget):
 
     def watch_extra_dir(self, path: str):
         """追加监视一个额外目录（如批处理输出目录）。"""
-        if path and os.path.isdir(path) and path not in self._fs_watcher.directories():
-            self._fs_watcher.addPath(path)
+        if not path or not os.path.isdir(path):
+            return
+        normalized = str(Path(path).resolve())
+        self._extra_dirs.add(normalized)
+        self._watch_directory_tree(Path(normalized))
+        watched = set(self._fs_watcher.directories())
+        parent = str(Path(normalized).parent)
+        if parent and parent not in watched and os.path.isdir(parent):
+            self._fs_watcher.addPath(parent)
+        self.schedule_refresh()
+
+    def schedule_refresh(self, delay_ms: int = 500):
+        """防抖刷新文件树，供处理流程和文件系统事件共同调用。"""
+        self._refresh_timer.start(max(0, delay_ms))
 
     def _on_dir_changed(self, path: str):
         """目录内容变化时触发防抖刷新，并确保新子目录被监视。"""
         # 若是新增子目录，追加监视
         if os.path.isdir(path) and path not in self._fs_watcher.directories():
             self._fs_watcher.addPath(path)
-        self._refresh_timer.start()
+        self.schedule_refresh()
 
     def _on_file_changed(self, path: str):
         """单个文件变化（如重命名后旧路径通知）时触发防抖刷新。"""
-        self._refresh_timer.start()
+        self.schedule_refresh()
 
     def refresh(self):
         """重新扫描工作目录，重建树节点。"""
         self._tree.setUpdatesEnabled(False)  # 批量更新期间禁止重绘
         self._tree.clear()
-        if not self._work_dir or not os.path.isdir(self._work_dir):
+        extra_dirs = [
+            Path(p) for p in sorted(self._extra_dirs)
+            if os.path.isdir(p)
+        ]
+        if (not self._work_dir or not os.path.isdir(self._work_dir)) and not extra_dirs:
             self._path_label.setText("未设置工作目录")
             self._tree.setUpdatesEnabled(True)
             return
 
-        self._path_label.setText(self._work_dir)
+        self._path_label.setText(self._work_dir or "额外输出目录")
 
-        root_dir = Path(self._work_dir)
+        root_dir = Path(self._work_dir) if self._work_dir and os.path.isdir(self._work_dir) else None
+        roots = []
+        if root_dir is not None:
+            roots.append(root_dir)
 
-        # 刷新后重新同步监视的子目录列表
-        watched_dirs = set(self._fs_watcher.directories())
-        for sub in root_dir.iterdir():
-            if sub.is_dir() and not sub.name.startswith('.'):
-                s = str(sub)
-                if s not in watched_dirs:
-                    self._fs_watcher.addPath(s)
+        seen_roots = {str(p.resolve()) for p in roots}
+        for extra in extra_dirs:
+            extra_key = str(extra.resolve())
+            if root_dir is not None:
+                try:
+                    extra.relative_to(root_dir)
+                    continue
+                except ValueError:
+                    pass
+            if extra_key not in seen_roots:
+                roots.append(extra)
+                seen_roots.add(extra_key)
 
-        # 先收集根目录下直属图片
-        root_images = sorted(
-            p for p in root_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
-        )
-
-        # 再收集子文件夹
-        subdirs = sorted(
-            p for p in root_dir.iterdir()
-            if p.is_dir() and not p.name.startswith('.')
-        )
-
-        # 根目录直属图片单独分组
-        if root_images:
-            group_item = QTreeWidgetItem(self._tree)
-            group_item.setText(0, f"📂 {root_dir.name}  ({len(root_images)} 张)")
-            group_item.setData(0, Qt.UserRole, str(root_dir))
-            group_item.setData(0, Qt.UserRole + 1, "group")
-            group_item.setForeground(0, QColor(self._theme.get("accent", "#3498db")))
-            group_item.setExpanded(False)
-            for img_path in root_images:
-                self._add_image_item(group_item, img_path)
-
-        # 子文件夹
-        for sub in subdirs:
-            imgs = sorted(
-                p for p in sub.iterdir()
-                if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
-            )
-            if not imgs:
-                continue
-            group_item = QTreeWidgetItem(self._tree)
-            group_item.setText(0, f"📂 {sub.name}  ({len(imgs)} 张)")
-            group_item.setData(0, Qt.UserRole, str(sub))
-            group_item.setData(0, Qt.UserRole + 1, "group")
-            group_item.setForeground(0, QColor(self._theme.get("accent", "#3498db")))
-            group_item.setExpanded(False)
-            for img_path in imgs:
-                self._add_image_item(group_item, img_path)
+        for root in roots:
+            self._watch_directory_tree(root)
+            self._add_directory_item(None, root)
 
         if self._tree.topLevelItemCount() == 0:
             empty_item = QTreeWidgetItem(self._tree)
@@ -1544,6 +1533,57 @@ class FileTreePanel(QWidget):
             empty_item.setForeground(0, QColor("#7f8c8d"))
 
         self._tree.setUpdatesEnabled(True)  # 恢复重绘
+
+    def _safe_iterdir(self, directory: Path):
+        try:
+            return list(directory.iterdir())
+        except Exception:
+            return []
+
+    def _direct_images(self, directory: Path):
+        return sorted(
+            p for p in self._safe_iterdir(directory)
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
+        )
+
+    def _child_dirs(self, directory: Path):
+        return sorted(
+            p for p in self._safe_iterdir(directory)
+            if p.is_dir() and not p.name.startswith('.')
+        )
+
+    def _image_count_recursive(self, directory: Path) -> int:
+        total = len(self._direct_images(directory))
+        for child in self._child_dirs(directory):
+            total += self._image_count_recursive(child)
+        return total
+
+    def _watch_directory_tree(self, directory: Path):
+        watched_dirs = set(self._fs_watcher.directories())
+        directory_str = str(directory)
+        if directory_str not in watched_dirs and directory.is_dir():
+            self._fs_watcher.addPath(directory_str)
+            watched_dirs.add(directory_str)
+        for child in self._child_dirs(directory):
+            self._watch_directory_tree(child)
+
+    def _add_directory_item(self, parent: Optional[QTreeWidgetItem], directory: Path, force: bool = False):
+        image_count = self._image_count_recursive(directory)
+        if image_count == 0 and not force:
+            return None
+
+        item = QTreeWidgetItem(parent if parent is not None else self._tree)
+        item.setText(0, f"📂 {directory.name}  ({image_count} 张)")
+        item.setData(0, Qt.UserRole, str(directory))
+        item.setData(0, Qt.UserRole + 1, "group")
+        item.setForeground(0, QColor(self._theme.get("accent", "#3498db")))
+        item.setExpanded(parent is None or directory.name.startswith("image_"))
+
+        for subdir in self._child_dirs(directory):
+            self._add_directory_item(item, subdir)
+        for img_path in self._direct_images(directory):
+            self._add_image_item(item, img_path)
+        return item
 
     def _add_image_item(self, parent: QTreeWidgetItem, img_path: Path):
         item = QTreeWidgetItem(parent)
@@ -1679,11 +1719,18 @@ class FileTreePanel(QWidget):
 
     def _preview_group(self, item: QTreeWidgetItem):
         """预览组节点的第一张图片。"""
-        child = item.child(0)
-        if child:
-            first_img = child.data(0, Qt.UserRole)
-            if first_img:
-                self.group_selected.emit(first_img)
+        first_img = self._first_image_path(item)
+        if first_img:
+            self.group_selected.emit(first_img)
+
+    def _first_image_path(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.UserRole + 1) == "image":
+            return item.data(0, Qt.UserRole)
+        for idx in range(item.childCount()):
+            found = self._first_image_path(item.child(idx))
+            if found:
+                return found
+        return None
 
     def _copy_path(self, path: str):
         """复制文件路径到剪贴板。"""
@@ -2389,6 +2436,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_operand_path: str = ""          # 加减法第二张图路径
         self.ie_src_dir: str = ""               # 批量输入目录
         self.ie_dst_dir: str = ""               # 批量输出目录
+        self.ie_dst_dir_manual: bool = False
         self.ie_worker_thread = None            # 批量处理后台线程
         self._ie_current_preview: Optional[np.ndarray] = None  # 处理后预览图
 
@@ -3017,6 +3065,163 @@ class BubbleTomographyGUI(QMainWindow):
             }}
         """
 
+    def _apply_image_editor_theme(self):
+        """Apply the active theme to the image editor's local styles."""
+        if not hasattr(self, "ie_editor_page"):
+            return
+
+        theme = self._theme_palette()
+        bg = theme["background"]
+        sidebar = theme["sidebar"]
+        surface = theme["surface"]
+        surface_alt = theme["surface_alt"]
+        input_bg = theme["input"]
+        border = theme["border"]
+        text = theme["text_main"]
+        muted = theme["text_secondary"]
+        accent = theme["accent"]
+        accent_hover = theme["accent_hover"]
+        success = theme["success"]
+        danger = theme["danger"]
+
+        def apply(widget, stylesheet):
+            if widget is not None:
+                widget.setStyleSheet(self._scale_stylesheet(stylesheet))
+
+        common_button = f"""
+            QPushButton {{
+                background: {surface_alt}; color: {text}; border: 1px solid {border};
+                border-radius: 3px; padding: 4px 10px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {theme['hover']}; border-color: {accent_hover}; }}
+            QPushButton:pressed {{ background: {theme['pressed']}; }}
+            QPushButton:disabled {{ background: {surface_alt}; color: {muted}; }}
+        """
+        input_style = f"""
+            QLineEdit, QComboBox, QSpinBox {{
+                background: {input_bg}; color: {text}; border: 1px solid {border};
+                border-radius: 3px; padding: 3px 8px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {input_bg}; color: {text};
+                selection-background-color: {accent};
+            }}
+        """
+        scroll_style = f"""
+            QScrollArea {{ border: none; background: {bg}; }}
+            QScrollBar:vertical {{ background: {bg}; width: 6px; }}
+            QScrollBar::handle:vertical {{
+                background: {border}; border-radius: 3px;
+            }}
+        """
+
+        apply(getattr(self, "ie_editor_page", None), f"QWidget {{ background: {bg}; color: {text}; }}")
+        apply(getattr(self, "ie_toolbar", None), f"""
+            QFrame {{ background: {sidebar}; border-bottom: 1px solid {border}; }}
+            QLabel {{ color: {muted}; font-size: 12px; }}
+            {common_button}
+        """)
+        apply(getattr(self, "ie_body_splitter", None),
+              f"QSplitter::handle {{ background: {border}; width: 2px; }}")
+        apply(getattr(self, "ie_ops_panel", None), f"""
+            QWidget {{ background: {sidebar}; color: {text}; }}
+            QLabel {{ color: {text}; }}
+            QLineEdit {{
+                background: {input_bg}; color: {text}; border: 1px solid {border};
+                border-radius: 3px; padding: 5px 8px;
+            }}
+            QLineEdit::placeholder {{ color: {muted}; }}
+            QGroupBox {{
+                color: {muted}; border: none; border-top: 1px solid {border};
+                margin-top: 12px; padding-top: 16px; font-weight: bold;
+            }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; }}
+        """)
+        apply(getattr(self, "ie_ops_scroll", None), scroll_style.replace(bg, sidebar))
+        apply(getattr(self, "ie_workflow_canvas", None), f"background: {bg}; color: {text};")
+        apply(getattr(self, "ie_canvas_scroll", None), scroll_style)
+        apply(getattr(self, "ie_canvas_content", None), f"QWidget {{ background: {bg}; color: {text}; }}")
+        apply(getattr(self, "ie_viewer", None), f"QWidget {{ background: {bg}; color: {text}; }}")
+
+        bar_style = f"""
+            QFrame {{ background: {surface}; border-radius: 4px; border: none; }}
+            QLabel {{ color: {muted}; font-size: 11px; border: none; }}
+            {common_button}
+            {input_style}
+        """
+        apply(getattr(self, "ie_source_bar", None), bar_style)
+        apply(getattr(self, "ie_fname_bar", None), bar_style)
+        apply(getattr(self, "ie_frame_nav", None), bar_style + f"""
+            QSlider::groove:horizontal {{ background: {border}; height: 4px; }}
+            QSlider::handle:horizontal {{
+                background: {accent}; width: 12px; margin: -4px 0; border-radius: 6px;
+            }}
+        """)
+        apply(getattr(self, "ie_viewer_splitter", None),
+              f"QSplitter::handle {{ background: {border}; height: 2px; }}")
+
+        frame_style = f"QFrame {{ background: {surface}; border: 1px solid {border}; border-radius: 4px; }}"
+        apply(getattr(self, "ie_orig_frame", None), frame_style)
+        apply(getattr(self, "ie_result_frame", None), frame_style)
+        label_style = f"border: 1px solid {border}; background: {bg}; color: {muted}; font-size: 13px;"
+        apply(getattr(self, "ie_orig_label", None), label_style)
+        apply(getattr(self, "ie_preview_label", None), label_style)
+        info_style = f"color: {muted}; font-size: 10px; background: {surface_alt}; padding: 0 6px; border: none;"
+        apply(getattr(self, "ie_orig_info_bar", None), info_style)
+        apply(getattr(self, "ie_result_info_bar", None), info_style)
+        apply(getattr(self, "ie_log", None),
+              f"QTextEdit {{ background: {surface}; color: {muted}; border: 1px solid {border}; border-radius: 4px; font-size: 11px; padding: 4px; }}")
+        apply(getattr(self, "ie_progress_bar", None), f"""
+            QProgressBar {{
+                background: {surface}; border: none; border-radius: 2px;
+                text-align: center; color: {text}; height: 16px;
+            }}
+            QProgressBar::chunk {{ background: {success}; border-radius: 2px; }}
+        """)
+
+        apply(getattr(self, "ie_run_btn", None), f"""
+            QPushButton {{
+                background: {accent}; color: {theme['accent_text']}; border: none;
+                border-radius: 3px; padding: 4px 12px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {accent_hover}; }}
+            QPushButton:disabled {{ background: {surface_alt}; color: {muted}; }}
+        """)
+        apply(getattr(self, "ie_batch_run_btn", None), f"""
+            QPushButton {{
+                background: {theme['warning']}; color: {theme['accent_text']}; border: none;
+                border-radius: 3px; padding: 4px 12px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {accent_hover}; }}
+            QPushButton:disabled {{ background: {surface_alt}; color: {muted}; }}
+        """)
+        if hasattr(self, "ie_stop_btn"):
+            self.ie_stop_btn.setStyleSheet(self._scale_stylesheet(common_button))
+        if hasattr(self, "ie_reset_btn"):
+            self.ie_reset_btn.setStyleSheet(self._scale_stylesheet(common_button))
+        if hasattr(self, "ie_mode_combo"):
+            self.ie_mode_combo.setStyleSheet(self._scale_stylesheet(input_style))
+        if hasattr(self, "ie_filename_edit"):
+            self.ie_filename_edit.setStyleSheet(self._scale_stylesheet(input_style))
+        if hasattr(self, "ie_fps_spin"):
+            self.ie_fps_spin.setStyleSheet(self._scale_stylesheet(input_style))
+
+        if hasattr(self, "_ie_workflow_nodes"):
+            for step_key, info in self._ie_workflow_nodes.items():
+                enabled = info["enable_check"].isChecked()
+                node_border = accent if enabled else border
+                info["widget"].setStyleSheet(
+                    f"QFrame {{ background: {surface}; border: 1px solid {node_border}; border-radius: 6px; }}"
+                )
+                info["param_label"].setStyleSheet(
+                    f"color: {muted}; font-size: 11px; border: none;"
+                )
+        if hasattr(self, "_ie_data_source_node"):
+            self._ie_data_source_node.setStyleSheet(
+                f"QFrame {{ background: {surface}; border: 1px solid {success}; border-radius: 6px; }}"
+            )
+
     def _apply_theme_to_fixed_widgets(self):
         """Refresh widgets that use local stylesheets outside the global theme."""
         theme = self._theme_palette()
@@ -3047,6 +3252,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._file_tree_panel.apply_theme(theme)
         if hasattr(self, "_preview_panel"):
             self._preview_panel.apply_theme(theme)
+        self._apply_image_editor_theme()
 
     def _apply_global_style(self):
         """应用全局样式 — DaVis 10 深色主题。"""
@@ -3402,6 +3608,7 @@ class BubbleTomographyGUI(QMainWindow):
     def _create_calibration_page(self):
         """创建标定页：左侧参数 + 右侧预览。"""
         page = QWidget()
+        self.ie_editor_page = page
         layout = QHBoxLayout(page)
 
         # 左侧: 参数设置
@@ -8472,6 +8679,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # ===== 顶部工具栏 =====
         toolbar = QFrame()
+        self.ie_toolbar = toolbar
         toolbar.setFixedHeight(self._sp(42))
         toolbar.setStyleSheet(
             "QFrame { background: #2b2b2b; border-bottom: 1px solid #444; }"
@@ -8549,6 +8757,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # ===== 三栏主体 =====
         body_splitter = QSplitter(Qt.Horizontal)
+        self.ie_body_splitter = body_splitter
         body_splitter.setStyleSheet("QSplitter::handle { background: #444; width: 2px; }")
 
         # --- 左栏：操作面板 ---
@@ -8567,6 +8776,7 @@ class BubbleTomographyGUI(QMainWindow):
         outer.addWidget(body_splitter, stretch=1)
 
         self.content_stack.addWidget(page)
+        self._apply_image_editor_theme()
 
         # 实时预览定时器（防抖）
         self._ie_preview_timer = QTimer(self)
@@ -8585,6 +8795,7 @@ class BubbleTomographyGUI(QMainWindow):
     def _ie_create_ops_panel(self, _IE):
         """左栏：操作面板 — 搜索框 + 可折叠算法分组。"""
         panel = QWidget()
+        self.ie_ops_panel = panel
         panel.setStyleSheet(
             "QWidget { background: #2b2b2b; }"
             "QLabel { color: #ccc; }"
@@ -8607,6 +8818,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 可滚动区域
         scroll = QScrollArea()
+        self.ie_ops_scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(
             "QScrollArea { border: none; background: #2b2b2b; }"
@@ -8671,6 +8883,7 @@ class BubbleTomographyGUI(QMainWindow):
     def _ie_create_workflow_canvas(self, _IE):
         """中栏：工作流画布 — 垂直节点卡片流，支持拖拽添加和节点排序。"""
         canvas = _IEWorkflowCanvas(self._sp)
+        self.ie_workflow_canvas = canvas
         canvas.setStyleSheet("background: #1e1e1e;")
         canvas.node_drop_requested.connect(self._ie_add_node)
         canvas.node_move_requested.connect(self._ie_move_node)
@@ -8712,6 +8925,7 @@ class BubbleTomographyGUI(QMainWindow):
     def _ie_create_viewer_area(self):
         """右栏：查看器区域 — 上下分割源图/结果。"""
         viewer = QWidget()
+        self.ie_viewer = viewer
         viewer.setStyleSheet("background: #1e1e1e;")
         v_lay = QVBoxLayout(viewer)
         v_lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
@@ -8719,6 +8933,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 输入源选择区域
         source_bar = QFrame()
+        self.ie_source_bar = source_bar
         source_bar.setStyleSheet(
             "QFrame { background: #2b2b2b; border-radius: 4px; border: none; }"
             "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
@@ -8791,6 +9006,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 文件名模式行
         fname_bar = QFrame()
+        self.ie_fname_bar = fname_bar
         fname_bar.setStyleSheet(
             "QFrame { background: #2b2b2b; border-radius: 3px; border: none; }"
             "QLabel { color: #aaa; font-size: 11px; border: none; }"
@@ -8824,12 +9040,14 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 上下分割的图像查看器
         viewer_splitter = QSplitter(Qt.Vertical)
+        self.ie_viewer_splitter = viewer_splitter
         viewer_splitter.setStyleSheet(
             "QSplitter::handle { background: #444; height: 2px; }"
         )
 
         # 源图区
         orig_frame = QFrame()
+        self.ie_orig_frame = orig_frame
         orig_frame.setStyleSheet(
             "QFrame { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; }"
         )
@@ -8873,6 +9091,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 结果图区
         result_frame = QFrame()
+        self.ie_result_frame = result_frame
         result_frame.setStyleSheet(
             "QFrame { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; }"
         )
@@ -8918,6 +9137,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 帧导航栏（批量模式浏览多帧）
         frame_nav = QFrame()
+        self.ie_frame_nav = frame_nav
         frame_nav.setStyleSheet(
             "QFrame { background: #2b2b2b; border-radius: 3px; border: none; }"
             "QPushButton { background: #3c3c3c; color: #ddd; border: 1px solid #555; "
@@ -9235,6 +9455,7 @@ class BubbleTomographyGUI(QMainWindow):
             f"QFrame {{ background: #2b2b2b; border: 1px solid {border_color}; "
             f"  border-radius: 6px; opacity: {opacity}; }}"
         )
+        self._apply_image_editor_theme()
         self._ie_request_preview()
 
     def _ie_add_arrow(self):
@@ -9740,6 +9961,8 @@ class BubbleTomographyGUI(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择输入目录")
         if d:
             self.ie_src_dir = d
+            if not getattr(self, "ie_dst_dir_manual", False):
+                self.ie_dst_dir = ""
             self.ie_src_label.setText(d)
             self.ie_src_label.setStyleSheet("color: #ddd;")
             from utils.image_editor import SUPPORTED_EXTS
@@ -9763,6 +9986,7 @@ class BubbleTomographyGUI(QMainWindow):
                                              "", "目录")[0]
         if d:
             self.ie_dst_dir = d
+            self.ie_dst_dir_manual = True
             self.ie_dst_label.setText(d)
             self.ie_dst_label.setStyleSheet("color: #ddd;")
             self.ie_log.append(f"输出目录: {d}")
@@ -9862,6 +10086,37 @@ class BubbleTomographyGUI(QMainWindow):
             result += ext
         return result
 
+    def _ie_processing_dir_suffix(self, step_order=None):
+        steps = step_order if step_order is not None else self._ie_get_step_order()
+        if steps:
+            raw = "_".join(str(step) for step in steps)
+        else:
+            raw = "processed"
+        raw = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_").lower()
+        return raw or "processed"
+
+    def _ie_next_default_output_dir(self, source_dir, step_order=None):
+        base_dir = Path(source_dir)
+        suffix = self._ie_processing_dir_suffix(step_order)
+        prefix = f"image_{suffix}_"
+        max_idx = 0
+        if base_dir.exists():
+            for child in base_dir.iterdir():
+                if not child.is_dir() or not child.name.startswith(prefix):
+                    continue
+                tail = child.name[len(prefix):]
+                if tail.isdigit():
+                    max_idx = max(max_idx, int(tail))
+        return str(base_dir / f"{prefix}{max_idx + 1:02d}")
+
+    def _ie_default_output_dir_for_current_image(self, step_order=None):
+        if self.ie_single_path:
+            return self._ie_next_default_output_dir(
+                os.path.dirname(self.ie_single_path), step_order)
+        if self.ie_src_dir:
+            return self._ie_next_default_output_dir(self.ie_src_dir, step_order)
+        return ""
+
     def _ie_save_single(self):
         """保存单张处理结果（使用文件名模式）。"""
         import cv2 as _cv2
@@ -9870,8 +10125,13 @@ class BubbleTomographyGUI(QMainWindow):
             return
         # 使用文件名模式自动生成路径
         if self.ie_single_path:
-            out_name = self._ie_resolve_filename(self.ie_single_path)
-            out_dir = self.ie_dst_dir or os.path.dirname(self.ie_single_path)
+            step_order = self._ie_get_step_order()
+            out_name = self._ie_resolve_filename(self.ie_single_path, step_order=step_order)
+            out_dir = (
+                self.ie_dst_dir
+                if getattr(self, "ie_dst_dir_manual", False)
+                else self._ie_default_output_dir_for_current_image(step_order)
+            )
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, out_name)
         else:
@@ -9897,9 +10157,14 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择输入目录")
             return
 
-        # 自动创建输出文件夹：若未设置则使用 {输入目录}/processed
-        if not self.ie_dst_dir:
-            self.ie_dst_dir = os.path.join(self.ie_src_dir, "processed")
+        # 自动创建输出文件夹：若未手动设置则使用 image_<处理步骤>_<次数>
+        step_order = self._ie_get_step_order()
+        if not step_order:
+            QMessageBox.warning(self, "提示", "请至少勾选一个处理步骤")
+            return
+        if not getattr(self, "ie_dst_dir_manual", False):
+            self.ie_dst_dir = self._ie_next_default_output_dir(
+                self.ie_src_dir, step_order)
             self.ie_dst_label.setText(self.ie_dst_dir)
             self.ie_log.append(f"自动设置输出目录: {self.ie_dst_dir}")
 
@@ -9907,11 +10172,6 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 让文件树监视输出目录（若它在工作目录下，会被自动发现；若在外部则追加监视）
         self._file_tree_panel.watch_extra_dir(self.ie_dst_dir)
-
-        step_order = self._ie_get_step_order()
-        if not step_order:
-            QMessageBox.warning(self, "提示", "请至少勾选一个处理步骤")
-            return
 
         # 不再调用 _ie_sync_config_from_ui()，配置已通过对话框同步到 ie_config
         filename_pattern = self.ie_filename_edit.text().strip() or "{original}_processed"
@@ -9941,6 +10201,7 @@ class BubbleTomographyGUI(QMainWindow):
         pct = int(done / total * 100) if total > 0 else 0
         self.ie_progress_bar.setValue(pct)
         self.ie_log.append(f"  [{done}/{total}] {fname}")
+        self._file_tree_panel.schedule_refresh()
 
     def _ie_on_batch_finished(self, success, total):
         self.ie_batch_run_btn.setEnabled(True)
@@ -9949,7 +10210,10 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_log.append(
             f"批量处理完成: {success}/{total} 成功  输出: {self.ie_dst_dir}")
         # 批处理完成后主动刷新文件树（确保立即显示新文件）
+        self._file_tree_panel.watch_extra_dir(self.ie_dst_dir)
         self._file_tree_panel.refresh()
+        QTimer.singleShot(300, self._file_tree_panel.refresh)
+        QTimer.singleShot(1000, self._file_tree_panel.refresh)
         QMessageBox.information(self, "完成",
                                 f"批量处理完成!\n成功: {success}/{total}\n输出目录: {self.ie_dst_dir}")
 
