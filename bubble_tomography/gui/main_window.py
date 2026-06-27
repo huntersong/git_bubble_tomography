@@ -4,9 +4,12 @@
 
 import sys
 import os
+import html
 import json
 import re
 import time
+import urllib.error
+import urllib.request
 import cv2
 import numpy as np
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -21,9 +24,13 @@ from PyQt5.QtWidgets import (
     QMessageBox, QScrollArea, QGridLayout, QCheckBox, QSlider,
     QStatusBar, QToolBar, QAction, QActionGroup, QFrame, QListWidget,
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
-    QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy
+    QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy,
+    QGraphicsDropShadowEffect, QDialog, QDialogButtonBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher,
+    QVariantAnimation, QEasingCurve
+)
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -52,6 +59,152 @@ from utils.image_editor import (
     robust_imread,
 )
 from utils.cpu_parallel import default_worker_count, limited_opencv_threads
+
+
+class IOSNavButton(QPushButton):
+    """Navigation button with an iOS-like lift and press response."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._hovered = False
+        self._pressed = False
+        self._lift = 0.0
+        self._shadow = QGraphicsDropShadowEffect(self)
+        self._shadow.setBlurRadius(3.0)
+        self._shadow.setOffset(0.0, 1.0)
+        self._shadow.setColor(QColor(0, 0, 0, 90))
+        self.setGraphicsEffect(self._shadow)
+
+        self._lift_animation = QVariantAnimation(self)
+        self._lift_animation.setDuration(150)
+        self._lift_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._lift_animation.valueChanged.connect(self._set_lift)
+        self.toggled.connect(self._on_toggled)
+
+    def set_shadow_color(self, color: QColor):
+        self._shadow.setColor(color)
+
+    def _set_lift(self, value):
+        self._lift = float(value)
+        self._shadow.setBlurRadius(3.0 + 15.0 * self._lift)
+        self._shadow.setOffset(0.0, 1.0 + 3.0 * self._lift)
+
+    def _animate_lift(self, target: float, duration: int = 150):
+        self._lift_animation.stop()
+        self._lift_animation.setDuration(duration)
+        self._lift_animation.setStartValue(self._lift)
+        self._lift_animation.setEndValue(target)
+        self._lift_animation.start()
+
+    def _resting_lift(self) -> float:
+        return 0.45 if self.isChecked() else 0.0
+
+    def _on_toggled(self, _checked: bool):
+        if not self._hovered and not self._pressed:
+            self._animate_lift(self._resting_lift(), 170)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        if not self._pressed:
+            self._animate_lift(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        if not self._pressed:
+            self._animate_lift(self._resting_lift())
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            self._animate_lift(0.0, 80)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton:
+            self._pressed = False
+            target = 1.0 if self._hovered else self._resting_lift()
+            self._animate_lift(target, 180)
+
+
+class ClickableVersionLabel(QLabel):
+    """Version label activated by either the left or right mouse button."""
+    activated = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.LeftButton, Qt.RightButton):
+            self.activated.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class AIChatWorker(QThread):
+    """Call an OpenAI-compatible chat completion endpoint off the UI thread."""
+    response_ready = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        model: str,
+        messages: List[dict],
+        temperature: float,
+        timeout: int,
+    ):
+        super().__init__()
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.model = model
+        self.messages = messages
+        self.temperature = temperature
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            payload = json.dumps({
+                "model": self.model,
+                "messages": self.messages,
+                "temperature": self.temperature,
+            }).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            request = urllib.request.Request(
+                self.endpoint,
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+            choices = result.get("choices") or []
+            if not choices:
+                raise ValueError("接口响应中没有 choices 数据")
+            content = choices[0].get("message", {}).get("content")
+            if not content:
+                raise ValueError("接口响应中没有模型回复内容")
+            self.response_ready.emit(str(content))
+        except urllib.error.HTTPError as exc:
+            detail = exc.reason
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                detail = body.get("error", {}).get("message", detail)
+            except Exception:
+                pass
+            self.error.emit(f"HTTP {exc.code}: {detail}")
+        except urllib.error.URLError as exc:
+            self.error.emit(f"无法连接模型接口: {exc.reason}")
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class CalibrationWorker(QThread):
@@ -2395,7 +2548,7 @@ class BubbleTomographyGUI(QMainWindow):
         super().__init__()
         self.ui_scale = self._detect_ui_scale()
         self.current_theme = "midnight"
-        self.setWindowTitle("三维多相流场测量软件")
+        self.setWindowTitle("三维图像模块")
         self.setMinimumSize(1200, 800)
 
         # 数据存储
@@ -2476,7 +2629,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # === 左侧导航 ===
         self._nav_panel = QWidget()
-        self._nav_panel.setFixedWidth(self._sp(180))
+        self._nav_panel.setFixedWidth(self._sp(208))
         self._nav_panel.setStyleSheet("""
             QWidget#navPanel {
                 background-color: #2c3e50;
@@ -2485,75 +2638,122 @@ class BubbleTomographyGUI(QMainWindow):
         self._nav_panel.setObjectName("navPanel")
         nav_layout = QVBoxLayout(self._nav_panel)
         nav_layout.setContentsMargins(
-            self._sp(8), self._sp(16), self._sp(8), self._sp(16)
+            self._sp(9), self._sp(12), self._sp(9), self._sp(12)
         )
-        nav_layout.setSpacing(self._sp(4))
-
-        # ??
-        self._nav_title_label = QLabel("三维多相流场测量软件")
-        self._nav_title_label.setAlignment(Qt.AlignCenter)
-        self._nav_title_label.setStyleSheet(
-            "color: #ecf0f1; font-size: 14px; font-weight: bold; "
-            "padding: 8px 0px 16px 0px;"
-        )
-        nav_layout.addWidget(self._nav_title_label)
-
-        nav_layout.addWidget(self._make_separator())
+        nav_layout.setSpacing(self._sp(7))
 
         # 导航按钮
         self._nav_btn_group = QButtonGroup(self)
         self._nav_btn_group.setExclusive(True)
 
         self._nav_buttons = {}
-        nav_items = [
-            ("calibration",    "相机标定"),
-            ("reconstruction", "气泡重建"),
-            ("raytrace",       "单相机3D重建"),
-            ("particle",       "Particle / PIV"),
-            ("piv2d",          "二维PIV"),
-            ("image_editor",   "图像处理"),
+        self._nav_section_labels = []
+        self._nav_section_frames = []
+        nav_sections = [
+            ("通用图像模块", [
+                ("image_editor", "图像处理"),
+            ]),
+            ("三维图像模块", [
+                ("calibration", "相机标定"),
+                ("reconstruction", "气泡重建"),
+                ("raytrace", "单相机3D重建"),
+            ]),
+            ("PIV模块", [
+                ("particle", "三维PIV"),
+                ("piv2d", "二维PIV"),
+            ]),
+            ("AI辅助", [
+                ("ai_assistant", "AI辅助模型"),
+                ("local_model", "本地模型"),
+            ]),
         ]
 
-        for page_id, text in nav_items:
-            btn = QPushButton(text)
-            btn.setCheckable(True)
-            btn.setMinimumHeight(self._sp(44))
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet("""
-                QPushButton {
-                    text-align: left;
-                    padding: 8px 14px;
-                    border: none;
-                    border-radius: 6px;
-                    color: #bdc3c7;
-                    font-size: 13px;
-                    background-color: transparent;
-                }
-                QPushButton:hover {
-                    background-color: #34495e;
-                    color: #ecf0f1;
-                }
-                QPushButton:checked {
-                    background-color: #3498db;
-                    color: white;
-                    font-weight: bold;
+        for section_title, nav_items in nav_sections:
+            section_frame = QFrame()
+            section_frame.setObjectName("navSectionCard")
+            section_frame.setStyleSheet("""
+                QFrame#navSectionCard {
+                    background-color: #323236;
+                    border: 2px solid #4A4A50;
+                    border-radius: 10px;
                 }
             """)
-            self._nav_btn_group.addButton(btn)
-            self._nav_buttons[page_id] = btn
-            nav_layout.addWidget(btn)
+            section_layout = QVBoxLayout(section_frame)
+            section_layout.setContentsMargins(
+                self._sp(6), self._sp(5), self._sp(6), self._sp(7)
+            )
+            section_layout.setSpacing(self._sp(3))
 
-        image_editor_btn = self._nav_buttons.get("image_editor")
-        if image_editor_btn is not None:
-            nav_layout.removeWidget(image_editor_btn)
-            nav_layout.insertWidget(0, image_editor_btn)
+            section_label = QLabel(section_title)
+            section_label.setStyleSheet(
+                "color: #ecf0f1; font-size: 14px; font-weight: bold; "
+                "padding: 5px 8px 6px 8px; border-bottom: 1px solid #4A4A50;"
+            )
+            section_layout.addWidget(section_label)
+            self._nav_section_labels.append(section_label)
+            self._nav_section_frames.append(section_frame)
+
+            for page_id, text in nav_items:
+                btn = IOSNavButton(text)
+                btn.setCheckable(True)
+                btn.setMinimumHeight(self._sp(38))
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        text-align: left;
+                        padding: 8px 12px;
+                        border: 1px solid transparent;
+                        border-radius: 8px;
+                        color: #bdc3c7;
+                        font-size: 13px;
+                        background-color: transparent;
+                    }
+                    QPushButton:hover {
+                        background-color: #34495e;
+                        color: #ecf0f1;
+                        border-color: #5A6A7A;
+                    }
+                    QPushButton:pressed {
+                        background-color: #46464C;
+                        padding-top: 10px;
+                        padding-bottom: 6px;
+                    }
+                    QPushButton:checked {
+                        background-color: #3498db;
+                        color: white;
+                        font-weight: bold;
+                        border-color: #69B4FF;
+                    }
+                """)
+                self._nav_btn_group.addButton(btn)
+                self._nav_buttons[page_id] = btn
+                section_layout.addWidget(btn)
+
+            nav_layout.addWidget(section_frame)
 
         nav_layout.addStretch()
 
         # 版本信息
-        self._nav_version_label = QLabel("v1.0")
+        self._nav_version_label = ClickableVersionLabel("v2.0.20260627")
+        self._nav_version_label.setObjectName("navVersionLabel")
         self._nav_version_label.setAlignment(Qt.AlignCenter)
-        self._nav_version_label.setStyleSheet("color: #7f8c8d; font-size: 11px; padding: 8px;")
+        self._nav_version_label.setCursor(Qt.PointingHandCursor)
+        self._nav_version_label.setToolTip("左击或右击查看版本与开源许可")
+        self._nav_version_label.activated.connect(self._show_version_info)
+        self._nav_version_label.setStyleSheet("""
+            QLabel#navVersionLabel {
+                color: #7f8c8d;
+                font-size: 11px;
+                padding: 8px;
+                border: 1px solid transparent;
+                border-radius: 7px;
+            }
+            QLabel#navVersionLabel:hover {
+                color: #ecf0f1;
+                background-color: #34495e;
+                border-color: #5A6A7A;
+            }
+        """)
         nav_layout.addWidget(self._nav_version_label)
 
         # === 右侧内?(QStackedWidget) ===
@@ -2577,6 +2777,11 @@ class BubbleTomographyGUI(QMainWindow):
 
         # Page 5: 通用图像处理
         self._create_image_editor_page()
+
+        # Page 6-7: AI辅助
+        self._create_ai_module_page("ai_assistant", "AI辅助模型", local_default=False)
+        self._create_ai_module_page("local_model", "本地模型", local_default=True)
+
         image_editor_page = self.content_stack.widget(5)
         if image_editor_page is not None:
             self.content_stack.removeWidget(image_editor_page)
@@ -2625,6 +2830,307 @@ class BubbleTomographyGUI(QMainWindow):
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet("color: #4a6785;")
         return line
+
+    def _create_ai_module_page(
+        self, page_id: str, title: str, local_default: bool = False
+    ):
+        """创建支持 OpenAI 兼容接口的AI对话页面。"""
+        if not hasattr(self, "_ai_page_controls"):
+            self._ai_page_controls = {}
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(
+            self._sp(16), self._sp(16), self._sp(16), self._sp(16)
+        )
+        page_layout.setSpacing(self._sp(10))
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        page_layout.addWidget(title_label)
+
+        config_group = QGroupBox("模型与API接口")
+        config_layout = QGridLayout(config_group)
+        config_layout.setColumnStretch(1, 1)
+        config_layout.setColumnStretch(3, 1)
+
+        provider_combo = QComboBox()
+        provider_combo.addItems([
+            "ChatGPT (OpenAI)",
+            "DeepSeek",
+            "Ollama（本地）",
+            "LM Studio（本地）",
+            "自定义 OpenAI 兼容接口",
+        ])
+        config_layout.addWidget(QLabel("服务类型:"), 0, 0)
+        config_layout.addWidget(provider_combo, 0, 1)
+
+        model_combo = QComboBox()
+        model_combo.setEditable(True)
+        model_combo.setMinimumWidth(self._sp(170))
+        config_layout.addWidget(QLabel("模型:"), 0, 2)
+        config_layout.addWidget(model_combo, 0, 3)
+
+        endpoint_edit = QLineEdit()
+        endpoint_edit.setPlaceholderText("https://.../v1/chat/completions")
+        config_layout.addWidget(QLabel("API地址:"), 1, 0)
+        config_layout.addWidget(endpoint_edit, 1, 1, 1, 3)
+
+        api_key_edit = QLineEdit()
+        api_key_edit.setEchoMode(QLineEdit.Password)
+        api_key_edit.setPlaceholderText("本地接口通常可以留空")
+        config_layout.addWidget(QLabel("API密钥:"), 2, 0)
+        config_layout.addWidget(api_key_edit, 2, 1)
+
+        show_key_check = QCheckBox("显示密钥")
+        show_key_check.toggled.connect(
+            lambda checked, edit=api_key_edit: edit.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+        config_layout.addWidget(show_key_check, 2, 2)
+
+        temperature_spin = QDoubleSpinBox()
+        temperature_spin.setRange(0.0, 2.0)
+        temperature_spin.setSingleStep(0.1)
+        temperature_spin.setValue(0.3)
+        temperature_spin.setDecimals(1)
+        config_layout.addWidget(temperature_spin, 2, 3)
+        temperature_spin.setPrefix("温度 ")
+
+        timeout_spin = QSpinBox()
+        timeout_spin.setRange(10, 300)
+        timeout_spin.setValue(120)
+        timeout_spin.setSuffix(" 秒")
+        config_layout.addWidget(QLabel("超时:"), 3, 0)
+        config_layout.addWidget(timeout_spin, 3, 1)
+
+        connection_status = QLabel("未连接")
+        connection_status.setStyleSheet("color: #7f8c8d;")
+        config_layout.addWidget(connection_status, 3, 2, 1, 2)
+        page_layout.addWidget(config_group)
+
+        content_splitter = QSplitter(Qt.Horizontal)
+
+        chat_group = QGroupBox("对话")
+        chat_layout = QVBoxLayout(chat_group)
+        chat_output = QTextEdit()
+        chat_output.setReadOnly(True)
+        chat_output.setPlaceholderText("模型回复将显示在这里")
+        chat_layout.addWidget(chat_output, stretch=1)
+
+        chat_input = QTextEdit()
+        chat_input.setPlaceholderText("输入问题或操作需求")
+        chat_input.setMaximumHeight(self._sp(100))
+        chat_layout.addWidget(chat_input)
+
+        chat_button_layout = QHBoxLayout()
+        clear_button = QPushButton("清空对话")
+        send_button = QPushButton("发送")
+        send_button.setDefault(True)
+        chat_button_layout.addWidget(clear_button)
+        chat_button_layout.addStretch(1)
+        chat_button_layout.addWidget(send_button)
+        chat_layout.addLayout(chat_button_layout)
+        content_splitter.addWidget(chat_group)
+
+        help_group = QGroupBox("本程序主要功能")
+        help_layout = QVBoxLayout(help_group)
+        help_text = QTextEdit()
+        help_text.setReadOnly(True)
+        help_text.setPlainText(
+            "通用图像处理\n"
+            "加载单张或批量图像，执行裁剪、灰度、亮度对比度、旋转、"
+            "镜像、阈值及图像运算，并保存处理结果。\n\n"
+            "相机标定\n"
+            "加载标定图像，计算相机内参、畸变参数以及多相机空间关系。\n\n"
+            "三维图像重建\n"
+            "完成气泡图像预处理、投影生成、MART层析重建、点云输出及"
+            "单相机射线追踪重建。\n\n"
+            "三维PIV\n"
+            "按相机加载粒子序列，选择双帧，重建三维粒子并计算速度场。\n\n"
+            "二维PIV\n"
+            "对单组或批量双帧图像进行互相关计算、异常矢量处理与结果显示。\n\n"
+            "AI辅助\n"
+            "通过兼容接口咨询参数含义、处理流程、异常信息和操作建议。"
+        )
+        help_layout.addWidget(help_text)
+        content_splitter.addWidget(help_group)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
+        content_splitter.setSizes([self._sp(560), self._sp(360)])
+        page_layout.addWidget(content_splitter, stretch=1)
+
+        controls = {
+            "provider": provider_combo,
+            "model": model_combo,
+            "endpoint": endpoint_edit,
+            "api_key": api_key_edit,
+            "temperature": temperature_spin,
+            "timeout": timeout_spin,
+            "status": connection_status,
+            "output": chat_output,
+            "input": chat_input,
+            "send": send_button,
+            "history": [],
+            "worker": None,
+        }
+        self._ai_page_controls[page_id] = controls
+
+        provider_combo.currentIndexChanged.connect(
+            lambda _index, pid=page_id: self._ai_apply_provider_profile(pid)
+        )
+        send_button.clicked.connect(
+            lambda _checked=False, pid=page_id: self._ai_send_message(pid)
+        )
+        clear_button.clicked.connect(
+            lambda _checked=False, pid=page_id: self._ai_clear_chat(pid)
+        )
+        provider_combo.setCurrentIndex(2 if local_default else 0)
+        self._ai_apply_provider_profile(page_id)
+
+        self.content_stack.addWidget(page)
+
+    def _ai_apply_provider_profile(self, page_id: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls:
+            return
+
+        profiles = {
+            "ChatGPT (OpenAI)": {
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "models": ["gpt-4o-mini", "gpt-4o"],
+            },
+            "DeepSeek": {
+                "endpoint": "https://api.deepseek.com/chat/completions",
+                "models": ["deepseek-chat", "deepseek-reasoner"],
+            },
+            "Ollama（本地）": {
+                "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+                "models": ["deepseek-r1", "qwen3", "llama3.2"],
+            },
+            "LM Studio（本地）": {
+                "endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+                "models": ["local-model"],
+            },
+            "自定义 OpenAI 兼容接口": {
+                "endpoint": "",
+                "models": [],
+            },
+        }
+        profile = profiles.get(controls["provider"].currentText(), profiles[
+            "自定义 OpenAI 兼容接口"
+        ])
+        controls["endpoint"].setText(profile["endpoint"])
+        controls["model"].blockSignals(True)
+        controls["model"].clear()
+        controls["model"].addItems(profile["models"])
+        controls["model"].setEditText(
+            profile["models"][0] if profile["models"] else ""
+        )
+        controls["model"].blockSignals(False)
+        controls["status"].setText("接口配置已更新")
+        controls["status"].setStyleSheet("color: #7f8c8d;")
+
+    @staticmethod
+    def _ai_program_context() -> str:
+        return (
+            "你是三维图像模块软件的操作助手。软件包含通用图像处理、相机标定、"
+            "气泡三维层析重建、单相机射线追踪重建、三维PIV和二维PIV。"
+            "回答应简洁、准确；涉及参数时说明单位和影响；不确定时明确提示用户核实。"
+        )
+
+    @staticmethod
+    def _ai_append_chat(output: QTextEdit, role: str, text: str):
+        safe_text = html.escape(text).replace("\n", "<br>")
+        output.append(f"<b>{html.escape(role)}</b><br>{safe_text}<br>")
+        output.verticalScrollBar().setValue(
+            output.verticalScrollBar().maximum()
+        )
+
+    def _ai_send_message(self, page_id: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls or controls.get("worker") is not None:
+            return
+
+        prompt = controls["input"].toPlainText().strip()
+        endpoint = controls["endpoint"].text().strip()
+        model = controls["model"].currentText().strip()
+        if not prompt:
+            QMessageBox.information(self, "提示", "请输入对话内容")
+            return
+        if not endpoint.startswith(("http://", "https://")):
+            QMessageBox.warning(self, "接口设置", "请输入有效的 HTTP 或 HTTPS API地址")
+            return
+        if not model:
+            QMessageBox.warning(self, "模型设置", "请选择或输入模型名称")
+            return
+
+        self._ai_append_chat(controls["output"], "您", prompt)
+        controls["input"].clear()
+        controls["history"].append({"role": "user", "content": prompt})
+        messages = [
+            {"role": "system", "content": self._ai_program_context()},
+            *controls["history"],
+        ]
+
+        worker = AIChatWorker(
+            endpoint=endpoint,
+            api_key=controls["api_key"].text().strip(),
+            model=model,
+            messages=messages,
+            temperature=controls["temperature"].value(),
+            timeout=controls["timeout"].value(),
+        )
+        controls["worker"] = worker
+        controls["send"].setEnabled(False)
+        controls["send"].setText("发送中...")
+        controls["status"].setText("正在等待模型回复...")
+        controls["status"].setStyleSheet("color: #2980b9;")
+        worker.response_ready.connect(
+            lambda text, pid=page_id: self._ai_on_response(pid, text)
+        )
+        worker.error.connect(
+            lambda message, pid=page_id: self._ai_on_error(pid, message)
+        )
+        worker.finished.connect(
+            lambda pid=page_id: self._ai_on_worker_finished(pid)
+        )
+        worker.start()
+
+    def _ai_on_response(self, page_id: str, text: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls:
+            return
+        controls["history"].append({"role": "assistant", "content": text})
+        self._ai_append_chat(controls["output"], "AI", text)
+        controls["status"].setText("回复完成")
+        controls["status"].setStyleSheet("color: #27ae60;")
+
+    def _ai_on_error(self, page_id: str, message: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls:
+            return
+        self._ai_append_chat(controls["output"], "接口错误", message)
+        controls["status"].setText("请求失败")
+        controls["status"].setStyleSheet("color: #c0392b;")
+
+    def _ai_on_worker_finished(self, page_id: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls:
+            return
+        controls["worker"] = None
+        controls["send"].setEnabled(True)
+        controls["send"].setText("发送")
+
+    def _ai_clear_chat(self, page_id: str):
+        controls = self._ai_page_controls.get(page_id)
+        if not controls:
+            return
+        controls["history"].clear()
+        controls["output"].clear()
+        controls["status"].setText("对话已清空")
+        controls["status"].setStyleSheet("color: #7f8c8d;")
 
     # 注：_on_nav_changed 定义在文件末尾（使用正确的页面索引映射）
 
@@ -2776,7 +3282,7 @@ class BubbleTomographyGUI(QMainWindow):
         nav_to_raytrace.triggered.connect(lambda: self._navigate_to(2))
         window_menu.addAction(nav_to_raytrace)
 
-        nav_to_particle = QAction("Particle / PIV", self)
+        nav_to_particle = QAction("三维PIV", self)
         nav_to_particle.triggered.connect(lambda: self._navigate_to(3))
         window_menu.addAction(nav_to_particle)
 
@@ -2787,6 +3293,16 @@ class BubbleTomographyGUI(QMainWindow):
         nav_to_ie = QAction("图像处理", self)
         nav_to_ie.triggered.connect(lambda: self._navigate_to(5))
         window_menu.addAction(nav_to_ie)
+
+        window_menu.addSeparator()
+
+        nav_to_ai = QAction("AI辅助模型", self)
+        nav_to_ai.triggered.connect(lambda: self._navigate_to(6))
+        window_menu.addAction(nav_to_ai)
+
+        nav_to_local_model = QAction("本地模型", self)
+        nav_to_local_model.triggered.connect(lambda: self._navigate_to(7))
+        window_menu.addAction(nav_to_local_model)
 
         window_menu.addSeparator()
 
@@ -3047,21 +3563,35 @@ class BubbleTomographyGUI(QMainWindow):
         return f"""
             QPushButton {{
                 text-align: left;
-                padding: 8px 14px;
-                border: none;
-                border-radius: 6px;
+                padding: 8px 12px;
+                border: 1px solid {theme['border']};
+                border-radius: 8px;
                 color: {theme['text_secondary']};
                 font-size: 13px;
-                background-color: transparent;
+                background-color: {theme['surface_alt']};
             }}
             QPushButton:hover {{
                 background-color: {theme['hover']};
                 color: {theme['text_main']};
+                border-color: {theme['accent_hover']};
+            }}
+            QPushButton:pressed {{
+                background-color: {theme['pressed']};
+                padding-top: 10px;
+                padding-bottom: 6px;
             }}
             QPushButton:checked {{
                 background-color: {theme['accent']};
                 color: {theme['accent_text']};
+                border-color: {theme['accent_hover']};
                 font-weight: bold;
+            }}
+            QPushButton:checked:hover {{
+                background-color: {theme['accent_hover']};
+            }}
+            QPushButton:checked:pressed {{
+                background-color: {theme['pressed']};
+                color: {theme['text_main']};
             }}
         """
 
@@ -3235,15 +3765,40 @@ class BubbleTomographyGUI(QMainWindow):
             nav_style = self._nav_button_stylesheet(theme)
             for btn in self._nav_buttons.values():
                 btn.setStyleSheet(nav_style)
-        if hasattr(self, "_nav_title_label"):
-            self._nav_title_label.setStyleSheet(
-                f"color: {theme['text_main']}; font-size: 14px; font-weight: bold; "
-                "padding: 8px 0px 16px 0px;"
-            )
+                if isinstance(btn, IOSNavButton):
+                    shadow_alpha = 115 if self.current_theme == "midnight" else 55
+                    btn.set_shadow_color(QColor(0, 0, 0, shadow_alpha))
+        if hasattr(self, "_nav_section_frames"):
+            for frame in self._nav_section_frames:
+                frame.setStyleSheet(f"""
+                    QFrame#navSectionCard {{
+                        background-color: {theme['surface']};
+                        border: 2px solid {theme['border']};
+                        border-radius: 10px;
+                    }}
+                """)
+        if hasattr(self, "_nav_section_labels"):
+            for label in self._nav_section_labels:
+                label.setStyleSheet(
+                    f"color: {theme['text_main']}; font-size: 14px; "
+                    "font-weight: bold; padding: 5px 8px 6px 8px; "
+                    f"border-bottom: 1px solid {theme['border']};"
+                )
         if hasattr(self, "_nav_version_label"):
-            self._nav_version_label.setStyleSheet(
-                f"color: {theme['text_secondary']}; font-size: 11px; padding: 8px;"
-            )
+            self._nav_version_label.setStyleSheet(f"""
+                QLabel#navVersionLabel {{
+                    color: {theme['text_secondary']};
+                    font-size: 11px;
+                    padding: 8px;
+                    border: 1px solid transparent;
+                    border-radius: 7px;
+                }}
+                QLabel#navVersionLabel:hover {{
+                    color: {theme['text_main']};
+                    background-color: {theme['hover']};
+                    border-color: {theme['accent_hover']};
+                }}
+            """)
         if hasattr(self, "_preview_toggle_btn"):
             self._preview_toggle_btn.setStyleSheet(
                 self._scale_stylesheet(self._preview_toggle_stylesheet(theme))
@@ -3599,11 +4154,86 @@ class BubbleTomographyGUI(QMainWindow):
         """显示关于对话框。"""
         QMessageBox.about(
             self, "关于",
-            "三维多相流场测量软件 v1.0\n\n"
+            "三维图像模块 v2.0.20260627\n\n"
             "功能：相机标定 -> 气泡图像预处理 -> MART层析重建\n"
             "     -> 3D点云输出 -> 示踪粒子重建 -> 互相关速度场\n\n"
             "作者: OpenAI Codex"
         )
+
+    def _create_version_info_dialog(self) -> QDialog:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("版本与开源许可")
+        dialog.setMinimumSize(self._sp(680), self._sp(540))
+        dialog.resize(self._sp(760), self._sp(620))
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(
+            self._sp(18), self._sp(18), self._sp(18), self._sp(14)
+        )
+        layout.setSpacing(self._sp(10))
+
+        title = QLabel("三维图像模块")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 22px; font-weight: bold;")
+        layout.addWidget(title)
+
+        info = QTextEdit()
+        info.setReadOnly(True)
+        info.setHtml("""
+            <h3>版本信息</h3>
+            <table cellspacing="4">
+              <tr><td><b>软件版本</b></td><td>v2.0.20260627</td></tr>
+              <tr><td><b>适用系统</b></td><td>Windows 10 / Windows 11，64位</td></tr>
+              <tr><td><b>源码环境</b></td><td>建议 Python 3.10-3.13；当前开发环境 Python 3.13</td></tr>
+              <tr><td><b>编程语言</b></td><td>Python 3，PyQt5 图形界面；数值计算组件包含 C/C++ 加速实现</td></tr>
+              <tr><td><b>发布形式</b></td><td>Windows x64 便携式 EXE，也可从 Python 源码运行</td></tr>
+              <tr><td><b>本程序许可</b></td><td>MIT License（项目 README 声明）</td></tr>
+            </table>
+
+            <h3>主要开源软件版权与许可证</h3>
+            <p><b>Python</b><br>
+            Copyright Python Software Foundation，PSF License。</p>
+
+            <p><b>PyQt5 / Qt 5</b><br>
+            PyQt5 Copyright Riverbank Computing Limited，GPL v3 / 商业许可；
+            Qt Copyright The Qt Company 及贡献者，适用其开源或商业许可条款。</p>
+
+            <p><b>NumPy</b><br>
+            Copyright NumPy Developers，BSD 3-Clause License。</p>
+
+            <p><b>OpenCV / opencv-contrib-python</b><br>
+            Copyright OpenCV Team 及贡献者，Apache License 2.0；
+            随附的第三方组件分别适用其原始许可证。</p>
+
+            <p><b>SciPy</b><br>
+            Copyright SciPy Developers，BSD 3-Clause License。</p>
+
+            <p><b>Matplotlib</b><br>
+            Copyright Matplotlib Development Team 及 John D. Hunter，
+            Matplotlib License（PSF 兼容许可）。</p>
+
+            <p><b>scikit-image</b><br>
+            Copyright scikit-image team 及各文件贡献者，主要采用 BSD 3-Clause License。</p>
+
+            <p><b>tqdm</b><br>
+            Copyright tqdm contributors，MPL 2.0 / MIT License。</p>
+
+            <p><b>PyInstaller</b><br>
+            Copyright PyInstaller Development Team，GPL 2.0-or-later，
+            附带用于分发所生成程序的特殊例外条款。</p>
+
+            <p>上述软件及名称的版权、商标和许可证均归各自权利人所有。
+            完整许可文本及第三方声明随发布包相关组件目录提供。</p>
+        """)
+        layout.addWidget(info, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        return dialog
+
+    def _show_version_info(self):
+        self._create_version_info_dialog().exec_()
 
     def _create_calibration_page(self):
         """创建标定页：左侧参数 + 右侧预览。"""
@@ -4297,16 +4927,34 @@ class BubbleTomographyGUI(QMainWindow):
         # 左侧参数
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
+        left_layout.setSpacing(self._sp(8))
+        left_panel.setMinimumWidth(self._sp(440))
+        left_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
         # 粒子图像加载（批量模式）
         img_group = QGroupBox("示踪粒子图像（按相机批量加载）")
+        img_group.setObjectName("particleSequenceGroup")
+        img_group.setStyleSheet("""
+            QGroupBox#particleSequenceGroup {
+                font-size: 14px;
+                font-weight: bold;
+            }
+        """)
         img_layout = QVBoxLayout()
+        img_layout.setSpacing(self._sp(10))
 
         cam_count_layout = QGridLayout()
-        cam_count_layout.addWidget(QLabel("相机数目:"), 0, 0)
+        camera_count_label = QLabel("相机数目:")
+        camera_count_label.setStyleSheet("font-size: 12px; font-weight: normal;")
+        cam_count_layout.addWidget(camera_count_label, 0, 0)
         self.particle_camera_count_spin = QSpinBox()
         self.particle_camera_count_spin.setRange(1, 16)
         self.particle_camera_count_spin.setValue(2)
+        self.particle_camera_count_spin.setMinimumHeight(self._sp(32))
+        self.particle_camera_count_spin.setStyleSheet(
+            "font-size: 12px; font-weight: normal;"
+        )
         self.particle_camera_count_spin.valueChanged.connect(
             self._on_particle_camera_count_changed
         )
@@ -4314,8 +4962,9 @@ class BubbleTomographyGUI(QMainWindow):
         img_layout.addLayout(cam_count_layout)
 
         btn_load_particles_batch = QPushButton("加载各相机粒子图像序列...")
+        btn_load_particles_batch.setMinimumHeight(self._sp(36))
         btn_load_particles_batch.setStyleSheet(
-            "QPushButton { font-weight: bold; padding: 6px; }"
+            "QPushButton { font-size: 12px; font-weight: bold; padding: 7px; }"
         )
         btn_load_particles_batch.clicked.connect(self._load_particle_images_batch)
         img_layout.addWidget(btn_load_particles_batch)
@@ -4324,7 +4973,9 @@ class BubbleTomographyGUI(QMainWindow):
             "每个相机选择一组按时间排序的粒子图像。\n"
             "系统会按时间顺序对齐各相机序列，并可分别指定第1帧和第2帧。"
         )
-        self.particle_batch_info.setStyleSheet("color: gray; font-size: 11px;")
+        self.particle_batch_info.setStyleSheet(
+            "color: gray; font-size: 12px; font-weight: normal;"
+        )
         self.particle_batch_info.setWordWrap(True)
         img_layout.addWidget(self.particle_batch_info)
 
@@ -4334,20 +4985,33 @@ class BubbleTomographyGUI(QMainWindow):
         )
         self.particle_camera_loader_layout.setContentsMargins(0, 0, 0, 0)
         self.particle_camera_loader_layout.setSpacing(self._sp(6))
-        self.particle_camera_loader_toolbox = QToolBox()
-        self.particle_camera_loader_toolbox.setStyleSheet(
-            "QToolBox::tab { padding: 6px 10px; font-weight: bold; }"
+        self.particle_camera_loader_container.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Minimum
         )
-        self.particle_camera_loader_layout.addWidget(
-            self.particle_camera_loader_toolbox
+        self.particle_camera_loader_scroll = QScrollArea()
+        self.particle_camera_loader_scroll.setWidgetResizable(True)
+        self.particle_camera_loader_scroll.setFrameShape(QFrame.NoFrame)
+        self.particle_camera_loader_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.particle_camera_loader_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.particle_camera_loader_scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 12px; }
+        """)
+        self.particle_camera_loader_scroll.verticalScrollBar().setSingleStep(
+            self._sp(42)
         )
-        img_layout.addWidget(self.particle_camera_loader_container)
+        self.particle_camera_loader_scroll.setWidget(
+            self.particle_camera_loader_container
+        )
+        img_layout.addWidget(self.particle_camera_loader_scroll)
 
         frame_select_group = QGroupBox("第1帧 / 第2帧设置")
         frame_select_layout = QGridLayout(frame_select_group)
         frame_select_layout.addWidget(QLabel("第1帧:"), 0, 0)
         self.piv_frame1_combo = QComboBox()
         self.piv_frame1_combo.setEnabled(False)
+        self.piv_frame1_combo.setMinimumWidth(self._sp(180))
+        self.piv_frame1_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.piv_frame1_combo.currentIndexChanged.connect(
             lambda idx: self._on_particle_frame_combo_changed(1, idx)
         )
@@ -4355,6 +5019,8 @@ class BubbleTomographyGUI(QMainWindow):
         frame_select_layout.addWidget(QLabel("第2帧:"), 1, 0)
         self.piv_frame2_combo = QComboBox()
         self.piv_frame2_combo.setEnabled(False)
+        self.piv_frame2_combo.setMinimumWidth(self._sp(180))
+        self.piv_frame2_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.piv_frame2_combo.currentIndexChanged.connect(
             lambda idx: self._on_particle_frame_combo_changed(2, idx)
         )
@@ -4501,8 +5167,10 @@ class BubbleTomographyGUI(QMainWindow):
 
         self.particle_camera_preview_scroll = QScrollArea()
         self.particle_camera_preview_scroll.setWidgetResizable(True)
+        self.particle_camera_preview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.particle_camera_preview_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.particle_camera_preview_content = QWidget()
-        self.particle_camera_preview_layout = QGridLayout(
+        self.particle_camera_preview_layout = QVBoxLayout(
             self.particle_camera_preview_content
         )
         self.particle_camera_preview_layout.setContentsMargins(
@@ -4586,7 +5254,20 @@ class BubbleTomographyGUI(QMainWindow):
         piv_timepoint_group.setLayout(piv_tp_layout)
         right_container_layout.addWidget(piv_timepoint_group)
 
-        layout.addWidget(left_panel, stretch=1)
+        self.particle_parameter_scroll = QScrollArea()
+        self.particle_parameter_scroll.setWidgetResizable(True)
+        self.particle_parameter_scroll.setFrameShape(QFrame.NoFrame)
+        self.particle_parameter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.particle_parameter_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.particle_parameter_scroll.setMinimumWidth(self._sp(460))
+        self.particle_parameter_scroll.setStyleSheet(
+            "QScrollBar:vertical { width: 12px; }"
+        )
+        self.particle_parameter_scroll.verticalScrollBar().setSingleStep(
+            self._sp(48)
+        )
+        self.particle_parameter_scroll.setWidget(left_panel)
+        layout.addWidget(self.particle_parameter_scroll, stretch=1)
         layout.addWidget(right_container, stretch=2)
 
         self.content_stack.addWidget(page)
@@ -4597,6 +5278,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.particles_3d_frame1 = []
         self.particles_3d_frame2 = []
         self._velocity_result = None
+        self._particle_preview_camera_id: str = ""
+        self._particle_preview_frame_num: int = 1
         self._particle_sequence_info_labels: Dict[str, QLabel] = {}
         self._particle_frame_preview_labels: Dict[int, Dict[str, QLabel]] = {
             1: {},
@@ -4635,18 +5318,38 @@ class BubbleTomographyGUI(QMainWindow):
         self._rebuild_particle_timepoints_from_sequences(update_log=False)
 
     def _build_particle_camera_loader_widgets(self):
-        while self.particle_camera_loader_toolbox.count():
-            widget = self.particle_camera_loader_toolbox.widget(0)
-            self.particle_camera_loader_toolbox.removeItem(0)
-            if widget is not None:
-                widget.deleteLater()
+        self._clear_layout_widgets(self.particle_camera_loader_layout)
         self._particle_sequence_info_labels = {}
 
         for cam_id in self.particle_active_camera_ids:
-            panel = QWidget()
+            panel = QGroupBox(f"{cam_id} 图像序列")
+            panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            panel.setMinimumHeight(self._sp(112))
+            panel.setStyleSheet("""
+                QGroupBox {
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+                QLabel {
+                    font-size: 12px;
+                    font-weight: normal;
+                }
+                QPushButton {
+                    font-size: 12px;
+                    font-weight: normal;
+                }
+            """)
             group_layout = QGridLayout(panel)
+            group_layout.setContentsMargins(
+                self._sp(10), self._sp(16), self._sp(10), self._sp(10)
+            )
+            group_layout.setHorizontalSpacing(self._sp(10))
+            group_layout.setVerticalSpacing(self._sp(8))
+            group_layout.setColumnStretch(1, 1)
 
             btn = QPushButton("批量加载该相机序列...")
+            btn.setMinimumWidth(self._sp(156))
+            btn.setMinimumHeight(self._sp(34))
             btn.clicked.connect(
                 lambda _checked=False, cid=cam_id: self._load_particle_sequence_for_camera(cid)
             )
@@ -4660,14 +5363,46 @@ class BubbleTomographyGUI(QMainWindow):
 
             hint = QLabel("展开当前相机后选择按时间顺序排列的图像序列。")
             hint.setWordWrap(True)
-            hint.setStyleSheet("color: #666; font-size: 11px;")
+            hint.setStyleSheet(
+                "color: #666; font-size: 12px; font-weight: normal;"
+            )
             group_layout.addWidget(hint, 1, 0, 1, 2)
 
-            self.particle_camera_loader_toolbox.addItem(panel, f"{cam_id} 图像序列")
+            self.particle_camera_loader_layout.addWidget(panel)
 
-        if self.particle_camera_loader_toolbox.count() > 0:
-            self.particle_camera_loader_toolbox.setCurrentIndex(0)
+        self.particle_camera_loader_layout.addStretch(1)
         self._refresh_particle_sequence_info_labels()
+        self._update_particle_loader_scroll_height()
+
+    def _update_particle_loader_scroll_height(self):
+        if not hasattr(self, "particle_camera_loader_scroll"):
+            return
+        panels = []
+        for index in range(self.particle_camera_loader_layout.count()):
+            widget = self.particle_camera_loader_layout.itemAt(index).widget()
+            if isinstance(widget, QGroupBox):
+                panels.append(widget)
+
+        if not panels:
+            return
+
+        spacing = self.particle_camera_loader_layout.spacing()
+        panel_heights = [
+            max(panel.minimumHeight(), panel.sizeHint().height())
+            for panel in panels
+        ]
+        content_height = (
+            sum(panel_heights)
+            + max(0, len(panel_heights) - 1) * spacing
+        )
+        visible_heights = panel_heights[:4]
+        desired = (
+            sum(visible_heights)
+            + max(0, len(visible_heights) - 1) * spacing
+        )
+        self.particle_camera_loader_container.setMinimumHeight(content_height)
+        self.particle_camera_loader_scroll.setMinimumHeight(desired)
+        self.particle_camera_loader_scroll.setMaximumHeight(desired)
 
     def _build_particle_camera_preview_widgets(self):
         self._clear_layout_widgets(self.particle_camera_preview_layout)
@@ -4680,25 +5415,76 @@ class BubbleTomographyGUI(QMainWindow):
             self.particle_camera_preview_layout.addWidget(empty_label, 0, 0)
             return
 
-        for col, cam_id in enumerate(self.particle_active_camera_ids):
-            title = QLabel(cam_id)
-            title.setAlignment(Qt.AlignCenter)
-            title.setStyleSheet("font-weight: bold; color: #E65100;")
-            self.particle_camera_preview_layout.addWidget(title, 0, col)
+        if self._particle_preview_camera_id not in self.particle_active_camera_ids:
+            self._particle_preview_camera_id = self.particle_active_camera_ids[0]
 
-            f1_label = QLabel("第1帧")
-            f1_label.setAlignment(Qt.AlignCenter)
-            f1_label.setMinimumSize(self._sp(180), self._sp(130))
-            f1_label.setStyleSheet("border: 1px solid #ccc; background: #f8f8f8;")
-            self.particle_camera_preview_layout.addWidget(f1_label, 1, col)
-            self._particle_frame_preview_labels[1][cam_id] = f1_label
+        self.particle_camera_preview_content.setMinimumWidth(self._sp(360))
 
-            f2_label = QLabel("第2帧")
-            f2_label.setAlignment(Qt.AlignCenter)
-            f2_label.setMinimumSize(self._sp(180), self._sp(130))
-            f2_label.setStyleSheet("border: 1px solid #ccc; background: #f8f8f8;")
-            self.particle_camera_preview_layout.addWidget(f2_label, 2, col)
-            self._particle_frame_preview_labels[2][cam_id] = f2_label
+        self.particle_single_preview_title = QLabel()
+        self.particle_single_preview_title.setAlignment(Qt.AlignCenter)
+        self.particle_single_preview_title.setStyleSheet(
+            "font-weight: bold; color: #E65100; font-size: 14px;"
+        )
+        self.particle_camera_preview_layout.addWidget(self.particle_single_preview_title)
+
+        self.particle_single_preview_label = QLabel("未加载")
+        self.particle_single_preview_label.setAlignment(Qt.AlignCenter)
+        self.particle_single_preview_label.setMinimumSize(self._sp(420), self._sp(300))
+        self.particle_single_preview_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        self.particle_single_preview_label.setStyleSheet(
+            "border: 1px solid #ccc; background: #f8f8f8; color: #666;"
+        )
+        self.particle_camera_preview_layout.addWidget(
+            self.particle_single_preview_label, stretch=1
+        )
+
+        frame_switch = QWidget()
+        frame_switch_layout = QHBoxLayout(frame_switch)
+        frame_switch_layout.setContentsMargins(0, self._sp(4), 0, self._sp(2))
+        frame_switch_layout.addStretch()
+        self.particle_preview_frame_group = QButtonGroup(self)
+        self.particle_preview_frame_group.setExclusive(True)
+        for frame_num, label in [(1, "第1帧"), (2, "第2帧")]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(self._sp(88))
+            btn.setChecked(frame_num == self._particle_preview_frame_num)
+            btn.clicked.connect(
+                lambda _checked=False, n=frame_num: self._set_particle_preview_frame(n)
+            )
+            self.particle_preview_frame_group.addButton(btn, frame_num)
+            frame_switch_layout.addWidget(btn)
+        frame_switch_layout.addStretch()
+        self.particle_camera_preview_layout.addWidget(frame_switch)
+
+        camera_switch_scroll = QScrollArea()
+        camera_switch_scroll.setWidgetResizable(True)
+        camera_switch_scroll.setFrameShape(QFrame.NoFrame)
+        camera_switch_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        camera_switch_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        camera_switch_scroll.setFixedHeight(self._sp(48))
+        camera_switch_content = QWidget()
+        camera_switch_layout = QHBoxLayout(camera_switch_content)
+        camera_switch_layout.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
+        camera_switch_layout.setSpacing(self._sp(6))
+        self.particle_preview_camera_group = QButtonGroup(self)
+        self.particle_preview_camera_group.setExclusive(True)
+        for cam_id in self.particle_active_camera_ids:
+            btn = QPushButton(cam_id)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(self._sp(72))
+            btn.setChecked(cam_id == self._particle_preview_camera_id)
+            btn.clicked.connect(
+                lambda _checked=False, cid=cam_id: self._set_particle_preview_camera(cid)
+            )
+            self.particle_preview_camera_group.addButton(btn)
+            camera_switch_layout.addWidget(btn)
+        camera_switch_layout.addStretch()
+        camera_switch_scroll.setWidget(camera_switch_content)
+        self.particle_camera_preview_layout.addWidget(camera_switch_scroll)
+        self._refresh_particle_camera_previews()
 
     def _refresh_particle_sequence_info_labels(self):
         for cam_id, label in self._particle_sequence_info_labels.items():
@@ -4843,28 +5629,58 @@ class BubbleTomographyGUI(QMainWindow):
             f"第2帧 = {_name(self.piv_frame2_combo)}"
         )
 
+    def _set_particle_preview_frame(self, frame_num: int):
+        self._particle_preview_frame_num = 1 if frame_num == 1 else 2
+        self._refresh_particle_camera_previews()
+
+    def _set_particle_preview_camera(self, cam_id: str):
+        if cam_id not in self.particle_active_camera_ids:
+            return
+        self._particle_preview_camera_id = cam_id
+        self._refresh_particle_camera_previews()
+
     def _refresh_particle_camera_previews(self):
-        for frame_num, frame_dict in [
-            (1, self.particle_images_frame1),
-            (2, self.particle_images_frame2),
-        ]:
-            for cam_id, label in self._particle_frame_preview_labels.get(frame_num, {}).items():
-                img = frame_dict.get(cam_id)
-                if img is None:
-                    label.setText(f"第{frame_num}帧\n{cam_id}\n未加载")
-                    label.setPixmap(QPixmap())
-                    continue
-                pixmap = self._ie_ndarray_to_pixmap(img)
-                if pixmap:
-                    label.setPixmap(
-                        pixmap.scaled(
-                            label.size(),
-                            Qt.KeepAspectRatio,
-                            Qt.SmoothTransformation
-                        )
-                    )
-                else:
-                    label.setText(f"第{frame_num}帧\n{cam_id}\n预览失败")
+        if not hasattr(self, "particle_single_preview_label"):
+            return
+        cam_id = self._particle_preview_camera_id
+        if cam_id not in self.particle_active_camera_ids and self.particle_active_camera_ids:
+            cam_id = self.particle_active_camera_ids[0]
+            self._particle_preview_camera_id = cam_id
+
+        frame_num = self._particle_preview_frame_num
+        frame_dict = self.particle_images_frame1 if frame_num == 1 else self.particle_images_frame2
+        img = frame_dict.get(cam_id)
+
+        if hasattr(self, "particle_single_preview_title"):
+            self.particle_single_preview_title.setText(f"{cam_id} | 第{frame_num}帧")
+
+        if hasattr(self, "particle_preview_frame_group"):
+            btn = self.particle_preview_frame_group.button(frame_num)
+            if btn is not None:
+                btn.setChecked(True)
+
+        if hasattr(self, "particle_preview_camera_group"):
+            for btn in self.particle_preview_camera_group.buttons():
+                btn.setChecked(btn.text() == cam_id)
+
+        if img is None:
+            self.particle_single_preview_label.setPixmap(QPixmap())
+            self.particle_single_preview_label.setText(f"{cam_id}\n第{frame_num}帧未加载")
+            return
+
+        pixmap = self._ie_ndarray_to_pixmap(img)
+        if pixmap:
+            self.particle_single_preview_label.setText("")
+            self.particle_single_preview_label.setPixmap(
+                pixmap.scaled(
+                    self.particle_single_preview_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+            )
+        else:
+            self.particle_single_preview_label.setPixmap(QPixmap())
+            self.particle_single_preview_label.setText(f"{cam_id}\n第{frame_num}帧预览失败")
 
     # ---- 标定模式切换 ----
 
@@ -10258,6 +11074,8 @@ class BubbleTomographyGUI(QMainWindow):
             "raytrace": 3,
             "particle": 4,
             "piv2d": 5,
+            "ai_assistant": 6,
+            "local_model": 7,
         }
         for page_id, nav_btn in self._nav_buttons.items():
             if btn is nav_btn:
@@ -10283,6 +11101,8 @@ class BubbleTomographyGUI(QMainWindow):
             "raytrace",
             "particle",
             "piv2d",
+            "ai_assistant",
+            "local_model",
         ]
         if current_idx < len(nav_keys):
             self._nav_buttons[nav_keys[current_idx]].setChecked(True)
