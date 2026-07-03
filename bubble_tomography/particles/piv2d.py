@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from scipy.signal import correlate2d
+from utils.image_editor import robust_imwrite
 
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -656,7 +657,8 @@ class PIV2DCalculator:
             data_path = dst_path / f"{stem}_field.npz"
             txt_path = dst_path / f"{stem}_summary.txt"
 
-            cv2.imwrite(str(overlay_path), overlay)
+            if not robust_imwrite(str(overlay_path), overlay):
+                continue
             np.savez_compressed(
                 data_path,
                 x=result["x"],

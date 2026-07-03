@@ -56,8 +56,10 @@ from utils.image_editor import (
     CropParams, GrayParams, BrightnessContrastParams,
     MirrorParams, RotateParams, BitDepthParams, GrayMathParams,
     ArithmeticParams, ThresholdParams,
-    robust_imread,
+    robust_imread, robust_imwrite,
 )
+from utils.bub_analysis import BubAnalysisParams
+from ptv import PTVConfig, PTVTracker, PTVVelocityCalculator
 from utils.cpu_parallel import default_worker_count, limited_opencv_threads
 
 
@@ -489,6 +491,413 @@ class BatchPIV2DWorker(QThread):
             self.error.emit(str(e))
 
 
+def save_figure_1080p(parent, figure: Figure, default_name: str = "image"):
+    """Save the current scientific view at an exact 1920 x 1080 raster size."""
+    safe_name = re.sub(r'[<>:"/\\|?*]+', "_", default_name).strip(" ._") or "image"
+    pictures_dir = Path.home() / "Pictures"
+    output_dir = pictures_dir if pictures_dir.is_dir() else Path.home()
+    default_path = str(output_dir / f"{safe_name}_1920x1080.png")
+    file_path, selected_filter = QFileDialog.getSaveFileName(
+        parent,
+        "保存当前图片（1080p）",
+        default_path,
+        "PNG图片 (*.png);;JPEG图片 (*.jpg *.jpeg);;TIFF图片 (*.tif *.tiff)",
+    )
+    if not file_path:
+        return
+
+    suffix = Path(file_path).suffix.lower()
+    if not suffix:
+        if "JPEG" in selected_filter:
+            file_path += ".jpg"
+        elif "TIFF" in selected_filter:
+            file_path += ".tif"
+        else:
+            file_path += ".png"
+
+    old_size = figure.get_size_inches().copy()
+    try:
+        figure.set_size_inches(19.2, 10.8, forward=False)
+        figure.savefig(
+            file_path,
+            dpi=100,
+            bbox_inches=None,
+            facecolor=figure.get_facecolor(),
+        )
+        QMessageBox.information(
+            parent,
+            "保存完成",
+            f"图片已保存为 1920×1080：\n{file_path}",
+        )
+    except Exception as exc:
+        QMessageBox.critical(parent, "保存失败", str(exc))
+    finally:
+        figure.set_size_inches(old_size[0], old_size[1], forward=False)
+        canvas = getattr(figure, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
+
+
+def apply_scientific_figure_theme(figure: Figure, canvas, theme: Dict[str, str]):
+    """Apply the active application palette to Matplotlib image canvases."""
+    figure.set_facecolor(theme["background"])
+    canvas.setStyleSheet(f"background-color: {theme['background']};")
+    for axes in figure.axes:
+        axes.set_facecolor(theme["surface"])
+        axes.tick_params(colors=theme["text_secondary"])
+        axes.xaxis.label.set_color(theme["text_main"])
+        axes.yaxis.label.set_color(theme["text_main"])
+        axes.title.set_color(theme["text_main"])
+        for spine in axes.spines.values():
+            spine.set_color(theme["border"])
+        for text in axes.texts:
+            if text.get_color() in ("black", "k"):
+                text.set_color(theme["text_main"])
+    canvas.draw_idle()
+
+
+class ScientificImageViewer(QWidget):
+    """Scientific image viewer with axes, colorbar, zoom, pan, ruler, and ROI zoom."""
+
+    def __init__(self, placeholder: str = "预览区域", parent=None):
+        super().__init__(parent)
+        self.setObjectName("scientificImageViewer")
+        self._image = None
+        self._pixmap = QPixmap()
+        self._placeholder = placeholder
+        self._title = ""
+        self._show_axes = True
+        self._show_colorbar = True
+        self._color_mode = "原图"
+        self._magnifier_enabled = False
+        self._ruler_enabled = False
+        self._drag_start = None
+        self._drag_patch = None
+        self._pan_limits = None
+        self._ruler_points = []
+        self._plot_theme = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.figure = Figure(figsize=(4, 3))
+        self.figure.subplots_adjust(left=0.15, right=0.88, bottom=0.16, top=0.90)
+        self.canvas = FigureCanvas(self.figure)
+        self.axes = self.figure.add_subplot(111)
+        self.canvas.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.canvas.customContextMenuRequested.connect(self._show_context_menu)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
+        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        layout.addWidget(self.canvas, stretch=1)
+
+        self.info_label = QLabel("x=--  y=--  灰度值=--")
+        self.info_label.setStyleSheet(
+            "font-family: Consolas; font-size: 11px; padding: 2px 6px;"
+        )
+        layout.addWidget(self.info_label)
+        self.setText(placeholder)
+
+    def setAlignment(self, _alignment):
+        pass
+
+    def setPixmap(self, pixmap: QPixmap):
+        self._pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        if self._pixmap.isNull():
+            self._image = None
+            self._render_placeholder(self._placeholder)
+            return
+        qimage = self._pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
+        ptr = qimage.bits()
+        ptr.setsize(qimage.byteCount())
+        rgba = np.frombuffer(ptr, np.uint8).reshape(
+            qimage.height(), qimage.width(), 4
+        ).copy()
+        self._image = rgba[:, :, :3]
+        self._render(reset_view=True)
+
+    def pixmap(self):
+        return self._pixmap
+
+    def set_image_array(self, image: np.ndarray, title: str = "", bgr: bool = True):
+        if image is None:
+            self.setText(self._placeholder)
+            return
+        array = np.asarray(image)
+        if array.ndim == 3 and array.shape[2] >= 3 and bgr:
+            array = cv2.cvtColor(array[:, :, :3], cv2.COLOR_BGR2RGB)
+        else:
+            array = array.copy()
+        self._image = array
+        self._pixmap = QPixmap()
+        self._title = title
+        self._render(reset_view=True)
+
+    def setText(self, text: str):
+        self._placeholder = text or self._placeholder
+        self._image = None
+        self._pixmap = QPixmap()
+        self.info_label.setText("x=--  y=--  灰度值=--")
+        self._render_placeholder(text)
+
+    def text(self):
+        return self._placeholder if self._image is None else ""
+
+    def clear(self):
+        self.setText(self._placeholder)
+
+    def _gray_image(self):
+        if self._image is None:
+            return None
+        if self._image.ndim == 2:
+            return self._image
+        rgb = self._image[:, :, :3].astype(np.float32)
+        return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+
+    def _render(self, reset_view: bool = False):
+        if self._image is None:
+            self._render_placeholder(self._placeholder)
+            return
+
+        old_limits = None
+        if not reset_view and self.axes.has_data():
+            old_limits = (self.axes.get_xlim(), self.axes.get_ylim())
+
+        self.figure.clear()
+        self.axes = self.figure.add_subplot(111)
+        gray = self._gray_image()
+        if self._color_mode == "原图" and self._image.ndim == 3:
+            artist = self.axes.imshow(self._image, origin="upper")
+            from matplotlib.cm import ScalarMappable
+            from matplotlib.colors import Normalize
+            vmin = float(np.nanmin(gray))
+            vmax = float(np.nanmax(gray))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            mappable = ScalarMappable(
+                norm=Normalize(vmin, vmax),
+                cmap="gray",
+            )
+            mappable.set_array(gray)
+        else:
+            cmap = "gray" if self._color_mode in ("原图", "灰度") else self._color_mode
+            artist = self.axes.imshow(gray, cmap=cmap, origin="upper")
+            mappable = artist
+
+        if self._title:
+            self.axes.set_title(self._title, fontsize=10)
+        if self._show_axes:
+            self.axes.set_xlabel("X (px)")
+            self.axes.set_ylabel("Y (px)")
+        else:
+            self.axes.set_axis_off()
+        if self._show_colorbar:
+            colorbar = self.figure.colorbar(
+                mappable, ax=self.axes, fraction=0.046, pad=0.04
+            )
+            colorbar.set_label("Gray value")
+
+        self._draw_ruler()
+        if old_limits is not None:
+            self.axes.set_xlim(old_limits[0])
+            self.axes.set_ylim(old_limits[1])
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
+        self.canvas.draw_idle()
+
+    def _render_placeholder(self, text: str):
+        self.figure.clear()
+        self.axes = self.figure.add_subplot(111)
+        self.axes.text(0.5, 0.5, text or "", ha="center", va="center")
+        self.axes.set_axis_off()
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
+        self.canvas.draw_idle()
+
+    def apply_theme(self, theme: Dict[str, str]):
+        self._plot_theme = dict(theme)
+        self.setStyleSheet(
+            f"QWidget#scientificImageViewer {{ "
+            f"background-color: {theme['background']}; "
+            f"color: {theme['text_secondary']}; "
+            f"border: 1px solid {theme['border']}; }}"
+        )
+        self.info_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; "
+            f"background: {theme['surface']}; "
+            "font-family: Consolas; font-size: 11px; padding: 2px 6px;"
+        )
+        apply_scientific_figure_theme(self.figure, self.canvas, theme)
+
+    def _reset_view(self):
+        if self._image is None:
+            return
+        self._drag_start = None
+        self._pan_limits = None
+        self._remove_drag_patch()
+        self._render(reset_view=True)
+
+    def _on_scroll(self, event):
+        if self._image is None or event.inaxes is not self.axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        scale = 0.8 if event.button == "up" else 1.25
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        x = float(event.xdata)
+        y = float(event.ydata)
+        self.axes.set_xlim(x + (xlim[0] - x) * scale, x + (xlim[1] - x) * scale)
+        self.axes.set_ylim(y + (ylim[0] - y) * scale, y + (ylim[1] - y) * scale)
+        self.canvas.draw_idle()
+
+    def _on_mouse_press(self, event):
+        if self._image is None or event.inaxes is not self.axes:
+            return
+        if event.button != 1 or event.xdata is None or event.ydata is None:
+            return
+        self._drag_start = (float(event.xdata), float(event.ydata))
+        if not self._magnifier_enabled and not self._ruler_enabled:
+            self._pan_limits = (self.axes.get_xlim(), self.axes.get_ylim())
+
+    def _on_mouse_move(self, event):
+        if self._image is None or event.inaxes is not self.axes:
+            self.info_label.setText("x=--  y=--  灰度值=--")
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        x = int(round(event.xdata))
+        y = int(round(event.ydata))
+        gray = self._gray_image()
+        h, w = gray.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            self.info_label.setText(f"x={x}  y={y}  灰度值={float(gray[y, x]):.3f}")
+
+        if self._drag_start is None:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        if self._magnifier_enabled:
+            from matplotlib.patches import Rectangle
+            self._remove_drag_patch()
+            self._drag_patch = Rectangle(
+                (min(x0, x1), min(y0, y1)),
+                abs(x1 - x0), abs(y1 - y0),
+                fill=False, edgecolor="#0A84FF", linewidth=1.5,
+            )
+            self.axes.add_patch(self._drag_patch)
+        elif self._ruler_enabled:
+            self._ruler_points = [(x0, y0), (x1, y1)]
+            self._render(reset_view=False)
+        elif self._pan_limits is not None:
+            xlim, ylim = self._pan_limits
+            self.axes.set_xlim(xlim[0] + x0 - x1, xlim[1] + x0 - x1)
+            self.axes.set_ylim(ylim[0] + y0 - y1, ylim[1] + y0 - y1)
+        self.canvas.draw_idle()
+
+    def _on_mouse_release(self, event):
+        if self._drag_start is None:
+            return
+        start = self._drag_start
+        self._drag_start = None
+        self._pan_limits = None
+        if (
+            self._magnifier_enabled
+            and event.inaxes is self.axes
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            x0, y0 = start
+            x1, y1 = float(event.xdata), float(event.ydata)
+            if abs(x1 - x0) > 1 and abs(y1 - y0) > 1:
+                self.axes.set_xlim(min(x0, x1), max(x0, x1))
+                self.axes.set_ylim(max(y0, y1), min(y0, y1))
+        self._remove_drag_patch()
+        self.canvas.draw_idle()
+
+    def _draw_ruler(self):
+        if len(self._ruler_points) != 2:
+            return
+        (x0, y0), (x1, y1) = self._ruler_points
+        distance = float(np.hypot(x1 - x0, y1 - y0))
+        self.axes.plot([x0, x1], [y0, y1], color="#FF453A", linewidth=1.8)
+        self.axes.text(
+            (x0 + x1) / 2.0, (y0 + y1) / 2.0,
+            f"{distance:.2f} px", color="#FF453A",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+
+    def _remove_drag_patch(self):
+        if self._drag_patch is not None:
+            try:
+                self._drag_patch.remove()
+            except ValueError:
+                pass
+            self._drag_patch = None
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        magnifier = menu.addAction("放大镜框")
+        magnifier.setCheckable(True)
+        magnifier.setChecked(self._magnifier_enabled)
+        reset = menu.addAction("恢复原尺寸")
+        save_action = menu.addAction("保存图片（1080p）...")
+        save_action.setEnabled(self._image is not None)
+        ruler = menu.addAction("标尺")
+        ruler.setCheckable(True)
+        ruler.setChecked(self._ruler_enabled)
+        axes = menu.addAction("横纵坐标显示")
+        axes.setCheckable(True)
+        axes.setChecked(self._show_axes)
+        colorbar = menu.addAction("Colorbar显示")
+        colorbar.setCheckable(True)
+        colorbar.setChecked(self._show_colorbar)
+        color_menu = menu.addMenu("颜色选择")
+        color_actions = {}
+        for text, mode in [
+            ("原图", "原图"), ("灰度", "灰度"), ("Viridis", "viridis"),
+            ("Jet", "jet"), ("Hot", "hot"), ("Cool", "cool"),
+        ]:
+            action = color_menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(self._color_mode == mode)
+            color_actions[action] = mode
+
+        action = menu.exec_(self.canvas.mapToGlobal(pos))
+        if action == magnifier:
+            self._magnifier_enabled = magnifier.isChecked()
+            if self._magnifier_enabled:
+                self._ruler_enabled = False
+        elif action == reset:
+            self._reset_view()
+            return
+        elif action == save_action:
+            save_figure_1080p(
+                self,
+                self.figure,
+                self._title or "scientific_image",
+            )
+        elif action == ruler:
+            self._ruler_enabled = ruler.isChecked()
+            if self._ruler_enabled:
+                self._magnifier_enabled = False
+        elif action == axes:
+            self._show_axes = axes.isChecked()
+            self._render(reset_view=False)
+        elif action == colorbar:
+            self._show_colorbar = colorbar.isChecked()
+            self._render(reset_view=False)
+        elif action in color_actions:
+            self._color_mode = color_actions[action]
+            self._render(reset_view=False)
+
+
 class PIV2DPreviewWidget(QWidget):
     """Grayscale image preview with colorbar, pixel readout, and optional vectors."""
 
@@ -496,6 +905,7 @@ class PIV2DPreviewWidget(QWidget):
 
     def __init__(self, placeholder: str = "预览区域", parent=None):
         super().__init__(parent)
+        self.setObjectName("piv2dPreviewWidget")
         self._image = None
         self._result = None
         self._title = placeholder
@@ -511,6 +921,16 @@ class PIV2DPreviewWidget(QWidget):
         self._mask_drag_patch = None
         self._mask_polygon_points = []
         self._correlation_window_size = None
+        self._show_axes = True
+        self._show_colorbar = True
+        self._cmap = "gray"
+        self._magnifier_enabled = False
+        self._ruler_enabled = False
+        self._view_drag_start = None
+        self._view_pan_limits = None
+        self._view_drag_patch = None
+        self._ruler_points = []
+        self._plot_theme = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -521,6 +941,7 @@ class PIV2DPreviewWidget(QWidget):
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
         layout.addWidget(self.canvas, stretch=1)
 
         self.info_label = QLabel("灰度值: --")
@@ -617,20 +1038,51 @@ class PIV2DPreviewWidget(QWidget):
         if self._image is None:
             self.axes.text(0.5, 0.5, self._title, ha="center", va="center")
             self.axes.set_axis_off()
+            if self._plot_theme:
+                apply_scientific_figure_theme(
+                    self.figure, self.canvas, self._plot_theme
+                )
             self.canvas.draw_idle()
             return
 
-        im = self.axes.imshow(self._image, cmap="gray", origin="upper")
-        self._colorbar = self.figure.colorbar(im, ax=self.axes, fraction=0.046, pad=0.04)
+        im = self.axes.imshow(self._image, cmap=self._cmap, origin="upper")
+        if self._show_colorbar:
+            self._colorbar = self.figure.colorbar(
+                im, ax=self.axes, fraction=0.046, pad=0.04
+            )
+            self._colorbar.set_label("Gray value")
         self.axes.set_title(self._title, fontsize=10)
-        self.axes.set_axis_off()
+        if self._show_axes:
+            self.axes.set_xlabel("X (px)")
+            self.axes.set_ylabel("Y (px)")
+        else:
+            self.axes.set_axis_off()
 
         self._draw_exclusion_mask()
+        self._draw_ruler_overlay()
 
         if self._result is not None:
             self._draw_vectors()
 
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
         self.canvas.draw_idle()
+
+    def apply_theme(self, theme: Dict[str, str]):
+        self._plot_theme = dict(theme)
+        self.setStyleSheet(
+            f"QWidget#piv2dPreviewWidget {{ "
+            f"background-color: {theme['background']}; "
+            f"border: 1px solid {theme['border']}; }}"
+        )
+        self.info_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; "
+            f"background: {theme['surface']}; "
+            "font-family: Consolas; font-size: 11px; padding: 2px 6px;"
+        )
+        apply_scientific_figure_theme(self.figure, self.canvas, theme)
 
     def _draw_exclusion_mask(self):
         if self._exclusion_mask is None or self._image is None:
@@ -690,24 +1142,32 @@ class PIV2DPreviewWidget(QWidget):
             self._show_context_menu(event)
             return
 
-        if not self._mask_selection_enabled or self._image is None or event.inaxes is not self.axes:
+        if self._image is None or event.inaxes is not self.axes:
             return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        if self._mask_shape == "polygon":
-            self._mask_polygon_points.append((float(event.xdata), float(event.ydata)))
-            if getattr(event, "dblclick", False) and len(self._mask_polygon_points) >= 3:
-                self._finish_polygon_mask()
-            else:
-                self._draw_polygon_preview()
+        if event.button != 1 or event.xdata is None or event.ydata is None:
             return
 
-        self._mask_press = (float(event.xdata), float(event.ydata))
-        self._remove_drag_patch()
+        if self._mask_selection_enabled:
+            if self._mask_shape == "polygon":
+                self._mask_polygon_points.append((float(event.xdata), float(event.ydata)))
+                if getattr(event, "dblclick", False) and len(self._mask_polygon_points) >= 3:
+                    self._finish_polygon_mask()
+                else:
+                    self._draw_polygon_preview()
+                return
+            self._mask_press = (float(event.xdata), float(event.ydata))
+            self._remove_drag_patch()
+            return
+
+        self._view_drag_start = (float(event.xdata), float(event.ydata))
+        if not self._magnifier_enabled and not self._ruler_enabled:
+            self._view_pan_limits = (self.axes.get_xlim(), self.axes.get_ylim())
 
     def _on_mouse_release(self, event):
-        if not self._mask_selection_enabled or self._image is None or self._mask_press is None:
+        if not self._mask_selection_enabled:
+            self._finish_view_drag(event)
+            return
+        if self._image is None or self._mask_press is None:
             return
         if event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
             self._mask_press = None
@@ -751,6 +1211,81 @@ class PIV2DPreviewWidget(QWidget):
             self.info_label.setText(f"x={x}  y={y}  灰度值={value:.3f}")
         else:
             self.info_label.setText("灰度值: --")
+
+        if self._view_drag_start is None:
+            return
+        x0, y0 = self._view_drag_start
+        x1, y1 = float(event.xdata), float(event.ydata)
+        if self._magnifier_enabled:
+            from matplotlib.patches import Rectangle
+            self._remove_view_drag_patch()
+            self._view_drag_patch = Rectangle(
+                (min(x0, x1), min(y0, y1)),
+                abs(x1 - x0), abs(y1 - y0),
+                fill=False, edgecolor="#0A84FF", linewidth=1.5,
+            )
+            self.axes.add_patch(self._view_drag_patch)
+        elif self._ruler_enabled:
+            self._ruler_points = [(x0, y0), (x1, y1)]
+        elif self._view_pan_limits is not None:
+            xlim, ylim = self._view_pan_limits
+            self.axes.set_xlim(xlim[0] + x0 - x1, xlim[1] + x0 - x1)
+            self.axes.set_ylim(ylim[0] + y0 - y1, ylim[1] + y0 - y1)
+        self.canvas.draw_idle()
+
+    def _on_scroll(self, event):
+        if self._image is None or event.inaxes is not self.axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        scale = 0.8 if event.button == "up" else 1.25
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        x, y = float(event.xdata), float(event.ydata)
+        self.axes.set_xlim(x + (xlim[0] - x) * scale, x + (xlim[1] - x) * scale)
+        self.axes.set_ylim(y + (ylim[0] - y) * scale, y + (ylim[1] - y) * scale)
+        self.canvas.draw_idle()
+
+    def _finish_view_drag(self, event):
+        if self._view_drag_start is None:
+            return
+        x0, y0 = self._view_drag_start
+        self._view_drag_start = None
+        self._view_pan_limits = None
+        if (
+            event.inaxes is self.axes
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            x1, y1 = float(event.xdata), float(event.ydata)
+            if self._magnifier_enabled and abs(x1 - x0) > 1 and abs(y1 - y0) > 1:
+                self.axes.set_xlim(min(x0, x1), max(x0, x1))
+                self.axes.set_ylim(max(y0, y1), min(y0, y1))
+            elif self._ruler_enabled:
+                self._ruler_points = [(x0, y0), (x1, y1)]
+                self._render()
+        self._remove_view_drag_patch()
+        self.canvas.draw_idle()
+
+    def _draw_ruler_overlay(self):
+        if len(self._ruler_points) != 2:
+            return
+        (x0, y0), (x1, y1) = self._ruler_points
+        distance = float(np.hypot(x1 - x0, y1 - y0))
+        self.axes.plot([x0, x1], [y0, y1], color="#FF453A", linewidth=1.8)
+        self.axes.text(
+            (x0 + x1) / 2.0, (y0 + y1) / 2.0,
+            f"{distance:.2f} px", color="#FF453A",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+
+    def _remove_view_drag_patch(self):
+        if self._view_drag_patch is not None:
+            try:
+                self._view_drag_patch.remove()
+            except ValueError:
+                pass
+            self._view_drag_patch = None
 
     def _update_drag_patch(self, event):
         if event.inaxes is not self.axes or event.xdata is None or event.ydata is None:
@@ -889,10 +1424,59 @@ class PIV2DPreviewWidget(QWidget):
         for text in self._context_info_lines(event, window_text):
             action = menu.addAction(text)
             action.setEnabled(False)
+        menu.addSeparator()
+        magnifier = menu.addAction("放大镜框")
+        magnifier.setCheckable(True)
+        magnifier.setChecked(self._magnifier_enabled)
+        reset = menu.addAction("恢复原尺寸")
+        save_action = menu.addAction("保存图片（1080p）...")
+        save_action.setEnabled(self._image is not None)
+        ruler = menu.addAction("标尺")
+        ruler.setCheckable(True)
+        ruler.setChecked(self._ruler_enabled)
+        axes = menu.addAction("横纵坐标显示")
+        axes.setCheckable(True)
+        axes.setChecked(self._show_axes)
+        colorbar = menu.addAction("Colorbar显示")
+        colorbar.setCheckable(True)
+        colorbar.setChecked(self._show_colorbar)
+        color_menu = menu.addMenu("颜色选择")
+        color_actions = {}
+        for text, cmap in [
+            ("灰度", "gray"), ("Viridis", "viridis"), ("Jet", "jet"),
+            ("Hot", "hot"), ("Cool", "cool"),
+        ]:
+            action = color_menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(self._cmap == cmap)
+            color_actions[action] = cmap
+
         if getattr(event, "guiEvent", None) is not None:
-            menu.exec_(self.canvas.mapToGlobal(event.guiEvent.pos()))
+            selected = menu.exec_(self.canvas.mapToGlobal(event.guiEvent.pos()))
         else:
-            menu.exec_(self.canvas.mapToGlobal(self.canvas.rect().center()))
+            selected = menu.exec_(self.canvas.mapToGlobal(self.canvas.rect().center()))
+
+        if selected == magnifier:
+            self._magnifier_enabled = magnifier.isChecked()
+            if self._magnifier_enabled:
+                self._ruler_enabled = False
+        elif selected == reset:
+            self._render()
+        elif selected == save_action:
+            save_figure_1080p(self, self.figure, self._title or "piv2d")
+        elif selected == ruler:
+            self._ruler_enabled = ruler.isChecked()
+            if self._ruler_enabled:
+                self._magnifier_enabled = False
+        elif selected == axes:
+            self._show_axes = axes.isChecked()
+            self._render()
+        elif selected == colorbar:
+            self._show_colorbar = colorbar.isChecked()
+            self._render()
+        elif selected in color_actions:
+            self._cmap = color_actions[selected]
+            self._render()
 
     def _context_info_lines(self, event, window_text: str) -> List[str]:
         lines = [window_text]
@@ -944,6 +1528,7 @@ class CalibrationPreviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("calibrationPreviewWidget")
         self._datasets: Dict[str, List[str]] = {}
         self._camera_ids: List[str] = []
         self._current_array = None
@@ -959,6 +1544,14 @@ class CalibrationPreviewWidget(QWidget):
         self._ruler_points = []
         self._ruler_dragging = False
         self._ruler_distance_px = 0.0
+        self._show_axes = True
+        self._show_colorbar = True
+        self._cmap = "gray"
+        self._magnifier_enabled = False
+        self._pan_start = None
+        self._pan_limits = None
+        self._magnifier_patch = None
+        self._plot_theme = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -986,6 +1579,7 @@ class CalibrationPreviewWidget(QWidget):
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.setContextMenuPolicy(Qt.CustomContextMenu)
         self.canvas.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self.canvas, stretch=1)
@@ -1092,7 +1686,7 @@ class CalibrationPreviewWidget(QWidget):
         self._request_preview_image(
             image_path,
             title or os.path.basename(image_path),
-            with_colorbar=False,
+            with_colorbar=True,
         )
 
     def enable_ruler(self, enabled: bool = True):
@@ -1207,25 +1801,32 @@ class CalibrationPreviewWidget(QWidget):
         self._colorbar = None
 
         if array.ndim == 2:
-            image_artist = self.axes.imshow(array, cmap="gray", origin="upper")
-            if with_colorbar:
+            image_artist = self.axes.imshow(array, cmap=self._cmap, origin="upper")
+            if with_colorbar and self._show_colorbar:
                 self._colorbar = self.figure.colorbar(image_artist, ax=self.axes)
-                self._colorbar.set_label("Pixel value")
+                self._colorbar.set_label("Gray value")
         elif array.ndim == 3 and array.shape[2] >= 3:
             rgb = cv2.cvtColor(array[:, :, :3], cv2.COLOR_BGR2RGB)
             self.axes.imshow(rgb, origin="upper")
         else:
             squeezed = np.squeeze(array)
-            image_artist = self.axes.imshow(squeezed, cmap="gray", origin="upper")
-            if with_colorbar:
+            image_artist = self.axes.imshow(squeezed, cmap=self._cmap, origin="upper")
+            if with_colorbar and self._show_colorbar:
                 self._colorbar = self.figure.colorbar(image_artist, ax=self.axes)
-                self._colorbar.set_label("Pixel value")
+                self._colorbar.set_label("Gray value")
 
         self.axes.set_title(title)
-        self.axes.set_xlabel("X (px)")
-        self.axes.set_ylabel("Y (px)")
+        if self._show_axes:
+            self.axes.set_xlabel("X (px)")
+            self.axes.set_ylabel("Y (px)")
+        else:
+            self.axes.set_axis_off()
         self._draw_detection_overlay()
         self._draw_ruler_overlay()
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
         self.canvas.draw_idle()
 
     def _render_placeholder(self, text: str):
@@ -1233,7 +1834,27 @@ class CalibrationPreviewWidget(QWidget):
         self.axes = self.figure.add_subplot(111)
         self.axes.text(0.5, 0.5, text, ha="center", va="center", transform=self.axes.transAxes)
         self.axes.set_axis_off()
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
         self.canvas.draw_idle()
+
+    def apply_theme(self, theme: Dict[str, str]):
+        self._plot_theme = dict(theme)
+        self.setStyleSheet(
+            f"QWidget#calibrationPreviewWidget {{ "
+            f"background-color: {theme['background']}; "
+            f"border: 1px solid {theme['border']}; }}"
+        )
+        self.info_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; background: {theme['surface']};"
+        )
+        self.pixel_label.setStyleSheet(
+            f"color: {theme['text_secondary']}; "
+            f"background: {theme['surface']}; font-family: Consolas;"
+        )
+        apply_scientific_figure_theme(self.figure, self.canvas, theme)
 
     def _redraw_current(self):
         if self._current_array is None:
@@ -1243,14 +1864,61 @@ class CalibrationPreviewWidget(QWidget):
 
     def _show_context_menu(self, pos):
         menu = QMenu(self)
-        toggle_action = menu.addAction("关闭标尺" if self._ruler_enabled else "打开标尺")
+        magnifier = menu.addAction("放大镜框")
+        magnifier.setCheckable(True)
+        magnifier.setChecked(self._magnifier_enabled)
+        reset = menu.addAction("恢复原尺寸")
+        save_action = menu.addAction("保存图片（1080p）...")
+        save_action.setEnabled(self._current_array is not None)
+        toggle_action = menu.addAction("标尺")
+        toggle_action.setCheckable(True)
+        toggle_action.setChecked(self._ruler_enabled)
         clear_action = menu.addAction("清除标尺")
         clear_action.setEnabled(bool(self._ruler_points))
+        axes_action = menu.addAction("横纵坐标显示")
+        axes_action.setCheckable(True)
+        axes_action.setChecked(self._show_axes)
+        colorbar_action = menu.addAction("Colorbar显示")
+        colorbar_action.setCheckable(True)
+        colorbar_action.setChecked(self._show_colorbar)
+        color_menu = menu.addMenu("颜色选择")
+        color_actions = {}
+        for text, cmap in [
+            ("灰度", "gray"), ("Viridis", "viridis"), ("Jet", "jet"),
+            ("Hot", "hot"), ("Cool", "cool"),
+        ]:
+            item = color_menu.addAction(text)
+            item.setCheckable(True)
+            item.setChecked(self._cmap == cmap)
+            color_actions[item] = cmap
         action = menu.exec_(self.canvas.mapToGlobal(pos))
-        if action == toggle_action:
-            self.enable_ruler(not self._ruler_enabled)
+        if action == magnifier:
+            self._magnifier_enabled = magnifier.isChecked()
+            if self._magnifier_enabled:
+                self.enable_ruler(False)
+        elif action == reset:
+            self._redraw_current()
+        elif action == save_action:
+            save_figure_1080p(
+                self,
+                self.figure,
+                self._current_title or "calibration",
+            )
+        elif action == toggle_action:
+            self.enable_ruler(toggle_action.isChecked())
+            if self._ruler_enabled:
+                self._magnifier_enabled = False
         elif action == clear_action:
             self.clear_ruler()
+        elif action == axes_action:
+            self._show_axes = axes_action.isChecked()
+            self._redraw_current()
+        elif action == colorbar_action:
+            self._show_colorbar = colorbar_action.isChecked()
+            self._redraw_current()
+        elif action in color_actions:
+            self._cmap = color_actions[action]
+            self._redraw_current()
 
     def _show_previous_camera(self):
         if not self._camera_ids:
@@ -1274,26 +1942,47 @@ class CalibrationPreviewWidget(QWidget):
         self._render_current_dataset_image()
 
     def _on_mouse_press(self, event):
-        if not self._ruler_enabled or event.inaxes != self.axes or event.button != 1:
+        if event.inaxes != self.axes or event.button != 1:
             return
         if event.xdata is None or event.ydata is None:
             return
-        self._ruler_points = [
-            (float(event.xdata), float(event.ydata)),
-            (float(event.xdata), float(event.ydata)),
-        ]
-        self._ruler_dragging = True
-        self._update_ruler_distance()
-        self._redraw_current()
+        if self._ruler_enabled:
+            self._ruler_points = [
+                (float(event.xdata), float(event.ydata)),
+                (float(event.xdata), float(event.ydata)),
+            ]
+            self._ruler_dragging = True
+            self._update_ruler_distance()
+            self._redraw_current()
+            return
+        self._pan_start = (float(event.xdata), float(event.ydata))
+        self._pan_limits = (self.axes.get_xlim(), self.axes.get_ylim())
 
     def _on_mouse_release(self, event):
-        if not self._ruler_enabled or not self._ruler_dragging:
+        if self._ruler_enabled and self._ruler_dragging:
+            self._ruler_dragging = False
+            if event.inaxes == self.axes and event.xdata is not None and event.ydata is not None:
+                self._ruler_points[-1] = (float(event.xdata), float(event.ydata))
+            self._update_ruler_distance()
+            self._redraw_current()
             return
-        self._ruler_dragging = False
-        if event.inaxes == self.axes and event.xdata is not None and event.ydata is not None:
-            self._ruler_points[-1] = (float(event.xdata), float(event.ydata))
-        self._update_ruler_distance()
-        self._redraw_current()
+        if self._pan_start is None:
+            return
+        x0, y0 = self._pan_start
+        self._pan_start = None
+        self._pan_limits = None
+        if (
+            self._magnifier_enabled
+            and event.inaxes == self.axes
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            x1, y1 = float(event.xdata), float(event.ydata)
+            if abs(x1 - x0) > 1 and abs(y1 - y0) > 1:
+                self.axes.set_xlim(min(x0, x1), max(x0, x1))
+                self.axes.set_ylim(max(y0, y1), min(y0, y1))
+        self._remove_magnifier_patch()
+        self.canvas.draw_idle()
 
     def _on_mouse_move(self, event):
         if event.inaxes != self.axes or self._current_array is None:
@@ -1308,6 +1997,23 @@ class CalibrationPreviewWidget(QWidget):
             self._ruler_points[-1] = (float(event.xdata), float(event.ydata))
             self._update_ruler_distance()
             self._redraw_current()
+        elif self._pan_start is not None:
+            x0, y0 = self._pan_start
+            x1, y1 = float(event.xdata), float(event.ydata)
+            if self._magnifier_enabled:
+                from matplotlib.patches import Rectangle
+                self._remove_magnifier_patch()
+                self._magnifier_patch = Rectangle(
+                    (min(x0, x1), min(y0, y1)),
+                    abs(x1 - x0), abs(y1 - y0),
+                    fill=False, edgecolor="#0A84FF", linewidth=1.5,
+                )
+                self.axes.add_patch(self._magnifier_patch)
+            elif self._pan_limits is not None:
+                xlim, ylim = self._pan_limits
+                self.axes.set_xlim(xlim[0] + x0 - x1, xlim[1] + x0 - x1)
+                self.axes.set_ylim(ylim[0] + y0 - y1, ylim[1] + y0 - y1)
+            self.canvas.draw_idle()
 
         x = int(np.clip(round(event.xdata), 0, self._current_array.shape[1] - 1))
         y = int(np.clip(round(event.ydata), 0, self._current_array.shape[0] - 1))
@@ -1322,6 +2028,27 @@ class CalibrationPreviewWidget(QWidget):
             self.pixel_label.setText(
                 f"x={x}, y={y}, gray={gray_value}, raw={raw_values}"
             )
+
+    def _on_scroll(self, event):
+        if self._current_array is None or event.inaxes != self.axes:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        scale = 0.8 if event.button == "up" else 1.25
+        xlim = self.axes.get_xlim()
+        ylim = self.axes.get_ylim()
+        x, y = float(event.xdata), float(event.ydata)
+        self.axes.set_xlim(x + (xlim[0] - x) * scale, x + (xlim[1] - x) * scale)
+        self.axes.set_ylim(y + (ylim[0] - y) * scale, y + (ylim[1] - y) * scale)
+        self.canvas.draw_idle()
+
+    def _remove_magnifier_patch(self):
+        if self._magnifier_patch is not None:
+            try:
+                self._magnifier_patch.remove()
+            except ValueError:
+                pass
+            self._magnifier_patch = None
 
     def _draw_ruler_overlay(self):
         if len(self._ruler_points) != 2:
@@ -2084,10 +2811,8 @@ class ImagePreviewPanel(QWidget):
         """)
         self._scroll = scroll
 
-        self._img_label = QLabel()
-        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label = ScientificImageViewer("请从左侧文件树选择图片")
         self._img_label.setStyleSheet("background-color: #111c28; color: #7f8c8d; font-size: 12px;")
-        self._img_label.setText("请从左侧文件树选择图片")
         scroll.setWidget(self._img_label)
         content_layout.addWidget(scroll, stretch=1)
 
@@ -2112,11 +2837,22 @@ class ImagePreviewPanel(QWidget):
     def collapse(self):
         """折叠预览面板，只保留标题栏（收缩到最右边）。"""
         self._expanded = False
-        self._expanded_width = self.width()
+        self._expanded_width = max(self.width(), 220)
         self._content.hide()
         self._collapse_btn.setText("▸")
-        # 收缩到仅标题栏窄条（约10px），紧贴最右边
-        self.setFixedWidth(10)
+        self.setMinimumWidth(10)
+        self.setMaximumWidth(10)
+        splitter = self.parentWidget()
+        if isinstance(splitter, QSplitter):
+            index = splitter.indexOf(self)
+            sizes = splitter.sizes()
+            if 0 <= index < len(sizes):
+                released = max(0, sizes[index] - 10)
+                sizes[index] = 10
+                donor = 1 if index != 1 and len(sizes) > 1 else 0
+                if 0 <= donor < len(sizes) and donor != index:
+                    sizes[donor] += released
+                splitter.setSizes(sizes)
         self.collapse_state_changed.emit(False)
 
     def expand(self):
@@ -2124,7 +2860,23 @@ class ImagePreviewPanel(QWidget):
         self._expanded = True
         self._content.show()
         self._collapse_btn.setText("◂")
-        self.setFixedWidth(self._expanded_width)
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(16777215)
+        splitter = self.parentWidget()
+        if isinstance(splitter, QSplitter):
+            index = splitter.indexOf(self)
+            sizes = splitter.sizes()
+            if 0 <= index < len(sizes):
+                target = max(180, self._expanded_width)
+                delta = max(0, target - sizes[index])
+                sizes[index] = target
+                if delta and len(sizes) > 1:
+                    donor = max(
+                        (i for i in range(len(sizes)) if i != index),
+                        key=lambda i: sizes[i],
+                    )
+                    sizes[donor] = max(1, sizes[donor] - delta)
+                splitter.setSizes(sizes)
         # 重新适配图片
         if hasattr(self, '_orig_pixmap') and not self._orig_pixmap.isNull():
             self._apply_pixmap()
@@ -2145,10 +2897,12 @@ class ImagePreviewPanel(QWidget):
         if not self._expanded:
             self.expand()
 
+        raw_img = None
         try:
+            raw_img = robust_imread(img_path, cv2.IMREAD_UNCHANGED)
             pix = QPixmap(img_path)
             if pix.isNull():
-                img = robust_imread(img_path, cv2.IMREAD_UNCHANGED)
+                img = raw_img
                 if img is not None:
                     # 非8位图像先归一化到0-255以便显示
                     if img.dtype != np.uint8:
@@ -2176,11 +2930,21 @@ class ImagePreviewPanel(QWidget):
             self._img_label.setText("无法加载图片")
             return
 
+        self._orig_image = raw_img
         self._orig_pixmap = pix
         self._apply_pixmap()
 
     def _apply_pixmap(self):
         if not hasattr(self, '_orig_pixmap') or self._orig_pixmap.isNull():
+            return
+        if isinstance(self._img_label, ScientificImageViewer):
+            if getattr(self, "_orig_image", None) is not None:
+                self._img_label.set_image_array(
+                    self._orig_image,
+                    os.path.basename(getattr(self, "_current_path", "")),
+                )
+            else:
+                self._img_label.setPixmap(self._orig_pixmap)
             return
         if self._fit_btn.isChecked():
             scaled = self._orig_pixmap.scaled(
@@ -2192,6 +2956,8 @@ class ImagePreviewPanel(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._expanded and self.width() > 180:
+            self._expanded_width = self.width()
         if self._expanded and hasattr(self, '_fit_btn') and self._fit_btn.isChecked():
             self._apply_pixmap()
 
@@ -2201,6 +2967,7 @@ class ImagePreviewPanel(QWidget):
         self._img_label.setText("请从左侧文件树选择图片")
         if hasattr(self, '_orig_pixmap'):
             self._orig_pixmap = QPixmap()
+        self._orig_image = None
 
 
 class _IEColorbarWidget(QWidget):
@@ -2255,76 +3022,171 @@ class _IEColorbarWidget(QWidget):
         painter.end()
 
 
-class _IEImageViewer(QLabel):
-    """图像处理查看器的增强QLabel，支持鼠标悬停显示像素坐标和值。"""
+class _IEImageViewer(ScientificImageViewer):
+    """Image-editor viewer using the shared scientific image interactions."""
 
     pixel_hover = pyqtSignal(int, int, object)  # x, y, pixel_value
+    roi_selected = pyqtSignal(int, int, int, int)  # x, y, width, height
 
     def __init__(self, text="", sp_func=None, parent=None):
         super().__init__(text, parent)
         self._sp = sp_func or (lambda x: x)
-        self.setAlignment(Qt.AlignCenter)
-        self.setMouseTracking(True)
-        self._image_data = None  # numpy array
-        self._scale_x = 1.0
-        self._scale_y = 1.0
-        self._offset_x = 0
-        self._offset_y = 0
+        self._image_data = None
+        self._roi_selection_active = False
+        self._roi_start = None
+        self._roi_patch = None
+        self._selected_roi = None
+        self.canvas.mpl_connect(
+            "figure_leave_event",
+            lambda _event: self.pixel_hover.emit(-1, -1, None),
+        )
 
     def set_image_data(self, img):
-        """设置原始图像数据用于像素值读取。"""
+        """Set original data so coordinates and values remain exact."""
         self._image_data = img
+        if img is not None:
+            self.set_image_array(img)
+            self._draw_selected_roi()
 
     def setPixmap(self, pixmap):
-        """重写setPixmap，记录缩放信息。"""
-        super().setPixmap(pixmap)
-        if pixmap and self._image_data is not None:
-            ih, iw = self._image_data.shape[:2]
-            pw = pixmap.width()
-            ph = pixmap.height()
-            if pw > 0 and ph > 0:
-                self._scale_x = iw / pw
-                self._scale_y = ih / ph
-                # 计算图片在label中的偏移（居中显示）
-                self._offset_x = (self.width() - pw) // 2
-                self._offset_y = (self.height() - ph) // 2
+        if self._image_data is not None:
+            self.set_image_array(self._image_data)
+            self._draw_selected_roi()
+        else:
+            super().setPixmap(pixmap)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # 重新计算偏移
-        if self.pixmap() and self._image_data is not None:
-            pw = self.pixmap().width()
-            ph = self.pixmap().height()
-            self._offset_x = (self.width() - pw) // 2
-            self._offset_y = (self.height() - ph) // 2
+    def start_roi_selection(self) -> bool:
+        if self._image_data is None:
+            return False
+        self._roi_selection_active = True
+        self._roi_start = None
+        self._remove_roi_patch()
+        self.canvas.setCursor(Qt.CrossCursor)
+        return True
 
-    def mouseMoveEvent(self, event):
-        """鼠标移动时发出像素坐标和值。"""
-        if self._image_data is None or self.pixmap() is None:
+    def cancel_roi_selection(self):
+        self._roi_selection_active = False
+        self._roi_start = None
+        self._remove_roi_patch()
+        self.canvas.unsetCursor()
+        self._draw_selected_roi()
+
+    def show_roi(self, x: int, y: int, width: int, height: int):
+        self._selected_roi = (
+            int(x), int(y), max(0, int(width)), max(0, int(height))
+        )
+        self._draw_selected_roi()
+
+    def _draw_selected_roi(self):
+        self._remove_roi_patch()
+        if not self._selected_roi or self._image_data is None:
+            return
+        x, y, width, height = self._selected_roi
+        if width <= 0 or height <= 0:
+            return
+        from matplotlib.patches import Rectangle
+        self._roi_patch = Rectangle(
+            (x, y), width, height,
+            fill=False, edgecolor="#FF453A", linewidth=2.0, linestyle="--",
+        )
+        self.axes.add_patch(self._roi_patch)
+        self.canvas.draw_idle()
+
+    def _remove_roi_patch(self):
+        if self._roi_patch is None:
+            return
+        try:
+            self._roi_patch.remove()
+        except (ValueError, AttributeError):
+            pass
+        self._roi_patch = None
+
+    def _on_mouse_press(self, event):
+        if self._roi_selection_active:
+            if (
+                event.button == 1
+                and event.inaxes is self.axes
+                and event.xdata is not None
+                and event.ydata is not None
+            ):
+                self._roi_start = (float(event.xdata), float(event.ydata))
+                self._remove_roi_patch()
+            return
+        super()._on_mouse_press(event)
+
+    def _on_mouse_move(self, event):
+        super()._on_mouse_move(event)
+        if (
+            self._image_data is None
+            or event.inaxes is not self.axes
+            or event.xdata is None
+            or event.ydata is None
+        ):
             self.pixel_hover.emit(-1, -1, None)
             return
+        x = int(round(event.xdata))
+        y = int(round(event.ydata))
+        h, w = self._image_data.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            value = self._image_data[y, x]
+            if isinstance(value, np.ndarray):
+                value = tuple(value.tolist())
+            self.pixel_hover.emit(x, y, value)
+        else:
+            self.pixel_hover.emit(-1, -1, None)
+        if (
+            self._roi_selection_active
+            and self._roi_start is not None
+            and event.inaxes is self.axes
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            from matplotlib.patches import Rectangle
+            x0, y0 = self._roi_start
+            x1, y1 = float(event.xdata), float(event.ydata)
+            self._remove_roi_patch()
+            self._roi_patch = Rectangle(
+                (min(x0, x1), min(y0, y1)),
+                abs(x1 - x0),
+                abs(y1 - y0),
+                fill=False,
+                edgecolor="#FF453A",
+                linewidth=2.0,
+                linestyle="--",
+            )
+            self.axes.add_patch(self._roi_patch)
+            self.canvas.draw_idle()
 
-        x = event.pos().x() - self._offset_x
-        y = event.pos().y() - self._offset_y
-
-        pw = self.pixmap().width()
-        ph = self.pixmap().height()
-
-        if 0 <= x < pw and 0 <= y < ph:
-            img_x = int(x * self._scale_x)
-            img_y = int(y * self._scale_y)
-            ih, iw = self._image_data.shape[:2]
-            if 0 <= img_y < ih and 0 <= img_x < iw:
-                val = self._image_data[img_y, img_x]
-                if isinstance(val, np.ndarray):
-                    val = tuple(val.tolist())
-                self.pixel_hover.emit(img_x, img_y, val)
+    def _on_mouse_release(self, event):
+        if not self._roi_selection_active:
+            super()._on_mouse_release(event)
+            return
+        if self._roi_start is None:
+            return
+        start = self._roi_start
+        self._roi_start = None
+        if (
+            event.inaxes is self.axes
+            and event.xdata is not None
+            and event.ydata is not None
+            and self._image_data is not None
+        ):
+            x0, y0 = start
+            x1, y1 = float(event.xdata), float(event.ydata)
+            image_h, image_w = self._image_data.shape[:2]
+            left = max(0, min(image_w, int(np.floor(min(x0, x1)))))
+            top = max(0, min(image_h, int(np.floor(min(y0, y1)))))
+            right = max(0, min(image_w, int(np.ceil(max(x0, x1)))))
+            bottom = max(0, min(image_h, int(np.ceil(max(y0, y1)))))
+            width = right - left
+            height = bottom - top
+            if width >= 2 and height >= 2:
+                self._selected_roi = (left, top, width, height)
+                self._roi_selection_active = False
+                self.canvas.unsetCursor()
+                self.roi_selected.emit(left, top, width, height)
                 return
-
-        self.pixel_hover.emit(-1, -1, None)
-
-    def leaveEvent(self, event):
-        self.pixel_hover.emit(-1, -1, None)
+        self.cancel_roi_selection()
 
 
 class _IEAlgoCard(QFrame):
@@ -2574,6 +3436,11 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv_batch_results: Dict[int, dict] = {}
         self.current_bubble_timepoint = 0
         self.current_piv_timepoint = 0
+        self.bubble_src_dir: str = ""
+        self.bubble_single_paths: List[str] = []
+        self.rt_image_path: str = ""
+        self.particle_manual_paths: List[str] = []
+        self._module_output_dirs: Dict[str, str] = {}
 
         # 单相机标定数据
         self.single_camera_params: Optional[dict] = None   # {camera_matrix, dist_coeffs, rms}
@@ -2598,6 +3465,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_frame2_path: str = ""
         self.piv2d_src_dir: str = ""
         self.piv2d_dst_dir: str = ""
+        self.piv2d_dst_dir_manual: bool = False
         self.piv2d_time_groups: List[dict] = []
         self.piv2d_worker_thread = None
         self._piv2d_last_result: Optional[dict] = None
@@ -2661,6 +3529,7 @@ class BubbleTomographyGUI(QMainWindow):
             ("PIV模块", [
                 ("particle", "三维PIV"),
                 ("piv2d", "二维PIV"),
+                ("ptv", "PTV"),
             ]),
             ("AI辅助", [
                 ("ai_assistant", "AI辅助模型"),
@@ -2758,6 +3627,10 @@ class BubbleTomographyGUI(QMainWindow):
 
         # === 右侧内?(QStackedWidget) ===
         self.content_stack = QStackedWidget()
+        self.content_stack.setMinimumWidth(self._sp(440))
+        self.content_stack.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Expanding
+        )
         self.content_stack.setStyleSheet("QStackedWidget { border: none; }")
 
         # Page 0: 相机标定
@@ -2775,14 +3648,17 @@ class BubbleTomographyGUI(QMainWindow):
         # Page 4: 二维PIV
         self._create_piv2d_page()
 
-        # Page 5: 通用图像处理
+        # Page 5: PTV
+        self._create_ptv_page()
+
+        # Page 6: 通用图像处理
         self._create_image_editor_page()
 
-        # Page 6-7: AI辅助
+        # Page 7-8: AI辅助
         self._create_ai_module_page("ai_assistant", "AI辅助模型", local_default=False)
         self._create_ai_module_page("local_model", "本地模型", local_default=True)
 
-        image_editor_page = self.content_stack.widget(5)
+        image_editor_page = self.content_stack.widget(6)
         if image_editor_page is not None:
             self.content_stack.removeWidget(image_editor_page)
             self.content_stack.insertWidget(0, image_editor_page)
@@ -2793,23 +3669,42 @@ class BubbleTomographyGUI(QMainWindow):
 
         # === 文件树面板（导航栏右侧） ===
         self._file_tree_panel = FileTreePanel()
-        self._file_tree_panel.setFixedWidth(self._sp(220))
+        self._file_tree_panel.setMinimumWidth(self._sp(150))
+        self._file_tree_panel.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Expanding
+        )
         self._file_tree_panel.image_selected.connect(self._on_filetree_image_selected)
         self._file_tree_panel.group_selected.connect(self._on_filetree_image_selected)
 
         # === 图片预览面板（最右侧）===
         self._preview_panel = ImagePreviewPanel()
-        self._preview_panel.setFixedWidth(self._sp(320))
+        self._preview_panel.setMinimumWidth(self._sp(210))
+        self._preview_panel.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Expanding
+        )
         self._file_tree_panel.image_selected.connect(self._preview_panel.load_image)
         self._file_tree_panel.group_selected.connect(self._preview_panel.load_image)
 
         # 同步面板自带折叠按钮的状态
         self._preview_panel.collapse_state_changed.connect(self._sync_preview_toggle_state_from_panel)
 
+        self._main_content_splitter = QSplitter(Qt.Horizontal)
+        self._main_content_splitter.setObjectName("mainContentSplitter")
+        self._main_content_splitter.setChildrenCollapsible(False)
+        self._main_content_splitter.setOpaqueResize(True)
+        self._main_content_splitter.setHandleWidth(self._sp(7))
+        self._main_content_splitter.addWidget(self._file_tree_panel)
+        self._main_content_splitter.addWidget(self.content_stack)
+        self._main_content_splitter.addWidget(self._preview_panel)
+        self._main_content_splitter.setStretchFactor(0, 0)
+        self._main_content_splitter.setStretchFactor(1, 1)
+        self._main_content_splitter.setStretchFactor(2, 0)
+        self._main_content_splitter.setSizes([
+            self._sp(220), self._sp(900), self._sp(320)
+        ])
+
         main_layout.addWidget(self._nav_panel)
-        main_layout.addWidget(self._file_tree_panel)
-        main_layout.addWidget(self.content_stack, stretch=1)
-        main_layout.addWidget(self._preview_panel)
+        main_layout.addWidget(self._main_content_splitter, stretch=1)
 
         # 连接导航切换
         self._nav_btn_group.buttonClicked.connect(self._on_nav_changed)
@@ -3147,6 +4042,106 @@ class BubbleTomographyGUI(QMainWindow):
             self._file_tree_panel.set_work_dir(directory)
             self.statusBar().showMessage(f"工作目录已设置: {directory}")
 
+    @staticmethod
+    def _processing_folder_suffix(function_name: str) -> str:
+        suffix = re.sub(r'[<>:"/\\|?*]+|\s+', "_", str(function_name)).strip(" ._")
+        return suffix or "processed"
+
+    def _next_processing_output_dir(self, source_dir: str, function_name: str) -> str:
+        base_dir = Path(source_dir).expanduser()
+        if base_dir.is_file():
+            base_dir = base_dir.parent
+        suffix = self._processing_folder_suffix(function_name)
+        prefix = f"image_{suffix}_"
+        max_index = 0
+        if base_dir.is_dir():
+            for child in base_dir.iterdir():
+                if not child.is_dir() or not child.name.startswith(prefix):
+                    continue
+                tail = child.name[len(prefix):]
+                if tail.isdigit():
+                    max_index = max(max_index, int(tail))
+        return str(base_dir / f"{prefix}{max_index + 1:02d}")
+
+    @staticmethod
+    def _first_existing_parent(paths) -> str:
+        for path in paths or []:
+            if not path:
+                continue
+            candidate = Path(path)
+            if candidate.is_file():
+                return str(candidate.parent)
+            if candidate.is_dir():
+                return str(candidate)
+        return ""
+
+    def _module_source_dir(self, module_key: str) -> str:
+        candidates = []
+        if module_key == "calibration":
+            for paths in self.camera_calib_images.values():
+                candidates.extend(paths)
+            candidates.extend(getattr(self, "_single_calib_files", []))
+            candidates.extend(getattr(self, "_stereo_left_files", []))
+            candidates.extend(getattr(self, "_stereo_right_files", []))
+        elif module_key == "reconstruction":
+            candidates.append(self.bubble_src_dir)
+            candidates.extend(self.bubble_single_paths)
+        elif module_key == "raytrace":
+            candidates.append(self.rt_image_path)
+        elif module_key == "particle":
+            for paths in self.particle_sequence_paths.values():
+                candidates.extend(paths)
+            candidates.extend(self.particle_manual_paths)
+        elif module_key == "piv2d":
+            candidates.extend([
+                self.piv2d_src_dir,
+                self.piv2d_frame1_path,
+                self.piv2d_frame2_path,
+            ])
+        elif module_key == "image_editor":
+            candidates.extend([self.ie_src_dir, self.ie_single_path])
+
+        source_dir = self._first_existing_parent(candidates)
+        return source_dir or self._work_dir or os.getcwd()
+
+    def _watch_and_refresh_output(self, output_dir: str):
+        if not output_dir or not hasattr(self, "_file_tree_panel"):
+            return
+        self._file_tree_panel.watch_extra_dir(output_dir)
+        self._file_tree_panel.schedule_refresh(100)
+        QTimer.singleShot(500, self._file_tree_panel.refresh)
+        QTimer.singleShot(1200, self._file_tree_panel.refresh)
+
+    def _prepare_module_output(
+        self,
+        module_key: str,
+        function_name: str,
+        *,
+        source_dir: str = "",
+        manual_dir: str = "",
+        new_run: bool = True,
+        use_visualizer: bool = True,
+    ) -> str:
+        if manual_dir:
+            output_dir = manual_dir
+        elif new_run or not self._module_output_dirs.get(module_key):
+            source = source_dir or self._module_source_dir(module_key)
+            output_dir = self._next_processing_output_dir(source, function_name)
+        else:
+            output_dir = self._module_output_dirs[module_key]
+
+        os.makedirs(output_dir, exist_ok=True)
+        self._module_output_dirs[module_key] = output_dir
+        if use_visualizer:
+            self.visualizer.output_dir = output_dir
+        self._watch_and_refresh_output(output_dir)
+        return output_dir
+
+    def _activate_module_output(self, module_key: str):
+        output_dir = self._module_output_dirs.get(module_key, "")
+        if output_dir:
+            self.visualizer.output_dir = output_dir
+
     def _on_filetree_image_selected(self, img_path: str):
         """文件树点击图片时，在右侧当前页面中加载预览（通用处理）。"""
         if not os.path.isfile(img_path):
@@ -3177,34 +4172,13 @@ class BubbleTomographyGUI(QMainWindow):
         dlg.resize(800, 600)
         layout = QVBoxLayout(dlg)
 
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
+        label = ScientificImageViewer("图像预览")
         label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         try:
             img = robust_imread(img_path, cv2.IMREAD_UNCHANGED)
             if img is not None:
-                # 非8位图像先归一化到0-255以便显示
-                if img.dtype != np.uint8:
-                    vmin, vmax = float(img.min()), float(img.max())
-                    if vmax > vmin:
-                        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                    else:
-                        img = np.zeros(img.shape[:2], dtype=np.uint8)
-                if img.ndim == 2:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                elif img.ndim == 3 and img.shape[2] == 4:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-                elif img.ndim == 3 and img.shape[2] == 1:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                else:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                h, w, ch = img_rgb.shape
-                # 使用 .tobytes() 创建数据副本，避免 numpy 数组被 GC 后 QImage 引用悬垂指针
-                qimg = QImage(img_rgb.data.tobytes(), w, h, w * ch, QImage.Format_RGB888)
-                pix = QPixmap.fromImage(qimg)
-                scaled = pix.scaled(780, 560, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                label.setPixmap(scaled)
+                label.set_image_array(img, os.path.basename(img_path))
             else:
                 label.setText("无法读取图像")
         except Exception as e:
@@ -3289,6 +4263,10 @@ class BubbleTomographyGUI(QMainWindow):
         nav_to_piv2d = QAction("二维PIV", self)
         nav_to_piv2d.triggered.connect(lambda: self._navigate_to(4))
         window_menu.addAction(nav_to_piv2d)
+
+        nav_to_ptv = QAction("PTV", self)
+        nav_to_ptv.triggered.connect(lambda: self._navigate_to(8))
+        window_menu.addAction(nav_to_ptv)
 
         nav_to_ie = QAction("图像处理", self)
         nav_to_ie.triggered.connect(lambda: self._navigate_to(5))
@@ -3653,7 +4631,12 @@ class BubbleTomographyGUI(QMainWindow):
             {common_button}
         """)
         apply(getattr(self, "ie_body_splitter", None),
-              f"QSplitter::handle {{ background: {border}; width: 2px; }}")
+              f"""
+              QSplitter::handle:horizontal {{
+                  background: {border}; width: 7px;
+              }}
+              QSplitter::handle:horizontal:hover {{ background: {accent_hover}; }}
+              """)
         apply(getattr(self, "ie_ops_panel", None), f"""
             QWidget {{ background: {sidebar}; color: {text}; }}
             QLabel {{ color: {text}; }}
@@ -3681,6 +4664,18 @@ class BubbleTomographyGUI(QMainWindow):
             {input_style}
         """
         apply(getattr(self, "ie_source_bar", None), bar_style)
+        apply(getattr(self, "ie_source_scroll", None), f"""
+            QScrollArea {{ border: none; background: {surface}; }}
+            QScrollBar:horizontal {{
+                background: {surface}; height: 7px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {border}; border-radius: 3px; min-width: 24px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background: {accent_hover}; }}
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal {{ width: 0px; }}
+        """)
         apply(getattr(self, "ie_fname_bar", None), bar_style)
         apply(getattr(self, "ie_frame_nav", None), bar_style + f"""
             QSlider::groove:horizontal {{ background: {border}; height: 4px; }}
@@ -3689,7 +4684,12 @@ class BubbleTomographyGUI(QMainWindow):
             }}
         """)
         apply(getattr(self, "ie_viewer_splitter", None),
-              f"QSplitter::handle {{ background: {border}; height: 2px; }}")
+              f"""
+              QSplitter::handle:vertical {{
+                  background: {border}; height: 7px;
+              }}
+              QSplitter::handle:vertical:hover {{ background: {accent_hover}; }}
+              """)
 
         frame_style = f"QFrame {{ background: {surface}; border: 1px solid {border}; border-radius: 4px; }}"
         apply(getattr(self, "ie_orig_frame", None), frame_style)
@@ -3807,6 +4807,20 @@ class BubbleTomographyGUI(QMainWindow):
             self._file_tree_panel.apply_theme(theme)
         if hasattr(self, "_preview_panel"):
             self._preview_panel.apply_theme(theme)
+        if hasattr(self, "content_stack"):
+            self.content_stack.setStyleSheet(
+                f"QStackedWidget {{ border: none; "
+                f"background-color: {theme['background']}; }}"
+            )
+            for viewer in self.content_stack.findChildren(ScientificImageViewer):
+                viewer.apply_theme(theme)
+            for viewer in self.content_stack.findChildren(PIV2DPreviewWidget):
+                viewer.apply_theme(theme)
+            for viewer in self.content_stack.findChildren(CalibrationPreviewWidget):
+                viewer.apply_theme(theme)
+        if hasattr(self, "_preview_panel"):
+            for viewer in self._preview_panel.findChildren(ScientificImageViewer):
+                viewer.apply_theme(theme)
         self._apply_image_editor_theme()
 
     def _apply_global_style(self):
@@ -4056,10 +5070,13 @@ class BubbleTomographyGUI(QMainWindow):
                 background: #444;
             }
             QSplitter::handle:horizontal {
-                width: 2px;
+                width: 7px;
             }
             QSplitter::handle:vertical {
-                height: 2px;
+                height: 7px;
+            }
+            QSplitter::handle:hover {
+                background: #2196F3;
             }
             QCheckBox {
                 color: #ddd;
@@ -4488,8 +5505,7 @@ class BubbleTomographyGUI(QMainWindow):
             )
             top_splitter.addWidget(preview_widget)
         else:
-            preview_widget = QLabel()
-            preview_widget.setAlignment(Qt.AlignCenter)
+            preview_widget = ScientificImageViewer("预览区域")
             preview_widget.setMinimumSize(self._sp(400), self._sp(300))
             preview_widget.setStyleSheet(
                 "border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px;"
@@ -4847,8 +5863,7 @@ class BubbleTomographyGUI(QMainWindow):
         mid_splitter.addWidget(self.recon_log)
 
         # Batch/result preview
-        self.proj_preview_label = QLabel()
-        self.proj_preview_label.setAlignment(Qt.AlignCenter)
+        self.proj_preview_label = ScientificImageViewer("投影预览")
         self.proj_preview_label.setMinimumSize(self._sp(400), self._sp(300))
         self.proj_preview_label.setStyleSheet(
             "border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px;"
@@ -5182,8 +6197,7 @@ class BubbleTomographyGUI(QMainWindow):
         )
         mid_splitter.addWidget(self.particle_camera_preview_scroll)
 
-        self.piv_preview = QLabel()
-        self.piv_preview.setAlignment(Qt.AlignCenter)
+        self.piv_preview = ScientificImageViewer("粒子追踪与速度场结果")
         self.piv_preview.setMinimumSize(self._sp(400), self._sp(300))
         self.piv_preview.setStyleSheet(
             "border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px;"
@@ -5427,8 +6441,7 @@ class BubbleTomographyGUI(QMainWindow):
         )
         self.particle_camera_preview_layout.addWidget(self.particle_single_preview_title)
 
-        self.particle_single_preview_label = QLabel("未加载")
-        self.particle_single_preview_label.setAlignment(Qt.AlignCenter)
+        self.particle_single_preview_label = ScientificImageViewer("未加载")
         self.particle_single_preview_label.setMinimumSize(self._sp(420), self._sp(300))
         self.particle_single_preview_label.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding
@@ -5668,19 +6681,26 @@ class BubbleTomographyGUI(QMainWindow):
             self.particle_single_preview_label.setText(f"{cam_id}\n第{frame_num}帧未加载")
             return
 
-        pixmap = self._ie_ndarray_to_pixmap(img)
-        if pixmap:
-            self.particle_single_preview_label.setText("")
-            self.particle_single_preview_label.setPixmap(
-                pixmap.scaled(
-                    self.particle_single_preview_label.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
+        if isinstance(self.particle_single_preview_label, ScientificImageViewer):
+            self.particle_single_preview_label.set_image_array(
+                img, f"{cam_id} | 第{frame_num}帧"
             )
         else:
-            self.particle_single_preview_label.setPixmap(QPixmap())
-            self.particle_single_preview_label.setText(f"{cam_id}\n第{frame_num}帧预览失败")
+            pixmap = self._ie_ndarray_to_pixmap(img)
+            if pixmap:
+                self.particle_single_preview_label.setText("")
+                self.particle_single_preview_label.setPixmap(
+                    pixmap.scaled(
+                        self.particle_single_preview_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                )
+            else:
+                self.particle_single_preview_label.setPixmap(QPixmap())
+                self.particle_single_preview_label.setText(
+                    f"{cam_id}\n第{frame_num}帧预览失败"
+                )
 
     # ---- 标定模式切换 ----
 
@@ -5934,6 +6954,15 @@ class BubbleTomographyGUI(QMainWindow):
             "标定结果已保存，可用于单相机射线追踪三维重建。"
         )
         self.calib_result_text.setPlainText(report)
+        output_dir = self._module_output_dirs.get("calibration", "")
+        if output_dir:
+            with open(os.path.join(output_dir, "stereo_calibration.json"), "w", encoding="utf-8") as handle:
+                json.dump(self.stereo_params, handle, ensure_ascii=False, indent=2)
+            self.calib_preview_label.figure.savefig(
+                os.path.join(output_dir, "stereo_calibration.png"),
+                dpi=150,
+            )
+            self._watch_and_refresh_output(output_dir)
         self.statusBar().showMessage(
             f"单相机标定完? RMS={params.rms_error:.4f}px"
         )
@@ -5972,6 +7001,9 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请输入大于 0 的实际尺寸")
             return
 
+        output_dir = self._prepare_module_output(
+            "calibration", "单相机标定", source_dir=os.path.dirname(image_path)
+        )
         image_h, image_w = image.shape[:2]
         mm_per_px = float(actual_size / distance_px)
         px_per_mm = float(distance_px / actual_size)
@@ -6010,6 +7042,13 @@ class BubbleTomographyGUI(QMainWindow):
             "后续重建将使用该像素尺度。"
         )
         self.calib_result_text.setPlainText(report)
+        with open(os.path.join(output_dir, "single_camera_calibration.json"), "w", encoding="utf-8") as handle:
+            json.dump(self.single_camera_params, handle, ensure_ascii=False, indent=2)
+        self.calib_preview_label.figure.savefig(
+            os.path.join(output_dir, "single_camera_calibration.png"),
+            dpi=150,
+        )
+        self._watch_and_refresh_output(output_dir)
         self.statusBar().showMessage(
             f"单相机标定完? {mm_per_px:.6f} mm/px"
         )
@@ -6206,6 +7245,7 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "左右相机各至少需要 3 张图像")
             return
 
+        self._prepare_module_output("calibration", "双目标定")
         pattern_type = self._pattern_type_items().get(
             self.pattern_type_combo.currentText(), "checkerboard"
         )
@@ -6457,7 +7497,7 @@ class BubbleTomographyGUI(QMainWindow):
         preview_path = os.path.join(
             self.visualizer.output_dir, 'calib_images_preview.png'
         )
-        cv2.imwrite(preview_path, canvas)
+        robust_imwrite(preview_path, canvas)
         pixmap = QPixmap(preview_path)
         self.calib_preview_label.setPixmap(pixmap.scaled(
             self.calib_preview_label.size(), Qt.KeepAspectRatio,
@@ -6490,6 +7530,7 @@ class BubbleTomographyGUI(QMainWindow):
         square_size = self.square_size_spin.value()
         level_separation = self.level_separation_spin.value()
 
+        self._prepare_module_output("calibration", "相机标定")
         self.calibrator = MultiCameraCalibrator(
             pattern_type=pattern_type,
             pattern_size=pattern_size,
@@ -6517,6 +7558,9 @@ class BubbleTomographyGUI(QMainWindow):
 
         report = self.calibrator.get_calibration_report()
         self.calib_result_text.setPlainText(report)
+        output_dir = self._module_output_dirs.get("calibration", "")
+        if output_dir:
+            self.calibrator.save_results(output_dir)
 
         # 保存标定结果预?
         try:
@@ -6531,6 +7575,7 @@ class BubbleTomographyGUI(QMainWindow):
             )
         except Exception:
             pass
+        self._watch_and_refresh_output(output_dir)
 
         QMessageBox.information(self, "完成",
                                 f"成功标定 {len(results)} 个相机！\n"
@@ -6578,6 +7623,7 @@ class BubbleTomographyGUI(QMainWindow):
         )
         if not root_dir:
             return
+        self.bubble_src_dir = root_dir
 
         # 扏子文件夹作为时间?
         subdirs = sorted([
@@ -6743,11 +7789,8 @@ class BubbleTomographyGUI(QMainWindow):
         preview_path = os.path.join(
             self.visualizer.output_dir, f'bubble_preview_t{idx}.png'
         )
-        cv2.imwrite(preview_path, combined)
-        pixmap = QPixmap(preview_path)
-        self.proj_preview_label.setPixmap(pixmap.scaled(
-            self.proj_preview_label.size(), Qt.KeepAspectRatio,
-            Qt.SmoothTransformation))
+        robust_imwrite(preview_path, combined)
+        self.proj_preview_label.set_image_array(combined, f"Time: {name}")
 
     def _on_bubble_tp_changed(self, idx):
         """滑块变更"""
@@ -6808,6 +7851,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         cam_ids = list(self.calibration_results.keys())
         self.camera_bubble_images = {}
+        self.bubble_single_paths = []
 
         for cam_id in cam_ids:
             file_path, _ = QFileDialog.getOpenFileName(
@@ -6818,6 +7862,7 @@ class BubbleTomographyGUI(QMainWindow):
                 img = cv2.imread(file_path, cv2.IMREAD_COLOR)
                 if img is not None:
                     self.camera_bubble_images[cam_id] = img
+                    self.bubble_single_paths.append(file_path)
 
         if self.camera_bubble_images:
             self.bubble_status_label.setText(
@@ -6875,6 +7920,10 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请先加载气泡图像")
             return
 
+        self._prepare_module_output(
+            "reconstruction",
+            f"三维重建_{self.recon_algo_combo.currentText()}",
+        )
         # Preprocess by camera parameters
         self.image_processor = BubbleImageProcessor(
             background_method=self.bg_method_combo.currentText(),
@@ -6917,9 +7966,7 @@ class BubbleTomographyGUI(QMainWindow):
             )
             pixmap = QPixmap(os.path.join(
                 self.visualizer.output_dir, 'proj_preview.png'))
-            self.proj_preview_label.setPixmap(pixmap.scaled(
-                self.proj_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            self.proj_preview_label.setPixmap(pixmap)
         except Exception:
             pass
 
@@ -6967,6 +8014,10 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请先批量加载气泡图像序列")
             return
 
+        self._prepare_module_output(
+            "reconstruction",
+            f"批量三维重建_{self.recon_algo_combo.currentText()}",
+        )
         # Create projections
         camera_params_for_preprocess = {}
         camera_params_for_recon = {}
@@ -7046,6 +8097,7 @@ class BubbleTomographyGUI(QMainWindow):
             f"点云: {len(result['points'])} pts"
         )
         self.bubble_batch_progress.setValue(len(self.bubble_batch_results))
+        self._file_tree_panel.schedule_refresh(150)
 
     def _on_batch_all_done(self, all_results):
         """批量重建全部完成。"""
@@ -7065,6 +8117,9 @@ class BubbleTomographyGUI(QMainWindow):
         )
         self.content_stack.setCurrentIndex(2)
         self._nav_buttons["reconstruction"].setChecked(True)
+        self._watch_and_refresh_output(
+            self._module_output_dirs.get("reconstruction", "")
+        )
         QTimer.singleShot(500, self._show_report)
 
     def _on_batch_error(self, msg):
@@ -7093,6 +8148,9 @@ class BubbleTomographyGUI(QMainWindow):
 
         self.content_stack.setCurrentIndex(2)
         self._nav_buttons["reconstruction"].setChecked(True)
+        self._watch_and_refresh_output(
+            self._module_output_dirs.get("reconstruction", "")
+        )
         QTimer.singleShot(500, self._show_report)
 
     def _on_recon_error(self, msg):
@@ -7334,9 +8392,8 @@ class BubbleTomographyGUI(QMainWindow):
         self.rt_img_path_label.setStyleSheet("color: gray;")
         img_layout.addWidget(self.rt_img_path_label)
 
-        self.rt_img_preview = QLabel()
+        self.rt_img_preview = ScientificImageViewer("未加载图像")
         self.rt_img_preview.setMaximumHeight(self._sp(150))
-        self.rt_img_preview.setAlignment(Qt.AlignCenter)
         self.rt_img_preview.setStyleSheet("border: 1px dashed #ccc;")
         img_layout.addWidget(self.rt_img_preview)
 
@@ -7469,8 +8526,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.rt_log.setPlaceholderText("光线追踪重建日志")
         mid_splitter.addWidget(self.rt_log)
 
-        self.rt_preview_label = QLabel()
-        self.rt_preview_label.setAlignment(Qt.AlignCenter)
+        self.rt_preview_label = ScientificImageViewer("光线追踪结果预览")
         self.rt_preview_label.setMinimumSize(self._sp(400), self._sp(300))
         self.rt_preview_label.setStyleSheet(
             "border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px;"
@@ -7566,6 +8622,7 @@ class BubbleTomographyGUI(QMainWindow):
             return
 
         try:
+            self.rt_image_path = file_path
             self.rt_processor = RaytraceProcessor()
             img = self.rt_processor.load_image(file_path)
             self.rt_img_path_label.setText(
@@ -7584,9 +8641,12 @@ class BubbleTomographyGUI(QMainWindow):
             else:
                 arr = (img * 255).astype(np.uint8)
                 qimg = QImage(arr.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg).scaled(
-                new_w, new_h, Qt.KeepAspectRatio)
-            self.rt_img_preview.setPixmap(pixmap)
+            if isinstance(self.rt_img_preview, ScientificImageViewer):
+                self.rt_img_preview.set_image_array(arr, os.path.basename(file_path), bgr=False)
+            else:
+                pixmap = QPixmap.fromImage(qimg).scaled(
+                    new_w, new_h, Qt.KeepAspectRatio)
+                self.rt_img_preview.setPixmap(pixmap)
 
             self._rt_log_msg(f"图像加载成功: {os.path.basename(file_path)} ({w}x{h})")
             self.rt_status_label.setText("图像已加载，可以开始计算")
@@ -7604,6 +8664,10 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "请先加载气泡图像")
             return
 
+        self._prepare_module_output(
+            "raytrace",
+            "射线追踪" if step == "all" else f"射线追踪_step{step}",
+        )
         kwargs = {}
         if step == 2 or step == 'all':
             kwargs = {
@@ -7642,6 +8706,9 @@ class BubbleTomographyGUI(QMainWindow):
         self.statusBar().showMessage(f"光线追踪: {msg}")
         # Refresh 3D preview automatically
         QTimer.singleShot(300, self._show_rt_3d_view)
+        self._watch_and_refresh_output(
+            self._module_output_dirs.get("raytrace", "")
+        )
 
     def _on_rt_error(self, err_msg):
         self._set_rt_buttons_enabled(True)
@@ -8021,11 +9088,8 @@ class BubbleTomographyGUI(QMainWindow):
         preview_path = os.path.join(
             self.visualizer.output_dir, f'particle_preview_t{idx}.png'
         )
-        cv2.imwrite(preview_path, combined)
-        pixmap = QPixmap(preview_path)
-        self.piv_preview.setPixmap(pixmap.scaled(
-            self.piv_preview.size(), Qt.KeepAspectRatio,
-            Qt.SmoothTransformation))
+        robust_imwrite(preview_path, combined)
+        self.piv_preview.set_image_array(combined, f"Particle: {name}")
 
     def _on_piv_tp_changed(self, idx):
         if idx < 0:
@@ -8081,6 +9145,7 @@ class BubbleTomographyGUI(QMainWindow):
                 img = cv2.imread(file_path, cv2.IMREAD_COLOR)
                 if img is not None:
                     target_dict[cam_id] = img
+                    self.particle_manual_paths.append(file_path)
         if target_dict:
             self.particle_status.setText(
                 f"帧 {frame_num}: 已加载 {len(target_dict)} 个相机图像"
@@ -8098,6 +9163,7 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请先加载两帧粒子图像")
             return
 
+        self._prepare_module_output("particle", "三维粒子重建")
         config = TriangulationConfig(
             blob_min_area=self.p_min_area.value(),
             blob_max_area=self.p_max_area.value(),
@@ -8135,9 +9201,7 @@ class BubbleTomographyGUI(QMainWindow):
                 )
                 pixmap = QPixmap(os.path.join(
                     self.visualizer.output_dir, 'particles_3d.png'))
-                self.piv_preview.setPixmap(pixmap.scaled(
-                    self.piv_preview.size(), Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation))
+                self.piv_preview.setPixmap(pixmap)
 
             QMessageBox.information(self, "完成",
                 f"粒子重建完成!\n"
@@ -8148,6 +9212,9 @@ class BubbleTomographyGUI(QMainWindow):
             self.piv_log.append(f"错误: {e}")
         finally:
             self.progress_bar.setVisible(False)
+            self._watch_and_refresh_output(
+                self._module_output_dirs.get("particle", "")
+            )
 
     def _run_piv_batch(self):
         """计算 PIV 速度场。"""
@@ -8164,6 +9231,7 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "至少需要 2 个时间点才能计算速度场")
             return
 
+        self._prepare_module_output("particle", "三维PIV")
         dt = self.piv_dt.value()
         interrog_size = (
             self.piv_interrog.value(),
@@ -8234,6 +9302,7 @@ class BubbleTomographyGUI(QMainWindow):
                     f"平均速度: {speed.mean():.2f} mm/s"
                 )
         self.piv_batch_progress.setValue(len(self.piv_batch_results))
+        self._file_tree_panel.schedule_refresh(150)
 
     def _on_piv_batch_all_done(self, all_results):
         """批量PIV全部完成"""
@@ -8254,6 +9323,9 @@ class BubbleTomographyGUI(QMainWindow):
         if all_results:
             first_idx = sorted(all_results.keys())[0]
             self._show_piv_result_for_timepoint(first_idx)
+        self._watch_and_refresh_output(
+            self._module_output_dirs.get("particle", "")
+        )
 
     def _on_piv_batch_error(self, msg):
         self.piv_batch_progress.setVisible(False)
@@ -8275,9 +9347,7 @@ class BubbleTomographyGUI(QMainWindow):
             )
             pixmap = QPixmap(os.path.join(
                 self.visualizer.output_dir, f'piv_report_t{tp_idx}.png'))
-            self.piv_preview.setPixmap(pixmap.scaled(
-                self.piv_preview.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            self.piv_preview.setPixmap(pixmap)
             self.visualizer.save_velocity_field_vtk(
                 result['velocity_result']['velocity_field'],
                 result['velocity_result']['grid_positions'],
@@ -8341,9 +9411,7 @@ class BubbleTomographyGUI(QMainWindow):
             )
             pixmap = QPixmap(os.path.join(
                 self.visualizer.output_dir, 'piv_report.png'))
-            self.piv_preview.setPixmap(pixmap.scaled(
-                self.piv_preview.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            self.piv_preview.setPixmap(pixmap)
 
             # 导出VTK
             self.visualizer.save_velocity_field_vtk(
@@ -8437,7 +9505,7 @@ class BubbleTomographyGUI(QMainWindow):
         btn_dst = QPushButton("输出目录...")
         btn_dst.clicked.connect(self._piv2d_pick_dst_dir)
         batch_layout.addWidget(btn_dst, 2, 0)
-        self.piv2d_dst_label = QLabel("未选择")
+        self.piv2d_dst_label = QLabel("自动：当前图像目录")
         self.piv2d_dst_label.setWordWrap(True)
         self.piv2d_dst_label.setStyleSheet("color: gray;")
         batch_layout.addWidget(self.piv2d_dst_label, 3, 0)
@@ -8701,8 +9769,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_timeline_list.currentRowChanged.connect(self._piv2d_on_timeline_selected)
         timeline_layout.addWidget(self.piv2d_timeline_list, stretch=1)
 
-        self.piv2d_timeline_preview_label = QLabel("时间组选中预览")
-        self.piv2d_timeline_preview_label.setAlignment(Qt.AlignCenter)
+        self.piv2d_timeline_preview_label = ScientificImageViewer("时间组选中预览")
         self.piv2d_timeline_preview_label.setMinimumSize(self._sp(220), self._sp(150))
         self.piv2d_timeline_preview_label.setStyleSheet(
             "border: 1px solid #ccc; background: #f8f8f8;"
@@ -8792,6 +9859,9 @@ class BubbleTomographyGUI(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择二维PIV输入目录")
         if d:
             self.piv2d_src_dir = d
+            if not self.piv2d_dst_dir_manual:
+                self.piv2d_dst_dir = ""
+                self.piv2d_dst_label.setText("自动：当前图像目录")
             self.piv2d_src_label.setText(d)
             self.piv2d_src_label.setStyleSheet("")
             groups = self._piv2d_scan_time_groups(d)
@@ -8809,6 +9879,7 @@ class BubbleTomographyGUI(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择二维PIV输出目录")
         if d:
             self.piv2d_dst_dir = d
+            self.piv2d_dst_dir_manual = True
             self.piv2d_dst_label.setText(d)
             self.piv2d_dst_label.setStyleSheet("")
             self.piv2d_log.append(f"输出目录: {d}")
@@ -9054,6 +10125,15 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "提示", "图像读取失败")
             return
 
+        output_dir = self._prepare_module_output(
+            "piv2d",
+            "二维PIV",
+            source_dir=os.path.dirname(self.piv2d_frame1_path),
+            manual_dir=self.piv2d_dst_dir if self.piv2d_dst_dir_manual else "",
+            use_visualizer=False,
+        )
+        self.piv2d_dst_dir = output_dir
+        self.piv2d_dst_label.setText(output_dir)
         self._piv2d_start_processing_timer("单组二维PIV", 0)
         try:
             calculator = PIV2DCalculator(self._piv2d_get_config())
@@ -9064,6 +10144,15 @@ class BubbleTomographyGUI(QMainWindow):
             self._piv2d_last_image = img1
             self._piv2d_show_vector_result(img1, result, "单组速度矢量")
             self._piv2d_set_single_result_timeline()
+            stem1 = Path(self.piv2d_frame1_path).stem
+            stem2 = Path(self.piv2d_frame2_path).stem
+            overlay_path = os.path.join(
+                output_dir, f"{stem1}_to_{stem2}_overlay.png"
+            )
+            if not robust_imwrite(
+                overlay_path, calculator.render_overlay(img1, result)
+            ):
+                raise IOError(f"无法写入二维PIV结果: {overlay_path}")
 
             self.piv2d_log.append("=== 二维PIV单组计算完成 ===")
             self.piv2d_log.append(
@@ -9086,13 +10175,11 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.critical(self, "二维PIV错误", str(e))
         finally:
             self._piv2d_finish_processing_timer()
+            self._watch_and_refresh_output(output_dir)
 
     def _piv2d_run_batch(self):
         if not self.piv2d_src_dir or not os.path.isdir(self.piv2d_src_dir):
             QMessageBox.warning(self, "提示", "请先选择输入目录")
-            return
-        if not self.piv2d_dst_dir:
-            QMessageBox.warning(self, "提示", "请先选择输出目录")
             return
         if any(group.get("source_type") == "subdir" for group in self.piv2d_time_groups):
             QMessageBox.information(
@@ -9103,7 +10190,15 @@ class BubbleTomographyGUI(QMainWindow):
                 "跨时间组双帧请在右侧时间轴中选择后使用“运行单组二维PIV”。"
             )
             return
-        os.makedirs(self.piv2d_dst_dir, exist_ok=True)
+
+        self.piv2d_dst_dir = self._prepare_module_output(
+            "piv2d",
+            "批量二维PIV",
+            source_dir=self.piv2d_src_dir,
+            manual_dir=self.piv2d_dst_dir if self.piv2d_dst_dir_manual else "",
+            use_visualizer=False,
+        )
+        self.piv2d_dst_label.setText(self.piv2d_dst_dir)
 
         batch_files = self._piv2d_batch_files()
         if len(batch_files) < 2:
@@ -9172,6 +10267,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.progress_bar.setValue(pct)
         self.progress_bar.setFormat(f"批量二维PIV: {pct}%")
         self.piv2d_log.append(f"[{done}/{total}] {name}")
+        self._file_tree_panel.schedule_refresh(150)
 
     def _piv2d_on_batch_finished(self, success, total, outputs):
         self.piv2d_progress.setVisible(False)
@@ -9180,6 +10276,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_stop_btn.setEnabled(False)
         self.piv2d_log.append(f"批量二维PIV完成: {success}/{total}")
         self._piv2d_set_batch_result_timeline(outputs)
+        self._watch_and_refresh_output(self.piv2d_dst_dir)
         QMessageBox.information(
             self,
             "完成",
@@ -9481,6 +10578,257 @@ class BubbleTomographyGUI(QMainWindow):
         )
 
     # ------------------------------------------------------------
+    #  PTV 粒子跟踪测速页面
+    # ------------------------------------------------------------
+
+    def _create_ptv_page(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(self._sp(12), self._sp(12), self._sp(12), self._sp(12))
+        outer.setSpacing(self._sp(8))
+
+        title = QLabel("PTV 粒子跟踪测速")
+        title.setStyleSheet("font-size: 20px; font-weight: bold;")
+        outer.addWidget(title)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(self._sp(7))
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setMinimumWidth(self._sp(280))
+        settings = QWidget()
+        form = QVBoxLayout(settings)
+
+        input_group = QGroupBox("三维粒子坐标序列")
+        input_layout = QVBoxLayout(input_group)
+        self.ptv_input_label = QLabel("尚未导入。支持每帧一个 N×3 的 NPY、NPZ、CSV 或 TXT 文件。")
+        self.ptv_input_label.setWordWrap(True)
+        input_layout.addWidget(self.ptv_input_label)
+        load_btn = QPushButton("导入坐标序列...")
+        load_btn.clicked.connect(self._ptv_load_sequence)
+        input_layout.addWidget(load_btn)
+        form.addWidget(input_group)
+
+        algorithm_group = QGroupBox("跟踪参数")
+        algorithm_layout = QGridLayout(algorithm_group)
+        algorithm_layout.addWidget(QLabel("算法:"), 0, 0)
+        self.ptv_method_combo = QComboBox()
+        self.ptv_method_combo.addItem("四帧前后跟踪", "forward_backward")
+        self.ptv_method_combo.addItem("最近邻", "nearest_neighbor")
+        self.ptv_method_combo.addItem("松弛法", "relaxation")
+        self.ptv_method_combo.addItem("Shake-The-Box", "stb")
+        algorithm_layout.addWidget(self.ptv_method_combo, 0, 1)
+
+        algorithm_layout.addWidget(QLabel("最大位移 (mm/帧):"), 1, 0)
+        self.ptv_max_displacement_spin = QDoubleSpinBox()
+        self.ptv_max_displacement_spin.setRange(0.001, 100000.0)
+        self.ptv_max_displacement_spin.setDecimals(3)
+        self.ptv_max_displacement_spin.setValue(5.0)
+        algorithm_layout.addWidget(self.ptv_max_displacement_spin, 1, 1)
+
+        algorithm_layout.addWidget(QLabel("最短轨迹 (帧):"), 2, 0)
+        self.ptv_min_track_spin = QSpinBox()
+        self.ptv_min_track_spin.setRange(2, 10000)
+        self.ptv_min_track_spin.setValue(4)
+        algorithm_layout.addWidget(self.ptv_min_track_spin, 2, 1)
+
+        algorithm_layout.addWidget(QLabel("帧间隔 dt (s):"), 3, 0)
+        self.ptv_dt_spin = QDoubleSpinBox()
+        self.ptv_dt_spin.setRange(0.000001, 1000.0)
+        self.ptv_dt_spin.setDecimals(6)
+        self.ptv_dt_spin.setValue(0.001)
+        algorithm_layout.addWidget(self.ptv_dt_spin, 3, 1)
+
+        algorithm_layout.addWidget(QLabel("松弛迭代次数:"), 4, 0)
+        self.ptv_relax_iterations_spin = QSpinBox()
+        self.ptv_relax_iterations_spin.setRange(1, 1000)
+        self.ptv_relax_iterations_spin.setValue(10)
+        algorithm_layout.addWidget(self.ptv_relax_iterations_spin, 4, 1)
+        form.addWidget(algorithm_group)
+
+        self.ptv_run_btn = QPushButton("开始 PTV 跟踪")
+        self.ptv_run_btn.setMinimumHeight(self._sp(38))
+        self.ptv_run_btn.clicked.connect(self._ptv_run)
+        form.addWidget(self.ptv_run_btn)
+        form.addStretch()
+        settings_scroll.setWidget(settings)
+        splitter.addWidget(settings_scroll)
+
+        results = QWidget()
+        results_layout = QVBoxLayout(results)
+        self.ptv_figure = Figure(figsize=(7, 5), tight_layout=True)
+        self.ptv_canvas = FigureCanvas(self.ptv_figure)
+        self.ptv_axes = self.ptv_figure.add_subplot(111, projection="3d")
+        self.ptv_axes.set_xlabel("X (mm)")
+        self.ptv_axes.set_ylabel("Y (mm)")
+        self.ptv_axes.set_zlabel("Z (mm)")
+        results_layout.addWidget(self.ptv_canvas, stretch=1)
+        self.ptv_log = QTextEdit()
+        self.ptv_log.setReadOnly(True)
+        self.ptv_log.setMaximumHeight(self._sp(170))
+        self.ptv_log.setPlaceholderText("PTV 运行日志与统计结果")
+        results_layout.addWidget(self.ptv_log)
+        splitter.addWidget(results)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([self._sp(320), self._sp(760)])
+
+        outer.addWidget(splitter, stretch=1)
+        self.ptv_files = []
+        self.ptv_frames_particles = {}
+        self.ptv_last_result = None
+        self.ptv_last_velocity = None
+        self.content_stack.addWidget(page)
+
+    @staticmethod
+    def _natural_sort_key(path):
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(path))
+        ]
+
+    @staticmethod
+    def _ptv_read_particle_file(path):
+        suffix = Path(path).suffix.lower()
+        if suffix == ".npy":
+            array = np.load(path, allow_pickle=False)
+        elif suffix == ".npz":
+            with np.load(path, allow_pickle=False) as archive:
+                preferred = ("particles", "positions", "points", "xyz")
+                key = next((name for name in preferred if name in archive), None)
+                if key is None:
+                    key = archive.files[0] if archive.files else None
+                if key is None:
+                    raise ValueError("NPZ 文件中没有数组")
+                array = archive[key]
+        else:
+            try:
+                array = np.loadtxt(path, delimiter=",", ndmin=2)
+            except ValueError:
+                array = np.loadtxt(path, ndmin=2)
+        array = np.asarray(array, dtype=np.float64)
+        if array.ndim != 2 or array.shape[1] < 3:
+            raise ValueError(f"坐标数组应为 N×3，实际为 {array.shape}")
+        array = array[:, :3]
+        return array[np.all(np.isfinite(array), axis=1)]
+
+    def _ptv_load_sequence(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择按时间排序的三维粒子坐标文件",
+            "",
+            "坐标文件 (*.npy *.npz *.csv *.txt)",
+        )
+        if not files:
+            return
+        files = sorted(files, key=self._natural_sort_key)
+        frames = {}
+        try:
+            for frame_index, path in enumerate(files):
+                frames[frame_index] = self._ptv_read_particle_file(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "PTV 导入失败", f"{Path(path).name}: {exc}")
+            return
+        self.ptv_files = files
+        self.ptv_frames_particles = frames
+        particle_count = sum(len(points) for points in frames.values())
+        self.ptv_input_label.setText(
+            f"已导入 {len(files)} 帧，共 {particle_count} 个三维粒子点\n"
+            f"{Path(files[0]).parent}"
+        )
+        self.ptv_log.append(f"已导入 {len(files)} 帧粒子坐标。")
+
+    def _ptv_run(self):
+        if len(self.ptv_frames_particles) < 2:
+            QMessageBox.warning(self, "PTV", "请先导入至少两帧三维粒子坐标。")
+            return
+        method = self.ptv_method_combo.currentData()
+        if method == "forward_backward" and len(self.ptv_frames_particles) < 4:
+            QMessageBox.warning(self, "PTV", "四帧前后跟踪至少需要四帧数据。")
+            return
+        config = PTVConfig(
+            tracking_method=method,
+            max_displacement=self.ptv_max_displacement_spin.value(),
+            min_track_length=self.ptv_min_track_spin.value(),
+            relaxation_iterations=self.ptv_relax_iterations_spin.value(),
+            dt=self.ptv_dt_spin.value(),
+        )
+        self.ptv_run_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = PTVTracker(config).track(self.ptv_frames_particles)
+            velocity = PTVVelocityCalculator(dt=config.dt).compute_from_tracks(
+                result.tracks
+            )
+            self.ptv_last_result = result
+            self.ptv_last_velocity = velocity
+            self._ptv_plot_result(result)
+            output_dir = self._next_processing_output_dir(
+                str(Path(self.ptv_files[0]).parent), "ptv"
+            )
+            self._ptv_save_result(output_dir, result, velocity)
+            self._module_output_dirs["ptv"] = output_dir
+            self._file_tree_panel.watch_extra_dir(output_dir)
+            self._file_tree_panel.refresh()
+            self.ptv_log.append(result.summary())
+            self.ptv_log.append(velocity.summary())
+            self.ptv_log.append(f"结果已保存: {output_dir}")
+        except Exception as exc:
+            self.ptv_log.append(f"PTV 处理失败: {exc}")
+            QMessageBox.critical(self, "PTV 处理失败", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.ptv_run_btn.setEnabled(True)
+
+    def _ptv_plot_result(self, result):
+        self.ptv_figure.clear()
+        self.ptv_axes = self.ptv_figure.add_subplot(111, projection="3d")
+        for track in result.tracks:
+            points = np.asarray(track.positions)
+            if len(points):
+                self.ptv_axes.plot(points[:, 0], points[:, 1], points[:, 2], linewidth=1.2)
+                self.ptv_axes.scatter(
+                    points[:, 0], points[:, 1], points[:, 2], s=8
+                )
+        self.ptv_axes.set_title(f"PTV trajectories ({result.n_tracks})")
+        self.ptv_axes.set_xlabel("X (mm)")
+        self.ptv_axes.set_ylabel("Y (mm)")
+        self.ptv_axes.set_zlabel("Z (mm)")
+        self.ptv_canvas.draw_idle()
+
+    @staticmethod
+    def _ptv_save_result(output_dir, result, velocity):
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        track_rows = []
+        for track in result.tracks:
+            for frame_index, position in zip(track.frame_indices, track.positions):
+                track_rows.append(
+                    [track.particle_id, frame_index, position[0], position[1], position[2], track.quality]
+                )
+        np.savetxt(
+            output / "ptv_tracks.csv",
+            np.asarray(track_rows, dtype=float).reshape((-1, 6)),
+            delimiter=",",
+            header="track_id,frame,x_mm,y_mm,z_mm,quality",
+            comments="",
+        )
+        velocity_rows = np.column_stack(
+            (velocity.track_ids, velocity.positions, velocity.velocities)
+        ) if len(velocity.positions) else np.empty((0, 7))
+        np.savetxt(
+            output / "ptv_velocity.csv",
+            velocity_rows,
+            delimiter=",",
+            header="track_id,x_mm,y_mm,z_mm,u_mm_s,v_mm_s,w_mm_s",
+            comments="",
+        )
+        with (output / "ptv_summary.txt").open("w", encoding="utf-8") as stream:
+            stream.write(result.summary() + "\n\n" + velocity.summary() + "\n")
+
+    # ------------------------------------------------------------
     #  通用图像处理页面（Page 5）— DaVis 10 风格三栏布局
     # ------------------------------------------------------------
 
@@ -9531,6 +10879,13 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_reset_btn.clicked.connect(self._ie_reset_workflow)
         tb_lay.addWidget(self.ie_reset_btn)
 
+        self.ie_crop_select_btn = QPushButton("框选裁剪")
+        self.ie_crop_select_btn.setCheckable(True)
+        self.ie_crop_select_btn.setFixedWidth(self._sp(96))
+        self.ie_crop_select_btn.setToolTip("在右侧源图像中按住鼠标左键框选裁剪区域")
+        self.ie_crop_select_btn.toggled.connect(self._ie_toggle_crop_selection)
+        tb_lay.addWidget(self.ie_crop_select_btn)
+
         tb_lay.addSpacing(self._sp(16))
 
         # 缩放控件
@@ -9574,20 +10929,35 @@ class BubbleTomographyGUI(QMainWindow):
         # ===== 三栏主体 =====
         body_splitter = QSplitter(Qt.Horizontal)
         self.ie_body_splitter = body_splitter
-        body_splitter.setStyleSheet("QSplitter::handle { background: #444; width: 2px; }")
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.setOpaqueResize(True)
+        body_splitter.setHandleWidth(self._sp(7))
+        body_splitter.setStyleSheet(
+            "QSplitter::handle:horizontal { background: #555; }"
+            "QSplitter::handle:horizontal:hover { background: #2196F3; }"
+        )
 
         # --- 左栏：操作面板 ---
         ops_panel = self._ie_create_ops_panel(_IE)
+        ops_panel.setMinimumWidth(self._sp(150))
+        ops_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         body_splitter.addWidget(ops_panel)
 
         # --- 中栏：工作流画布 ---
         canvas_widget = self._ie_create_workflow_canvas(_IE)
+        canvas_widget.setMinimumWidth(self._sp(180))
+        canvas_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         body_splitter.addWidget(canvas_widget)
 
         # --- 右栏：查看器区域 ---
         viewer_widget = self._ie_create_viewer_area()
+        viewer_widget.setMinimumWidth(self._sp(280))
+        viewer_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         body_splitter.addWidget(viewer_widget)
 
+        body_splitter.setStretchFactor(0, 1)
+        body_splitter.setStretchFactor(1, 2)
+        body_splitter.setStretchFactor(2, 3)
         body_splitter.setSizes([self._sp(220), self._sp(320), self._sp(520)])
         outer.addWidget(body_splitter, stretch=1)
 
@@ -9665,6 +11035,9 @@ class BubbleTomographyGUI(QMainWindow):
             "🔢 运算处理": [
                 ("arithmetic", "图像加减", "标量或双图运算"),
             ],
+            "🫧 气泡分析": [
+                ("bub_analysis", "BubAnalysis 气泡识别", "识别、分离并统计气泡尺寸"),
+            ],
         }
 
         self._ie_algo_cards = {}  # key -> card widget
@@ -9687,7 +11060,6 @@ class BubbleTomographyGUI(QMainWindow):
         scroll.setWidget(scroll_content)
         lay.addWidget(scroll, stretch=1)
 
-        panel.setFixedWidth(self._sp(220))
         return panel
 
     def _ie_make_algo_card(self, key, label, desc):
@@ -9700,6 +11072,7 @@ class BubbleTomographyGUI(QMainWindow):
         """中栏：工作流画布 — 垂直节点卡片流，支持拖拽添加和节点排序。"""
         canvas = _IEWorkflowCanvas(self._sp)
         self.ie_workflow_canvas = canvas
+        canvas.setMinimumWidth(self._sp(180))
         canvas.setStyleSheet("background: #1e1e1e;")
         canvas.node_drop_requested.connect(self._ie_add_node)
         canvas.node_move_requested.connect(self._ie_move_node)
@@ -9742,6 +11115,7 @@ class BubbleTomographyGUI(QMainWindow):
         """右栏：查看器区域 — 上下分割源图/结果。"""
         viewer = QWidget()
         self.ie_viewer = viewer
+        viewer.setMinimumWidth(self._sp(280))
         viewer.setStyleSheet("background: #1e1e1e;")
         v_lay = QVBoxLayout(viewer)
         v_lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
@@ -9851,14 +11225,31 @@ class BubbleTomographyGUI(QMainWindow):
         )
         fb_lay.addWidget(self.ie_filename_edit, stretch=1)
 
-        v_lay.addWidget(source_bar)
+        self.ie_source_scroll = QScrollArea()
+        self.ie_source_scroll.setWidgetResizable(False)
+        self.ie_source_scroll.setFrameShape(QFrame.NoFrame)
+        self.ie_source_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.ie_source_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.ie_source_scroll.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        source_bar.adjustSize()
+        self.ie_source_scroll.setFixedHeight(
+            source_bar.sizeHint().height() + self._sp(12)
+        )
+        self.ie_source_scroll.setWidget(source_bar)
+        v_lay.addWidget(self.ie_source_scroll)
         v_lay.addWidget(fname_bar)
 
         # 上下分割的图像查看器
         viewer_splitter = QSplitter(Qt.Vertical)
         self.ie_viewer_splitter = viewer_splitter
+        viewer_splitter.setChildrenCollapsible(False)
+        viewer_splitter.setOpaqueResize(True)
+        viewer_splitter.setHandleWidth(self._sp(7))
         viewer_splitter.setStyleSheet(
-            "QSplitter::handle { background: #444; height: 2px; }"
+            "QSplitter::handle:vertical { background: #555; }"
+            "QSplitter::handle:vertical:hover { background: #2196F3; }"
         )
 
         # 源图区
@@ -9878,10 +11269,11 @@ class BubbleTomographyGUI(QMainWindow):
         of_lay.addWidget(orig_header)
 
         self.ie_orig_label = _IEImageViewer("（未加载）", self._sp)
-        self.ie_orig_label.setMinimumSize(self._sp(300), self._sp(200))
+        self.ie_orig_label.setMinimumSize(self._sp(220), self._sp(120))
         self.ie_orig_label.setStyleSheet(
             "border: 1px solid #333; background: #111; color: #666; font-size: 13px;"
         )
+        self.ie_orig_label.roi_selected.connect(self._ie_apply_selected_crop)
         of_lay.addWidget(self.ie_orig_label, stretch=1)
 
         # 坐标/像素值信息条
@@ -9921,12 +11313,24 @@ class BubbleTomographyGUI(QMainWindow):
         )
         rf_lay.addWidget(result_header)
 
+        self.ie_result_tabs = QTabWidget()
+        self.ie_result_tabs.setDocumentMode(True)
+        self.ie_result_tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #333; background: #111; }"
+            "QTabBar::tab { background: #2b2b2b; color: #aaa; padding: 5px 14px; }"
+            "QTabBar::tab:selected { background: #1769aa; color: white; }"
+        )
+
+        annotated_tab = QWidget()
+        annotated_layout = QVBoxLayout(annotated_tab)
+        annotated_layout.setContentsMargins(0, 0, 0, 0)
+        annotated_layout.setSpacing(1)
         self.ie_preview_label = _IEImageViewer("（未处理）", self._sp)
-        self.ie_preview_label.setMinimumSize(self._sp(300), self._sp(200))
+        self.ie_preview_label.setMinimumSize(self._sp(220), self._sp(120))
         self.ie_preview_label.setStyleSheet(
             "border: 1px solid #333; background: #111; color: #666; font-size: 13px;"
         )
-        rf_lay.addWidget(self.ie_preview_label, stretch=1)
+        annotated_layout.addWidget(self.ie_preview_label, stretch=1)
 
         # 坐标/像素值信息条
         self.ie_result_info_bar = QLabel("")
@@ -9939,15 +11343,41 @@ class BubbleTomographyGUI(QMainWindow):
             lambda x, y, v: self.ie_result_info_bar.setText(
                 f"  坐标: ({x}, {y})    像素值: {v}" if x >= 0 else "")
         )
-        rf_lay.addWidget(self.ie_result_info_bar)
+        annotated_layout.addWidget(self.ie_result_info_bar)
 
         # 颜色条
         self.ie_result_colorbar = _IEColorbarWidget(self._sp)
         self.ie_result_colorbar.setFixedHeight(self._sp(20))
-        rf_lay.addWidget(self.ie_result_colorbar)
+        annotated_layout.addWidget(self.ie_result_colorbar)
+        self.ie_result_tabs.addTab(annotated_tab, "处理/气泡标注图")
+
+        distribution_tab = QWidget()
+        distribution_layout = QVBoxLayout(distribution_tab)
+        distribution_layout.setContentsMargins(0, 0, 0, 0)
+        self.ie_bub_distribution_viewer = _IEImageViewer(
+            "运行 BubAnalysis 后显示粒径分布", self._sp
+        )
+        self.ie_bub_distribution_viewer.setMinimumSize(
+            self._sp(220), self._sp(120)
+        )
+        self.ie_bub_distribution_viewer.setStyleSheet(
+            "border: 1px solid #333; background: #f8f8f8; color: #666; font-size: 13px;"
+        )
+        distribution_layout.addWidget(self.ie_bub_distribution_viewer, stretch=1)
+        self.ie_bub_stats_label = QLabel("尚无气泡统计结果")
+        self.ie_bub_stats_label.setWordWrap(True)
+        self.ie_bub_stats_label.setStyleSheet(
+            "color: #ddd; background: #222; padding: 4px 8px; border: none;"
+        )
+        distribution_layout.addWidget(self.ie_bub_stats_label)
+        self.ie_result_tabs.addTab(distribution_tab, "粒径分布")
+        self.ie_result_tabs.setTabEnabled(1, False)
+        rf_lay.addWidget(self.ie_result_tabs, stretch=1)
 
         viewer_splitter.addWidget(result_frame)
 
+        viewer_splitter.setStretchFactor(0, 1)
+        viewer_splitter.setStretchFactor(1, 1)
         viewer_splitter.setSizes([self._sp(300), self._sp(300)])
         v_lay.addWidget(viewer_splitter, stretch=1)
 
@@ -10141,7 +11571,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # 启用/禁用 checkbox
         enable_check = QCheckBox()
-        enable_check.setChecked(True)
+        enable_check.setChecked(step_key != "bub_analysis")
         enable_check.setStyleSheet(
             "QCheckBox { border: none; spacing: 0; }"
             "QCheckBox::indicator { width: 14px; height: 14px; }"
@@ -10298,6 +11728,12 @@ class BubbleTomographyGUI(QMainWindow):
             "bc": f"α={cfg.bc.alpha:.1f}, β={cfg.bc.beta}",
             "arithmetic": f"{cfg.arithmetic.operation}" + (f" val={cfg.arithmetic.scalar_value}" if not cfg.arithmetic.operand_path else " 双图"),
             "threshold": f"模式: {cfg.threshold.mode} T={cfg.threshold.threshold_value}",
+            "bub_analysis": (
+                f"面积≥{cfg.bub_analysis.min_area}px², "
+                f"直径 {cfg.bub_analysis.min_diameter:g}–"
+                f"{cfg.bub_analysis.max_diameter:g}px, "
+                f"{cfg.bub_analysis.scale_mm_per_px:g} mm/px"
+            ),
         }
         return summaries.get(step_key, "")
 
@@ -10348,6 +11784,8 @@ class BubbleTomographyGUI(QMainWindow):
             self._build_arith_param_widget(p_lay)
         elif step_key == "threshold":
             self._build_threshold_param_widget(p_lay)
+        elif step_key == "bub_analysis":
+            self._build_bub_analysis_param_widget(p_lay)
 
         p_lay.addStretch()
         d_lay.addWidget(param_widget)
@@ -10364,6 +11802,10 @@ class BubbleTomographyGUI(QMainWindow):
         d_lay.addWidget(btns)
 
         if dialog.exec_() == QDialog.Accepted:
+            if step_key == "crop":
+                self._ie_apply_crop_params_from_controls()
+            elif step_key == "bub_analysis":
+                self._ie_apply_bub_analysis_params()
             self._ie_sync_config_from_ui()
             # 更新节点参数摘要
             if step_key in self._ie_workflow_nodes:
@@ -10375,19 +11817,34 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _build_crop_param_widget(self, layout):
         labels = ["X (px):", "Y (px):", "宽 (px):", "高 (px):"]
-        if not hasattr(self, 'ie_crop_spins'):
-            self.ie_crop_spins = []
+        values = [
+            self.ie_config.crop.x,
+            self.ie_config.crop.y,
+            self.ie_config.crop.w,
+            self.ie_config.crop.h,
+        ]
+        self.ie_crop_spins = []
         for i, lbl in enumerate(labels):
-            if i < len(self.ie_crop_spins):
-                layout.addWidget(QLabel(lbl))
-                layout.addWidget(self.ie_crop_spins[i])
-            else:
-                layout.addWidget(QLabel(lbl))
-                sp = QSpinBox()
-                sp.setRange(0, 99999)
-                sp.valueChanged.connect(lambda _: self._ie_request_preview())
-                layout.addWidget(sp)
-                self.ie_crop_spins.append(sp)
+            layout.addWidget(QLabel(lbl))
+            spin = QSpinBox()
+            spin.setRange(0, 99999)
+            spin.setValue(values[i])
+            layout.addWidget(spin)
+            self.ie_crop_spins.append(spin)
+        hint = QLabel("也可以关闭此对话框，点击顶部“框选裁剪”，直接在右侧源图像中拖动鼠标。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(hint)
+
+    def _ie_apply_crop_params_from_controls(self):
+        if len(getattr(self, "ie_crop_spins", [])) != 4:
+            return
+        values = [spin.value() for spin in self.ie_crop_spins]
+        crop = self.ie_config.crop
+        crop.x, crop.y, crop.w, crop.h = values
+        crop.enabled = crop.w > 0 and crop.h > 0
+        if hasattr(self, "ie_orig_label"):
+            self.ie_orig_label.show_roi(crop.x, crop.y, crop.w, crop.h)
 
     def _build_mirror_param_widget(self, layout):
         layout.addWidget(QLabel("镜像方向:"))
@@ -10530,6 +11987,108 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_thr_max_spin.setValue(255)
             self.ie_thr_max_spin.valueChanged.connect(lambda _: self._ie_request_preview())
         layout.addWidget(self.ie_thr_max_spin)
+
+    def _build_bub_analysis_param_widget(self, layout):
+        cfg = self.ie_config.bub_analysis
+        source_group = QGroupBox("图像与尺度")
+        source_layout = QGridLayout(source_group)
+        source_layout.addWidget(QLabel("背景图:"), 0, 0)
+        self.ie_bub_background_edit = QLineEdit(cfg.background_path)
+        self.ie_bub_background_edit.setPlaceholderText("可留空：按亮背景、暗气泡处理")
+        source_layout.addWidget(self.ie_bub_background_edit, 0, 1)
+        background_btn = QPushButton("选择...")
+        background_btn.clicked.connect(self._ie_pick_bub_background)
+        source_layout.addWidget(background_btn, 0, 2)
+        source_layout.addWidget(QLabel("比例尺 (mm/px):"), 1, 0)
+        self.ie_bub_scale_spin = QDoubleSpinBox()
+        self.ie_bub_scale_spin.setRange(0.000001, 100000.0)
+        self.ie_bub_scale_spin.setDecimals(6)
+        self.ie_bub_scale_spin.setValue(cfg.scale_mm_per_px)
+        source_layout.addWidget(self.ie_bub_scale_spin, 1, 1, 1, 2)
+        layout.addWidget(source_group)
+
+        segmentation_group = QGroupBox("识别与筛选")
+        segmentation_layout = QGridLayout(segmentation_group)
+        segmentation_layout.addWidget(QLabel("最小面积 (px²):"), 0, 0)
+        self.ie_bub_min_area_spin = QSpinBox()
+        self.ie_bub_min_area_spin.setRange(1, 10000000)
+        self.ie_bub_min_area_spin.setValue(cfg.min_area)
+        segmentation_layout.addWidget(self.ie_bub_min_area_spin, 0, 1)
+        segmentation_layout.addWidget(QLabel("最小直径 (px):"), 1, 0)
+        self.ie_bub_min_diameter_spin = QDoubleSpinBox()
+        self.ie_bub_min_diameter_spin.setRange(0.0, 100000.0)
+        self.ie_bub_min_diameter_spin.setValue(cfg.min_diameter)
+        segmentation_layout.addWidget(self.ie_bub_min_diameter_spin, 1, 1)
+        segmentation_layout.addWidget(QLabel("最大直径 (px):"), 2, 0)
+        self.ie_bub_max_diameter_spin = QDoubleSpinBox()
+        self.ie_bub_max_diameter_spin.setRange(0.01, 1000000.0)
+        self.ie_bub_max_diameter_spin.setValue(cfg.max_diameter)
+        segmentation_layout.addWidget(self.ie_bub_max_diameter_spin, 2, 1)
+        segmentation_layout.addWidget(QLabel("最小圆度:"), 3, 0)
+        self.ie_bub_circularity_spin = QDoubleSpinBox()
+        self.ie_bub_circularity_spin.setRange(0.0, 1.0)
+        self.ie_bub_circularity_spin.setDecimals(3)
+        self.ie_bub_circularity_spin.setSingleStep(0.05)
+        self.ie_bub_circularity_spin.setValue(cfg.min_circularity)
+        segmentation_layout.addWidget(self.ie_bub_circularity_spin, 3, 1)
+        self.ie_bub_split_check = QCheckBox("分离重叠气泡（距离变换 + 分水岭）")
+        self.ie_bub_split_check.setChecked(cfg.split_overlaps)
+        segmentation_layout.addWidget(self.ie_bub_split_check, 4, 0, 1, 2)
+        self.ie_bub_bilateral_check = QCheckBox("启用双边滤波")
+        self.ie_bub_bilateral_check.setChecked(cfg.bilateral_filter)
+        segmentation_layout.addWidget(self.ie_bub_bilateral_check, 5, 0, 1, 2)
+        layout.addWidget(segmentation_group)
+
+        focus_group = QGroupBox("去焦气泡过滤")
+        focus_layout = QGridLayout(focus_group)
+        self.ie_bub_focus_check = QCheckBox("启用 Sobel 边界清晰度过滤")
+        self.ie_bub_focus_check.setChecked(cfg.focused_filter)
+        focus_layout.addWidget(self.ie_bub_focus_check, 0, 0, 1, 2)
+        focus_layout.addWidget(QLabel("梯度阈值:"), 1, 0)
+        self.ie_bub_gradient_spin = QDoubleSpinBox()
+        self.ie_bub_gradient_spin.setRange(0.0, 1.0)
+        self.ie_bub_gradient_spin.setDecimals(3)
+        self.ie_bub_gradient_spin.setValue(cfg.gradient_threshold)
+        focus_layout.addWidget(self.ie_bub_gradient_spin, 1, 1)
+        focus_layout.addWidget(QLabel("灰度差阈值:"), 2, 0)
+        self.ie_bub_gray_spin = QDoubleSpinBox()
+        self.ie_bub_gray_spin.setRange(0.0, 1.0)
+        self.ie_bub_gray_spin.setDecimals(3)
+        self.ie_bub_gray_spin.setValue(cfg.gray_threshold)
+        focus_layout.addWidget(self.ie_bub_gray_spin, 2, 1)
+        layout.addWidget(focus_group)
+
+        attribution = QLabel(
+            "算法流程参考 BubAnalysis VOL1.0；原 MATLAB 软件著作权隶属于"
+            "上海交通大学核电泵阀实验室（WG-Chen，2021）。"
+        )
+        attribution.setWordWrap(True)
+        attribution.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(attribution)
+
+    def _ie_pick_bub_background(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 BubAnalysis 背景图",
+            "",
+            "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
+        )
+        if path:
+            self.ie_bub_background_edit.setText(path)
+
+    def _ie_apply_bub_analysis_params(self):
+        p = self.ie_config.bub_analysis
+        p.background_path = self.ie_bub_background_edit.text().strip()
+        p.scale_mm_per_px = self.ie_bub_scale_spin.value()
+        p.min_area = self.ie_bub_min_area_spin.value()
+        p.min_diameter = self.ie_bub_min_diameter_spin.value()
+        p.max_diameter = self.ie_bub_max_diameter_spin.value()
+        p.min_circularity = self.ie_bub_circularity_spin.value()
+        p.split_overlaps = self.ie_bub_split_check.isChecked()
+        p.bilateral_filter = self.ie_bub_bilateral_check.isChecked()
+        p.focused_filter = self.ie_bub_focus_check.isChecked()
+        p.gradient_threshold = self.ie_bub_gradient_spin.value()
+        p.gray_threshold = self.ie_bub_gray_spin.value()
 
     # ===== 工作流辅助方法 =====
 
@@ -10738,6 +12297,56 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_thr_val_spin.blockSignals(False)
         self._ie_request_preview()
 
+    def _ie_toggle_crop_selection(self, checked):
+        if not hasattr(self, "ie_orig_label"):
+            return
+        if not checked:
+            self.ie_orig_label.cancel_roi_selection()
+            return
+        if self.ie_orig_label._image_data is None:
+            self.ie_crop_select_btn.blockSignals(True)
+            self.ie_crop_select_btn.setChecked(False)
+            self.ie_crop_select_btn.blockSignals(False)
+            QMessageBox.information(self, "框选裁剪", "请先加载一张源图像。")
+            return
+        if not self.ie_orig_label.start_roi_selection():
+            self.ie_crop_select_btn.setChecked(False)
+            return
+        self.ie_log.append("框选裁剪：请在右侧源图像中按住鼠标左键拖出矩形区域。")
+
+    def _ie_apply_selected_crop(self, x, y, width, height):
+        crop = self.ie_config.crop
+        crop.x = int(x)
+        crop.y = int(y)
+        crop.w = int(width)
+        crop.h = int(height)
+        crop.enabled = True
+
+        if "crop" not in self._ie_workflow_nodes:
+            self._ie_add_node("crop", request_preview=False)
+        crop_node = self._ie_workflow_nodes["crop"]
+        crop_node["enable_check"].setChecked(True)
+        crop_node["param_label"].setText(self._ie_get_param_summary("crop"))
+
+        for spin, value in zip(
+            getattr(self, "ie_crop_spins", []),
+            (crop.x, crop.y, crop.w, crop.h),
+        ):
+            try:
+                spin.setValue(value)
+            except RuntimeError:
+                break
+
+        self.ie_orig_label.show_roi(crop.x, crop.y, crop.w, crop.h)
+        self.ie_crop_select_btn.blockSignals(True)
+        self.ie_crop_select_btn.setChecked(False)
+        self.ie_crop_select_btn.blockSignals(False)
+        self.ie_log.append(
+            f"已设置裁剪区域: X={crop.x}, Y={crop.y}, "
+            f"宽={crop.w}, 高={crop.h}"
+        )
+        self._ie_do_preview()
+
     def _ie_request_preview(self):
         """防抖：重启 300ms 定时器，到期后执行预览。"""
         self._ie_preview_timer.start()
@@ -10767,11 +12376,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_source_info.setStyleSheet("color: #4CAF50; font-size: 11px; border: none;")
         if hasattr(self, 'ie_source_dim'):
             self.ie_source_dim.setText(f"{w} × {h}  |  {img.dtype}  |  {img.ndim}D")
-        pixmap = self._ie_ndarray_to_pixmap(img)
-        if pixmap:
-            self.ie_orig_label.setPixmap(
-                pixmap.scaled(self.ie_orig_label.size(),
-                              Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.ie_orig_label.set_image_data(img)
 
     def _ie_pick_src_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择输入目录")
@@ -10849,8 +12454,14 @@ class BubbleTomographyGUI(QMainWindow):
                                      _cv2.IMREAD_UNCHANGED)
             editor = ImageEditor(self.ie_config)
             result = editor.process(img, op_img, step_order=step_order)
+            self._ie_last_bub_analysis_result = editor.last_bub_analysis_result
             self._ie_current_preview = result
-            pixmap = self._ie_ndarray_to_pixmap(result)
+            display_result = (
+                editor.last_bub_analysis_result.overlay
+                if editor.last_bub_analysis_result is not None
+                else result
+            )
+            pixmap = self._ie_ndarray_to_pixmap(display_result)
             if pixmap:
                 self.ie_preview_label.setPixmap(
                     pixmap.scaled(self.ie_preview_label.size(),
@@ -10859,19 +12470,38 @@ class BubbleTomographyGUI(QMainWindow):
 
             # 更新颜色条
             if hasattr(self, 'ie_result_colorbar'):
-                vmin, vmax = float(result.min()), float(result.max())
+                vmin, vmax = float(display_result.min()), float(display_result.max())
                 self.ie_result_colorbar.set_range(vmin, vmax)
             if hasattr(self, 'ie_orig_colorbar'):
                 vmin, vmax = float(img.min()), float(img.max())
                 self.ie_orig_colorbar.set_range(vmin, vmax)
 
             # 更新 image viewer 的原始图像数据（用于鼠标悬停像素值读取）
-            self.ie_preview_label.set_image_data(result)
+            self.ie_preview_label.set_image_data(display_result)
             self.ie_orig_label.set_image_data(img)
 
             steps_str = " -> ".join(
                 ImageEditor.STEP_LABELS.get(s, s) for s in step_order)
             self.ie_log.append(f"处理完成: {steps_str}  输出: {w}x{h}")
+            if editor.last_bub_analysis_result is not None:
+                bub_result = editor.last_bub_analysis_result
+                distribution = bub_result.render_distribution_chart()
+                self.ie_bub_distribution_viewer.set_image_data(distribution)
+                distribution_pixmap = self._ie_ndarray_to_pixmap(distribution)
+                if distribution_pixmap:
+                    self.ie_bub_distribution_viewer.setPixmap(
+                        distribution_pixmap.scaled(
+                            self.ie_bub_distribution_viewer.size(),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
+                    )
+                self.ie_bub_stats_label.setText(bub_result.summary())
+                self.ie_result_tabs.setTabEnabled(1, True)
+                self.ie_log.append(bub_result.summary())
+            else:
+                self.ie_result_tabs.setTabEnabled(1, False)
+                self.ie_bub_stats_label.setText("尚无气泡统计结果")
         except Exception as e:
             self.ie_log.append(f"处理失败: {e}")
 
@@ -10912,18 +12542,8 @@ class BubbleTomographyGUI(QMainWindow):
         return raw or "processed"
 
     def _ie_next_default_output_dir(self, source_dir, step_order=None):
-        base_dir = Path(source_dir)
         suffix = self._ie_processing_dir_suffix(step_order)
-        prefix = f"image_{suffix}_"
-        max_idx = 0
-        if base_dir.exists():
-            for child in base_dir.iterdir():
-                if not child.is_dir() or not child.name.startswith(prefix):
-                    continue
-                tail = child.name[len(prefix):]
-                if tail.isdigit():
-                    max_idx = max(max_idx, int(tail))
-        return str(base_dir / f"{prefix}{max_idx + 1:02d}")
+        return self._next_processing_output_dir(source_dir, suffix)
 
     def _ie_default_output_dir_for_current_image(self, step_order=None):
         if self.ie_single_path:
@@ -10949,6 +12569,7 @@ class BubbleTomographyGUI(QMainWindow):
                 else self._ie_default_output_dir_for_current_image(step_order)
             )
             os.makedirs(out_dir, exist_ok=True)
+            self._module_output_dirs["image_editor"] = out_dir
             path = os.path.join(out_dir, out_name)
         else:
             path, _ = QFileDialog.getSaveFileName(
@@ -10958,7 +12579,15 @@ class BubbleTomographyGUI(QMainWindow):
                 return
 
         try:
-            _cv2.imwrite(path, self._ie_current_preview)
+            if not robust_imwrite(path, self._ie_current_preview):
+                raise IOError(f"无法写入图像: {path}")
+            bub_result = getattr(self, "_ie_last_bub_analysis_result", None)
+            if bub_result is not None and "bub_analysis" in self._ie_get_step_order():
+                artifacts = bub_result.write_artifacts(path)
+                self.ie_log.append(
+                    "BubAnalysis 输出: "
+                    + ", ".join(Path(item).name for item in artifacts.values())
+                )
             self.ie_log.append(f"已保存: {os.path.basename(path)}")
             # 保存后刷新文件树
             self._file_tree_panel.watch_extra_dir(os.path.dirname(path))
@@ -10985,6 +12614,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_log.append(f"自动设置输出目录: {self.ie_dst_dir}")
 
         os.makedirs(self.ie_dst_dir, exist_ok=True)
+        self._module_output_dirs["image_editor"] = self.ie_dst_dir
 
         # 让文件树监视输出目录（若它在工作目录下，会被自动发现；若在外部则追加监视）
         self._file_tree_panel.watch_extra_dir(self.ie_dst_dir)
@@ -11074,12 +12704,24 @@ class BubbleTomographyGUI(QMainWindow):
             "raytrace": 3,
             "particle": 4,
             "piv2d": 5,
-            "ai_assistant": 6,
-            "local_model": 7,
+            "ptv": 6,
+            "ai_assistant": 7,
+            "local_model": 8,
         }
         for page_id, nav_btn in self._nav_buttons.items():
             if btn is nav_btn:
                 self.content_stack.setCurrentIndex(page_map.get(page_id, 0))
+                module_map = {
+                    "image_editor": "image_editor",
+                    "calibration": "calibration",
+                    "reconstruction": "reconstruction",
+                    "raytrace": "raytrace",
+                    "particle": "particle",
+                    "piv2d": "piv2d",
+                    "ptv": "ptv",
+                }
+                if page_id in module_map:
+                    self._activate_module_output(module_map[page_id])
                 return
         self.content_stack.setCurrentIndex(0)
 
@@ -11091,6 +12733,9 @@ class BubbleTomographyGUI(QMainWindow):
             3: 4,
             4: 5,
             5: 0,
+            6: 7,
+            7: 8,
+            8: 6,
         }
         current_idx = legacy_to_current.get(page_idx, page_idx)
         self.content_stack.setCurrentIndex(current_idx)
@@ -11101,11 +12746,23 @@ class BubbleTomographyGUI(QMainWindow):
             "raytrace",
             "particle",
             "piv2d",
+            "ptv",
             "ai_assistant",
             "local_model",
         ]
         if current_idx < len(nav_keys):
             self._nav_buttons[nav_keys[current_idx]].setChecked(True)
+        module_by_index = {
+            0: "image_editor",
+            1: "calibration",
+            2: "reconstruction",
+            3: "raytrace",
+            4: "particle",
+            5: "piv2d",
+            6: "ptv",
+        }
+        if current_idx in module_by_index:
+            self._activate_module_output(module_by_index[current_idx])
 
     def _clear_current_log(self):
         page_idx = self.content_stack.currentIndex()
@@ -11121,28 +12778,35 @@ class BubbleTomographyGUI(QMainWindow):
             self.piv_log.clear()
         elif page_idx == 5:
             self.piv2d_log.clear()
+        elif page_idx == 6:
+            self.ptv_log.clear()
 
     def _show_image(self, path):
         pixmap = QPixmap(path)
+        image = robust_imread(path, cv2.IMREAD_UNCHANGED)
         page_idx = self.content_stack.currentIndex()
         if page_idx == 0:
-            self.ie_preview_label.setPixmap(pixmap.scaled(
-                self.ie_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            if image is not None:
+                self.ie_preview_label.set_image_data(image)
+            else:
+                self.ie_preview_label.setPixmap(pixmap)
         elif page_idx == 1:
             self.calib_preview_label.show_static_image(path, title=os.path.basename(path))
         elif page_idx == 2:
-            self.proj_preview_label.setPixmap(pixmap.scaled(
-                self.proj_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            if image is not None:
+                self.proj_preview_label.set_image_array(image, os.path.basename(path))
+            else:
+                self.proj_preview_label.setPixmap(pixmap)
         elif page_idx == 3:
-            self.rt_preview_label.setPixmap(pixmap.scaled(
-                self.rt_preview_label.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            if image is not None:
+                self.rt_preview_label.set_image_array(image, os.path.basename(path))
+            else:
+                self.rt_preview_label.setPixmap(pixmap)
         elif page_idx == 4:
-            self.piv_preview.setPixmap(pixmap.scaled(
-                self.piv_preview.size(), Qt.KeepAspectRatio,
-                Qt.SmoothTransformation))
+            if image is not None:
+                self.piv_preview.set_image_array(image, os.path.basename(path))
+            else:
+                self.piv_preview.setPixmap(pixmap)
         elif page_idx == 5:
             self._piv2d_set_preview(path, self.piv2d_result_preview)
 
@@ -11222,7 +12886,9 @@ class _IEBatchWorker(QThread):
                 if img is None:
                     return index, file_path.name, False
                 result = editor.process(img, op_img, step_order=self.step_order)
-                ok = _cv2.imwrite(dst, result)
+                ok = robust_imwrite(dst, result)
+                if ok and editor.last_bub_analysis_result is not None:
+                    editor.last_bub_analysis_result.write_artifacts(dst)
                 return index, file_path.name, bool(ok)
 
             if worker_count <= 1:

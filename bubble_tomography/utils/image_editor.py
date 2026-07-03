@@ -10,6 +10,8 @@ from typing import Callable, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from utils.bub_analysis import BubAnalysisParams, BubAnalysisProcessor, BubAnalysisResult
+
 # ---------------------------------------------------------------------------
 # 鲁棒图像加载：cv2.imread 无法处理某些 TIFF（例：12-bit/非标准BitsPerSample），
 # 此时回退到 PIL 读取。
@@ -62,6 +64,21 @@ def robust_imread(path: str, flags: int = cv2.IMREAD_UNCHANGED) -> "Optional[np.
         return arr
     except Exception:
         return None
+
+
+def robust_imwrite(path: str, image: np.ndarray, params=None) -> bool:
+    """Write images through imencode/tofile so Unicode Windows paths work."""
+    try:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        extension = output.suffix.lower() or ".png"
+        success, encoded = cv2.imencode(extension, image, params or [])
+        if not success:
+            return False
+        encoded.tofile(str(output))
+        return True
+    except Exception:
+        return False
 
 
 @dataclass
@@ -142,6 +159,7 @@ class ImageEditConfig:
     bc: BrightnessContrastParams = field(default_factory=BrightnessContrastParams)
     arithmetic: ArithmeticParams = field(default_factory=ArithmeticParams)
     threshold: ThresholdParams = field(default_factory=ThresholdParams)
+    bub_analysis: BubAnalysisParams = field(default_factory=BubAnalysisParams)
 
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -160,6 +178,7 @@ class ImageEditor:
         "bc",
         "arithmetic",
         "threshold",
+        "bub_analysis",
     ]
 
     STEP_LABELS = {
@@ -172,10 +191,12 @@ class ImageEditor:
         "bc": "亮度/对比度",
         "arithmetic": "图像加/减法",
         "threshold": "阈值化",
+        "bub_analysis": "BubAnalysis 气泡识别",
     }
 
     def __init__(self, config: Optional[ImageEditConfig] = None):
         self.config = config or ImageEditConfig()
+        self.last_bub_analysis_result: Optional[BubAnalysisResult] = None
 
     def process(
         self,
@@ -211,6 +232,8 @@ class ImageEditor:
             return cfg.arithmetic.enabled and cfg.arithmetic.operation != "none"
         if step == "threshold":
             return cfg.threshold.enabled
+        if step == "bub_analysis":
+            return cfg.bub_analysis.enabled
         return False
 
     def _run_step(
@@ -238,6 +261,11 @@ class ImageEditor:
             return self._apply_arithmetic(img, cfg.arithmetic, operand_image)
         if step == "threshold":
             return self._apply_threshold(img, cfg.threshold)
+        if step == "bub_analysis":
+            self.last_bub_analysis_result = BubAnalysisProcessor(
+                cfg.bub_analysis
+            ).process(img)
+            return self.last_bub_analysis_result.overlay
         return img
 
     @staticmethod
@@ -410,8 +438,7 @@ class ImageEditor:
                 op_img = robust_imread(operand_path)
             result = self.process(img, op_img)
             os.makedirs(os.path.dirname(dst_path) or ".", exist_ok=True)
-            cv2.imwrite(dst_path, result)
-            return True
+            return robust_imwrite(dst_path, result)
         except Exception:
             return False
 
