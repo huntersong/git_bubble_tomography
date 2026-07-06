@@ -73,7 +73,7 @@ def _draw_asymmetric_circles(
     ox, oy = origin
     for y in range(height):
         for x in range(width):
-            px = ox + int((2 * x + (y % 2)) * spacing / 2)
+            px = ox + int((2 * x + (y % 2)) * spacing)
             py = oy + y * spacing
             cv2.circle(image, (px, py), radius, (255, 255, 255), -1)
 
@@ -169,14 +169,14 @@ def _make_symmetric_circle_images() -> List[Dict[str, object]]:
 
 def _make_asymmetric_circle_images() -> List[Dict[str, object]]:
     pattern_size = (9, 6)
-    origin = (90, 70)
+    origin = (90, 90)
     spacing = 44
     radius = 8
-    source_quad = np.float32([[70, 50], [470, 55], [500, 330], [60, 340]])
+    source_quad = np.float32([[60, 60], [900, 65], [910, 390], [55, 400]])
     target_quads = [
-        np.float32([[90, 70], [480, 50], [510, 330], [70, 340]]),
-        np.float32([[80, 85], [470, 60], [520, 335], [85, 350]]),
-        np.float32([[95, 60], [455, 78], [525, 340], [65, 320]]),
+        np.float32([[90, 75], [880, 55], [920, 405], [65, 395]]),
+        np.float32([[75, 95], [865, 65], [925, 390], [90, 420]]),
+        np.float32([[105, 60], [850, 85], [930, 410], [60, 375]]),
     ]
 
     outputs = []
@@ -184,7 +184,7 @@ def _make_asymmetric_circle_images() -> List[Dict[str, object]]:
     _ensure_dir(out_dir)
 
     for index, quad in enumerate(target_quads, start=1):
-        image = _make_canvas(width=560, height=400)
+        image = _make_canvas(width=980, height=460)
         _draw_asymmetric_circles(image, pattern_size, origin, spacing, radius)
         warped = _apply_perspective(image, source_quad, quad)
         file_path = out_dir / f"acircles_{index:02d}.png"

@@ -1,0 +1,59 @@
+{
+  "pattern_type": "volume_dots",
+  "pattern_size": [
+    8,
+    7
+  ],
+  "square_size": 3.3,
+  "circle_radius": 0.5,
+  "level_separation": 1.0,
+  "origin_point_id": null,
+  "num_cameras": 3,
+  "cameras": {
+    "C1": {
+      "image_size": [
+        1280,
+        800
+      ],
+      "rms_error": 0.3237094923238542,
+      "focal_length": [
+        6063.513986435381,
+        6063.513986435381
+      ],
+      "principal_point": [
+        640.0,
+        400.0
+      ]
+    },
+    "C2": {
+      "image_size": [
+        1280,
+        800
+      ],
+      "rms_error": 0.16267142970162138,
+      "focal_length": [
+        6063.513986435381,
+        6063.513986435381
+      ],
+      "principal_point": [
+        640.0,
+        400.0
+      ]
+    },
+    "C3": {
+      "image_size": [
+        1280,
+        799
+      ],
+      "rms_error": 0.16067253348558808,
+      "focal_length": [
+        6063.513986435381,
+        6063.513986435381
+      ],
+      "principal_point": [
+        640.0,
+        399.5
+      ]
+    }
+  }
+}

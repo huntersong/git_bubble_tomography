@@ -90,6 +90,7 @@ class MultiCameraCalibrator:
         square_size: float = 1.0,
         circle_radius: float = 0.5,
         level_separation: Optional[float] = None,
+        origin_point_id: Optional[Sequence[float]] = None,
     ):
         if pattern_type not in self.SUPPORTED_PATTERN_TYPES:
             raise ValueError(f"Unsupported pattern type: {pattern_type}")
@@ -102,6 +103,9 @@ class MultiCameraCalibrator:
             float(level_separation)
             if level_separation is not None
             else max(1.0, 0.2 * float(square_size))
+        )
+        self.origin_point_id = (
+            tuple(origin_point_id) if origin_point_id is not None else None
         )
 
         self.obj_points = self._generate_object_points()
@@ -129,7 +133,7 @@ class MultiCameraCalibrator:
         aggregated: Dict[Tuple[str, Tuple[int, int]], Dict[str, object]] = {}
 
         for image_path in image_paths[:max_images]:
-            image = cv2.imread(image_path)
+            image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
             if image is None:
                 continue
 
@@ -229,6 +233,186 @@ class MultiCameraCalibrator:
             best_result["pattern_size"] = (pattern_h, pattern_w)
 
         return best_result
+
+    @classmethod
+    def detect_pattern_automatically(
+        cls,
+        image: np.ndarray,
+        pattern_size_hint: Tuple[int, int] = (11, 8),
+        pattern_type_hint: str = "checkerboard",
+        square_size: float = 1.0,
+        circle_radius: float = 0.5,
+        level_separation: Optional[float] = None,
+        size_min: int = 3,
+        size_max: int = 15,
+    ) -> Optional[Dict[str, object]]:
+        """Detect any supported target, preferring the current GUI dimensions.
+
+        The inexpensive first pass tries every target type with the configured
+        grid size.  Only when that fails do we infer both type and dimensions.
+        """
+        if image.ndim == 2:
+            source = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            source = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        else:
+            source = image
+
+        # A LaVision target is substantially more expensive than the planar
+        # detectors, so honor an explicit volume-target hint before probing
+        # every 2-D family. If it fails, the generic fallback below remains.
+        if pattern_type_hint == "volume_dots":
+            volume_detector = cls(
+                pattern_type="volume_dots",
+                pattern_size=pattern_size_hint,
+                square_size=square_size,
+                circle_radius=circle_radius,
+                level_separation=level_separation,
+            )
+            volume_observation = volume_detector.detect_pattern_observation(source)
+            if volume_observation is not None:
+                return {
+                    "pattern_type": "volume_dots",
+                    "pattern_size": tuple(pattern_size_hint),
+                    "observation": volume_observation,
+                    "inferred_size": False,
+                }
+
+        type_order = [pattern_type_hint] + [
+            pattern_type
+            for pattern_type in (
+                "checkerboard",
+                "circles",
+                "acircles",
+                "volume_dots",
+            )
+            if pattern_type != pattern_type_hint
+        ]
+        standard_types = [
+            pattern_type
+            for pattern_type in type_order
+            if pattern_type in {"checkerboard", "circles", "acircles"}
+        ]
+        for pattern_type in standard_types:
+            if pattern_type not in cls.SUPPORTED_PATTERN_TYPES:
+                continue
+            detector = cls(
+                pattern_type=pattern_type,
+                pattern_size=pattern_size_hint,
+                square_size=square_size,
+                circle_radius=circle_radius,
+                level_separation=level_separation,
+            )
+            observation = detector.detect_pattern_observation(source)
+            if observation is not None:
+                return {
+                    "pattern_type": pattern_type,
+                    "pattern_size": tuple(pattern_size_hint),
+                    "observation": observation,
+                    "inferred_size": False,
+                }
+
+        gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+        blob_helper = cls(
+            pattern_type="volume_dots",
+            pattern_size=pattern_size_hint,
+            square_size=square_size,
+        )
+        blob_count = len(blob_helper._extract_round_blob_centers(gray))
+        factor_sizes = []
+        for width in range(size_min, size_max + 1):
+            if blob_count % width:
+                continue
+            height = blob_count // width
+            if size_min <= height <= size_max:
+                factor_sizes.append((width, height))
+
+        # Test asymmetric grids first: a staggered grid can occasionally be
+        # accepted as a rotated symmetric grid, while the reverse is rare.
+        dot_type_order = ["acircles", "circles"]
+        for pattern_type in dot_type_order:
+            for pattern_size in factor_sizes:
+                detector = cls(
+                    pattern_type=pattern_type,
+                    pattern_size=pattern_size,
+                    square_size=square_size,
+                    circle_radius=circle_radius,
+                    level_separation=level_separation,
+                )
+                observation = detector.detect_pattern_observation(source)
+                if observation is not None:
+                    return {
+                        "pattern_type": detector.pattern_type,
+                        "pattern_size": detector.pattern_size,
+                        "observation": observation,
+                        "inferred_size": True,
+                    }
+
+        # A volume target may intentionally contain missing points, so its
+        # detected count need not factor into the configured grid dimensions.
+        volume_detector = cls(
+            pattern_type="volume_dots",
+            pattern_size=pattern_size_hint,
+            square_size=square_size,
+            circle_radius=circle_radius,
+            level_separation=level_separation,
+        )
+        volume_observation = volume_detector.detect_pattern_observation(source)
+        if volume_observation is not None:
+            return {
+                "pattern_type": volume_detector.pattern_type,
+                "pattern_size": volume_detector.pattern_size,
+                "observation": volume_observation,
+                "inferred_size": False,
+            }
+
+        inferred = cls.infer_pattern_spec(
+            source,
+            candidate_types=["checkerboard"],
+            size_min=size_min,
+            size_max=size_max,
+        )
+        if inferred is not None:
+            detector = cls(
+                pattern_type="checkerboard",
+                pattern_size=tuple(inferred["pattern_size"]),
+                square_size=square_size,
+                circle_radius=circle_radius,
+                level_separation=level_separation,
+            )
+            observation = detector.detect_pattern_observation(source)
+            if observation is not None:
+                return {
+                    "pattern_type": detector.pattern_type,
+                    "pattern_size": detector.pattern_size,
+                    "observation": observation,
+                    "inferred_size": True,
+                }
+
+        volume_spec = cls.infer_pattern_spec(
+            source,
+            candidate_types=["volume_dots"],
+            size_min=size_min,
+            size_max=size_max,
+        )
+        if volume_spec is not None:
+            detector = cls(
+                pattern_type=str(volume_spec["pattern_type"]),
+                pattern_size=tuple(volume_spec["pattern_size"]),
+                square_size=square_size,
+                circle_radius=circle_radius,
+                level_separation=level_separation,
+            )
+            observation = detector.detect_pattern_observation(source)
+            if observation is not None:
+                return {
+                    "pattern_type": detector.pattern_type,
+                    "pattern_size": detector.pattern_size,
+                    "observation": observation,
+                    "inferred_size": True,
+                }
+
+        return None
 
     @classmethod
     def _infer_standard_pattern_spec(
@@ -447,18 +631,18 @@ class MultiCameraCalibrator:
         if self.pattern_type == "acircles":
             x_idx, y_idx = point_id
             spacing = 2.0 * self.circle_radius + 1.0
-            x = (2.0 * x_idx + (y_idx % 2)) * spacing / 2.0
+            x = (2.0 * x_idx + (y_idx % 2)) * spacing
             y = y_idx * spacing
             return np.array([x, y, 0.0], dtype=np.float32)
 
         if self.pattern_type == "volume_dots":
             if len(point_id) == 3:
-                layer_idx, x_sign, y_sign = point_id
+                layer_idx, x_idx, y_idx = point_id
                 return np.array(
                     [
-                        0.5 * float(x_sign) * self.square_size,
-                        0.5 * float(y_sign) * self.square_size,
-                        float(layer_idx) * self.level_separation,
+                        float(x_idx) * self.square_size,
+                        float(y_idx) * self.square_size,
+                        -float(layer_idx) * self.level_separation,
                     ],
                     dtype=np.float32,
                 )
@@ -471,10 +655,14 @@ class MultiCameraCalibrator:
         raise ValueError(f"Unsupported pattern type: {self.pattern_type}")
 
     def _object_points_from_ids(self, point_ids: Sequence[PointId]) -> np.ndarray:
-        return np.array(
+        points = np.array(
             [self._grid_id_to_object_point(point_id) for point_id in point_ids],
             dtype=np.float32,
         )
+        if self.origin_point_id is not None:
+            origin = self._grid_id_to_object_point(self.origin_point_id)
+            points = points - origin.reshape(1, 3)
+        return points
 
     def _generate_object_points(self) -> np.ndarray:
         return self._object_points_from_ids(self._generate_grid_point_ids())
@@ -486,7 +674,7 @@ class MultiCameraCalibrator:
     def detect_pattern_observation(
         self, image: np.ndarray
     ) -> Optional[PatternObservation]:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = self._to_gray8(image)
 
         if self.pattern_type in {"checkerboard", "circles", "acircles"}:
             image_points = self._detect_standard_pattern(gray)
@@ -503,6 +691,34 @@ class MultiCameraCalibrator:
             return self._detect_volume_dot_target(gray)
 
         return None
+
+    @staticmethod
+    def _to_gray8(image: np.ndarray) -> np.ndarray:
+        """Preserve useful contrast when calibration images are 12/16 bit TIFFs."""
+        if image.ndim == 3:
+            if image.shape[2] == 4:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            else:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        if gray.dtype == np.uint8:
+            return gray
+
+        finite = gray[np.isfinite(gray)]
+        if finite.size == 0:
+            return np.zeros(gray.shape, dtype=np.uint8)
+
+        low, high = np.percentile(finite, (0.5, 99.5))
+        if high <= low:
+            low = float(np.min(finite))
+            high = float(np.max(finite))
+        if high <= low:
+            return np.zeros(gray.shape, dtype=np.uint8)
+
+        normalized = (gray.astype(np.float32) - float(low)) * (255.0 / (high - low))
+        return np.clip(normalized, 0, 255).astype(np.uint8)
 
     def _detect_standard_pattern(self, gray: np.ndarray) -> Optional[np.ndarray]:
         w, h = self.pattern_size
@@ -525,20 +741,44 @@ class MultiCameraCalibrator:
             return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
 
         if self.pattern_type == "circles":
-            flags = cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
-            ret, centers = cv2.findCirclesGrid(gray, (w, h), flags=flags)
-            return centers if ret else None
+            for flags in (
+                cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING,
+                cv2.CALIB_CB_SYMMETRIC_GRID,
+            ):
+                for source in (gray, cv2.bitwise_not(gray)):
+                    ret, centers = cv2.findCirclesGrid(
+                        source, (w, h), flags=flags
+                    )
+                    if ret:
+                        return centers
+            return None
 
         if self.pattern_type == "acircles":
-            flags = cv2.CALIB_CB_ASYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
-            ret, centers = cv2.findCirclesGrid(gray, (w, h), flags=flags)
-            return centers if ret else None
+            for flags in (
+                cv2.CALIB_CB_ASYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING,
+                cv2.CALIB_CB_ASYMMETRIC_GRID,
+            ):
+                for source in (gray, cv2.bitwise_not(gray)):
+                    ret, centers = cv2.findCirclesGrid(
+                        source, (w, h), flags=flags
+                    )
+                    if ret:
+                        return centers
+            return None
 
         return None
 
     def _detect_volume_dot_target(
         self, gray: np.ndarray
     ) -> Optional[PatternObservation]:
+        lavision_observation = self._detect_lavision_double_layer_target(gray)
+        if lavision_observation is not None:
+            return lavision_observation
+        # Do not reinterpret a recognized LaVision plate as an unrelated
+        # single-plane grid when a clipped/blurred frame lacks enough columns.
+        if self._extract_lavision_target_features(gray) is not None:
+            return None
+
         # Fast path: if OpenCV can solve the grid directly, reuse it.
         w, h = self.pattern_size
         flags = cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
@@ -590,6 +830,645 @@ class MultiCameraCalibrator:
             object_points=object_points,
             point_ids=point_ids,
         )
+
+    def _detect_lavision_double_layer_target(
+        self, gray: np.ndarray
+    ) -> Optional[PatternObservation]:
+        """Detect the interleaved lattices on LaVision 025-3.3 volume targets."""
+        features = self._extract_lavision_target_features(gray)
+        if features is None:
+            return None
+
+        circles, square_center, triangle_center = features
+        assignments = self._assign_lavision_interleaved_columns(
+            circles, square_center, triangle_center
+        )
+        if assignments is None:
+            return None
+
+        point_rows: List[Tuple[PointId, np.ndarray, float]] = [
+            ((0.0, 0.0, 0.0), square_center, 0.0),
+        ]
+
+        for center_index, fine_x, fine_y, layer, residual in assignments:
+            point_rows.append(
+                (
+                    (layer, 0.5 * fine_x, 0.5 * fine_y),
+                    circles[center_index],
+                    residual,
+                )
+            )
+
+        # Keep only the best image candidate if thresholding produced a duplicate ID.
+        best_by_id: Dict[PointId, Tuple[np.ndarray, float]] = {}
+        for point_id, center, residual in point_rows:
+            current = best_by_id.get(point_id)
+            if current is None or residual < current[1]:
+                best_by_id[point_id] = (center, residual)
+
+        layer_counts = {
+            layer: sum(point_id[0] == layer for point_id in best_by_id)
+            for layer in (0.0, 1.0)
+        }
+        if min(layer_counts.values()) < 20:
+            return None
+
+        point_ids = sorted(best_by_id, key=self._point_sort_key)
+        image_points = np.array(
+            [best_by_id[point_id][0] for point_id in point_ids],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        return PatternObservation(
+            image_points=image_points,
+            object_points=self._object_points_from_ids(point_ids),
+            point_ids=point_ids,
+        )
+
+    def _extract_lavision_target_features(
+        self, gray: np.ndarray
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        min_dim = min(gray.shape[:2])
+        kernel_size = max(11, int(round(min_dim * 0.026)))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        top_hat = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_TOPHAT,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+            ),
+        )
+        _, mask = cv2.threshold(
+            top_hat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
+        )
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        rows = []
+        max_area = float((min_dim * 0.035) ** 2)
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            perimeter = float(cv2.arcLength(contour, True))
+            if area < 6.0 or area > max_area or perimeter <= 0:
+                continue
+            moments = cv2.moments(contour)
+            if abs(moments["m00"]) < 1e-6:
+                continue
+            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.25:
+                continue
+            center = np.array(
+                [
+                    moments["m10"] / moments["m00"],
+                    moments["m01"] / moments["m00"],
+                ],
+                dtype=np.float32,
+            )
+            rows.append(
+                {
+                    "center": center,
+                    "area": area,
+                    "circularity": circularity,
+                    "vertices_005": len(
+                        cv2.approxPolyDP(contour, 0.05 * perimeter, True)
+                    ),
+                    "vertices_009": len(
+                        cv2.approxPolyDP(contour, 0.09 * perimeter, True)
+                    ),
+                    "convex": bool(cv2.isContourConvex(contour)),
+                }
+            )
+
+        if len(rows) < 40:
+            return None
+
+        all_centers = np.array([row["center"] for row in rows], dtype=np.float32)
+        distances = np.linalg.norm(
+            all_centers[:, None, :] - all_centers[None, :, :], axis=2
+        )
+        np.fill_diagonal(distances, np.inf)
+        nearest = np.min(distances, axis=1)
+        nearest_distance = float(np.median(nearest[np.isfinite(nearest)]))
+        if nearest_distance <= 0:
+            return None
+
+        dense = np.sum(distances < 2.2 * nearest_distance, axis=1) >= 3
+        rows = [row for row, keep in zip(rows, dense) if keep]
+        if len(rows) < 40:
+            return None
+
+        median_area = float(np.median([row["area"] for row in rows]))
+        centers = np.array([row["center"] for row in rows], dtype=np.float32)
+        center_median = np.median(centers, axis=0)
+        center_span = np.ptp(centers, axis=0)
+
+        def is_central(row: dict) -> bool:
+            delta = np.abs(row["center"] - center_median)
+            return bool(np.all(delta <= np.maximum(0.28 * center_span, nearest_distance)))
+
+        square_candidates = [
+            (index, row)
+            for index, row in enumerate(rows)
+            if is_central(row)
+            and row["vertices_005"] == 4
+            and row["area"] >= 1.25 * median_area
+        ]
+        if not square_candidates:
+            return None
+        square_index, square = min(
+            square_candidates,
+            key=lambda item: (
+                np.linalg.norm(
+                    (item[1]["center"] - center_median)
+                    / np.maximum(center_span, nearest_distance)
+                ),
+                -item[1]["area"],
+            ),
+        )
+
+        triangle_candidates = [
+            (index, row)
+            for index, row in enumerate(rows)
+            if index != square_index
+            and is_central(row)
+            and 0.35 * nearest_distance
+            <= np.linalg.norm(row["center"] - square["center"])
+            <= 1.45 * nearest_distance
+            and row["vertices_009"] == 3
+            and 0.25 * median_area <= row["area"] <= 0.95 * median_area
+        ]
+        if not triangle_candidates:
+            triangle_candidates = [
+                (index, row)
+                for index, row in enumerate(rows)
+                if index != square_index
+                and 0.35 * nearest_distance
+                <= np.linalg.norm(row["center"] - square["center"])
+                <= 1.45 * nearest_distance
+                and 0.20 * median_area <= row["area"] <= 0.95 * median_area
+            ]
+        if not triangle_candidates:
+            return None
+
+        triangle_index, triangle = min(
+            triangle_candidates,
+            key=lambda item: (
+                0 if item[1]["vertices_009"] == 3 else 1,
+                item[1]["area"],
+            ),
+        )
+
+        circle_centers = np.array(
+            [
+                row["center"]
+                for index, row in enumerate(rows)
+                if index not in {square_index, triangle_index}
+                and 0.30 * median_area <= row["area"] <= 2.0 * median_area
+                and row["circularity"] >= 0.42
+            ],
+            dtype=np.float32,
+        )
+        if len(circle_centers) < 40:
+            return None
+        return circle_centers, square["center"], triangle["center"]
+
+    def _assign_lavision_interleaved_columns(
+        self,
+        centers: np.ndarray,
+        square_center: np.ndarray,
+        triangle_center: np.ndarray,
+    ) -> Optional[List[Tuple[int, int, int, float, float]]]:
+        """Index alternating depth columns without assuming one common plane."""
+        column_count = max(7, 2 * int(self.pattern_size[0]) - 1)
+        if len(centers) < column_count * 4:
+            return None
+
+        y_center = float(np.median(centers[:, 1]))
+        best_clustering = None
+        for shear in np.linspace(-0.12, 0.12, 49):
+            corrected_x = centers[:, 0] - shear * (centers[:, 1] - y_center)
+            sort_order = np.argsort(corrected_x)
+            sorted_x = corrected_x[sort_order].astype(np.float64)
+            prefix = np.concatenate(([0.0], np.cumsum(sorted_x)))
+            prefix_sq = np.concatenate(([0.0], np.cumsum(sorted_x * sorted_x)))
+            point_count = len(sorted_x)
+            infinity = float("inf")
+            dp = np.full((column_count + 1, point_count + 1), infinity)
+            previous = np.full(
+                (column_count + 1, point_count + 1), -1, dtype=np.int32
+            )
+            dp[0, 0] = 0.0
+
+            for cluster_index in range(1, column_count + 1):
+                for end in range(1, point_count + 1):
+                    for size in range(5, 12):
+                        start = end - size
+                        if start < 0 or not np.isfinite(
+                            dp[cluster_index - 1, start]
+                        ):
+                            continue
+                        value_sum = prefix[end] - prefix[start]
+                        value_sq_sum = prefix_sq[end] - prefix_sq[start]
+                        sse = value_sq_sum - value_sum * value_sum / size
+                        count_cost = 20.0 * (size - 7.5) ** 2
+                        score = dp[cluster_index - 1, start] + sse + count_cost
+                        if score < dp[cluster_index, end]:
+                            dp[cluster_index, end] = score
+                            previous[cluster_index, end] = start
+
+            if not np.isfinite(dp[column_count, point_count]):
+                continue
+            ordered_labels = np.empty(point_count, dtype=np.int32)
+            end = point_count
+            for cluster_index in range(column_count, 0, -1):
+                start = int(previous[cluster_index, end])
+                ordered_labels[sort_order[start:end]] = cluster_index - 1
+                end = start
+            score = float(dp[column_count, point_count])
+            if best_clustering is None or score < best_clustering[0]:
+                best_clustering = (score, ordered_labels)
+
+        if best_clustering is None:
+            return None
+        labels = best_clustering[1]
+
+        # Points in one physical column are separated by two fine-grid steps.
+        column_differences = []
+        for column_index in range(column_count):
+            indices = np.where(labels == column_index)[0]
+            ordered = indices[np.argsort(centers[indices, 1])]
+            if len(ordered) >= 2:
+                differences = np.diff(centers[ordered], axis=0)
+                column_differences.extend(
+                    difference
+                    for difference in differences
+                    if difference[1] > 0
+                )
+        if not column_differences:
+            return None
+        fine_vertical = 0.5 * np.median(
+            np.asarray(column_differences, dtype=np.float64), axis=0
+        )
+        nearest_distance = self._median_nearest_distance(centers)
+        local_vertical_offsets = []
+        for marker in (square_center, triangle_center):
+            delta_y = np.abs(centers[:, 1] - marker[1])
+            local_vertical_offsets.extend(
+                float(value)
+                for value in delta_y
+                if 0.30 * nearest_distance <= value <= 1.20 * nearest_distance
+            )
+        if local_vertical_offsets:
+            fine_vertical[1] = float(np.median(local_vertical_offsets))
+            fine_vertical[0] = 0.0
+        vertical_norm_sq = float(np.dot(fine_vertical, fine_vertical))
+        if vertical_norm_sq < 4.0:
+            return None
+
+        center_column = (column_count - 1) // 2
+        assignments = []
+        used_ids = set()
+        for column_index in range(column_count):
+            column_indices = np.where(labels == column_index)[0]
+            fine_x = int(column_index - center_column)
+            layer = 0.0 if abs(fine_x) % 2 == 0 else 1.0
+            layer_center = square_center if layer == 0.0 else triangle_center
+            y_coordinates = np.array(
+                [
+                    np.dot(
+                        centers[center_index].astype(np.float64)
+                        - layer_center.astype(np.float64),
+                        fine_vertical,
+                    )
+                    / vertical_norm_sq
+                    for center_index in column_indices
+                ],
+                dtype=np.float64,
+            )
+
+            phase_results = []
+            for phase in (0, 1):
+                fine_rows = (
+                    np.rint((y_coordinates - phase) / 2.0) * 2 + phase
+                ).astype(np.int32)
+                row_residuals = np.abs(y_coordinates - fine_rows)
+                phase_results.append(
+                    (
+                        len(set(int(value) for value in fine_rows)),
+                        -float(np.median(row_residuals)),
+                        fine_rows,
+                        row_residuals,
+                    )
+                )
+            _, _, fine_rows, row_residuals = max(
+                phase_results, key=lambda item: (item[0], item[1])
+            )
+            for center_index, fine_y, residual in zip(
+                column_indices, fine_rows, row_residuals
+            ):
+                point_id = (layer, fine_x, int(fine_y))
+                if (
+                    residual > 0.55
+                    or abs(int(fine_y)) > 7
+                    or point_id in used_ids
+                ):
+                    continue
+                used_ids.add(point_id)
+                assignments.append(
+                    (
+                        int(center_index),
+                        fine_x,
+                        int(fine_y),
+                        layer,
+                        float(residual),
+                    )
+                )
+
+        layer_counts = [
+            sum(row[3] == layer for row in assignments)
+            for layer in (0.0, 1.0)
+        ]
+        if min(layer_counts) < 40 or len(assignments) < 90:
+            return None
+        return assignments
+
+    def _fit_lavision_fine_lattice(
+        self, marker_center: np.ndarray, centers: np.ndarray
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, List[Tuple[int, np.ndarray, float]]]]:
+        """Recover the 15-column interleaved checker lattice around the square."""
+        offsets = centers.astype(np.float64) - marker_center.astype(np.float64)
+        radii = np.linalg.norm(offsets, axis=1)
+        nearby = np.argsort(radii)[: min(60, len(centers))]
+        opposite_vectors = []
+
+        for row, first in enumerate(nearby):
+            for second in nearby[row + 1 :]:
+                mean_radius = 0.5 * (radii[first] + radii[second])
+                if mean_radius < 4.0:
+                    continue
+                if abs(radii[first] - radii[second]) / mean_radius > 0.40:
+                    continue
+                symmetry_error = (
+                    np.linalg.norm(offsets[first] + offsets[second]) / mean_radius
+                )
+                if symmetry_error <= 0.35:
+                    opposite_vectors.append(
+                        (
+                            float(symmetry_error),
+                            0.5 * (offsets[first] - offsets[second]),
+                        )
+                    )
+
+        if len(opposite_vectors) < 2:
+            return None
+        opposite_vectors.sort(key=lambda item: item[0])
+        candidates = opposite_vectors[:60]
+
+        horizontal_candidates = []
+        for symmetry_error, raw_vector in candidates:
+            for scale in (0.5, 1.0, 2.0):
+                vector = raw_vector * scale
+                if abs(vector[0]) < 1.5 * abs(vector[1]):
+                    continue
+                if vector[0] < 0:
+                    vector = -vector
+                if not any(
+                    np.linalg.norm(vector - existing[1])
+                    < 0.08 * np.linalg.norm(vector)
+                    for existing in horizontal_candidates
+                ):
+                    horizontal_candidates.append((symmetry_error, vector))
+        horizontal_candidates = horizontal_candidates[:18]
+
+        best = None
+        for error_u, basis_u in horizontal_candidates:
+            for error_v, raw_v in candidates:
+                for x_multiple in range(-6, 7):
+                    for y_multiple in tuple(range(-6, 0)) + tuple(range(1, 7)):
+                        basis_v = (
+                            raw_v - x_multiple * basis_u
+                        ) / float(y_multiple)
+                        if abs(basis_v[1]) < 1.5 * abs(basis_v[0]):
+                            continue
+                        ratio = np.linalg.norm(basis_v) / np.linalg.norm(basis_u)
+                        if ratio < 0.55 or ratio > 1.8:
+                            continue
+                        if basis_v[1] < 0:
+                            basis_v = -basis_v
+
+                        basis = np.column_stack((basis_u, basis_v))
+                        if abs(np.linalg.det(basis)) < 20.0:
+                            continue
+                        uv = np.linalg.solve(basis, offsets.T).T
+                        rounded = np.rint(uv)
+                        residuals = np.linalg.norm(uv - rounded, axis=1)
+                        parity = (
+                            np.abs(rounded).astype(np.int32).sum(axis=1) % 2
+                        ) == 1
+                        valid = (
+                            (residuals <= 0.24)
+                            & parity
+                            & (np.abs(rounded[:, 0]) <= 8)
+                            & (np.abs(rounded[:, 1]) <= 9)
+                        )
+                        unique_count = len(
+                            {tuple(value.astype(np.int32)) for value in rounded[valid]}
+                        )
+                        if unique_count < 70:
+                            continue
+                        score = (
+                            unique_count * 10.0
+                            - float(np.median(residuals[valid])) * 10.0
+                            - error_u
+                            - error_v
+                        )
+                        if best is None or score > best[0]:
+                            best = (score, basis_u.copy(), basis_v.copy())
+
+        if best is None:
+            return None
+        _, basis_u, basis_v = best
+        if basis_u[0] < 0:
+            basis_u = -basis_u
+        if basis_v[1] < 0:
+            basis_v = -basis_v
+
+        uv = np.linalg.solve(
+            np.column_stack((basis_u, basis_v)), offsets.T
+        ).T
+        rounded = np.rint(uv).astype(np.int32)
+        residuals = np.linalg.norm(uv - rounded, axis=1)
+        best_by_grid: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        for index, (grid_xy, residual) in enumerate(zip(rounded, residuals)):
+            grid_key = (int(grid_xy[0]), int(grid_xy[1]))
+            if (
+                residual > 0.24
+                or (abs(grid_key[0]) + abs(grid_key[1])) % 2 != 1
+                or abs(grid_key[0]) > 8
+                or abs(grid_key[1]) > 9
+            ):
+                continue
+            current = best_by_grid.get(grid_key)
+            if current is None or residual < current[1]:
+                best_by_grid[grid_key] = (index, float(residual))
+
+        assignments = [
+            (center_index, np.array(grid_key, dtype=np.int32), residual)
+            for grid_key, (center_index, residual) in best_by_grid.items()
+        ]
+        if len(assignments) < 70:
+            return None
+        return basis_u.astype(np.float32), basis_v.astype(np.float32), assignments
+
+    def _fit_lavision_layer_lattice(
+        self, marker_center: np.ndarray, centers: np.ndarray
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, List[Tuple[int, np.ndarray, float]]]]:
+        offsets = centers.astype(np.float64) - marker_center.astype(np.float64)
+        radii = np.linalg.norm(offsets, axis=1)
+        nearby = np.argsort(radii)[: min(60, len(centers))]
+
+        opposite_vectors = []
+        for row, first in enumerate(nearby):
+            for second in nearby[row + 1 :]:
+                mean_radius = 0.5 * (radii[first] + radii[second])
+                if mean_radius < 4.0:
+                    continue
+                if abs(radii[first] - radii[second]) / mean_radius > 0.40:
+                    continue
+                symmetry_error = (
+                    np.linalg.norm(offsets[first] + offsets[second]) / mean_radius
+                )
+                if symmetry_error <= 0.35:
+                    opposite_vectors.append(
+                        (
+                            float(symmetry_error),
+                            0.5 * (offsets[first] - offsets[second]),
+                        )
+                    )
+
+        if len(opposite_vectors) < 2:
+            return None
+        opposite_vectors.sort(key=lambda item: item[0])
+        candidates = opposite_vectors[:60]
+
+        best = None
+        horizontal_candidates = []
+        for symmetry_error, raw_vector in candidates:
+            for scale in (1.0, 2.0):
+                vector = raw_vector * scale
+                if abs(vector[0]) < 1.5 * abs(vector[1]):
+                    continue
+                if vector[0] < 0:
+                    vector = -vector
+                if not any(
+                    np.linalg.norm(vector - existing[1])
+                    < 0.08 * np.linalg.norm(vector)
+                    for existing in horizontal_candidates
+                ):
+                    horizontal_candidates.append((symmetry_error, vector))
+        horizontal_candidates = horizontal_candidates[:16]
+
+        half_x_values = np.arange(-3.5, 4.0, 0.5)
+        y_multipliers = (-3, -2, -1, 1, 2, 3)
+        max_x = max(2.0, self.pattern_size[0] / 2.0 + 0.1)
+        max_y = max(2.0, (self.pattern_size[1] - 1) / 2.0 + 0.1)
+
+        for error_u, basis_u in horizontal_candidates:
+            for error_v, raw_v in candidates:
+                for x_multiple in half_x_values:
+                    for y_multiple in y_multipliers:
+                        basis_v = (
+                            raw_v - x_multiple * basis_u
+                        ) / float(y_multiple)
+                        if abs(basis_v[1]) < 1.5 * abs(basis_v[0]):
+                            continue
+                        if not 0.5 * np.linalg.norm(basis_u) <= np.linalg.norm(
+                            basis_v
+                        ) <= 2.5 * np.linalg.norm(basis_u):
+                            continue
+                        if basis_v[1] < 0:
+                            basis_v = -basis_v
+
+                        basis = np.column_stack((basis_u, basis_v))
+                        if abs(np.linalg.det(basis)) < 100.0:
+                            continue
+                        uv = np.linalg.solve(basis, offsets.T).T
+                        for phase_x, phase_y in ((0.5, 0.0), (0.0, 0.5)):
+                            rounded = np.column_stack(
+                                (
+                                    np.rint(uv[:, 0] - phase_x) + phase_x,
+                                    np.rint(uv[:, 1] - phase_y) + phase_y,
+                                )
+                            )
+                            residuals = np.linalg.norm(uv - rounded, axis=1)
+                            valid = (
+                                (residuals <= 0.24)
+                                & (np.abs(rounded[:, 0]) <= max_x)
+                                & (np.abs(rounded[:, 1]) <= max_y)
+                            )
+                            unique_count = len(
+                                {tuple(value) for value in rounded[valid]}
+                            )
+                            if unique_count < 20:
+                                continue
+                            score = (
+                                unique_count * 10.0
+                                - float(np.median(residuals[valid])) * 10.0
+                                - error_u
+                                - error_v
+                            )
+                            if best is None or score > best[0]:
+                                best = (
+                                    score,
+                                    basis_u.copy(),
+                                    basis_v.copy(),
+                                    phase_x,
+                                    phase_y,
+                                )
+
+        if best is None:
+            return None
+
+        _, basis_u, basis_v, phase_x, phase_y = best
+        # Stable orientation gives all cameras the same point IDs for an
+        # upright target, independent of contour ordering.
+        if basis_u[0] < 0:
+            basis_u = -basis_u
+        if basis_v[1] < 0:
+            basis_v = -basis_v
+
+        basis = np.column_stack((basis_u, basis_v))
+        uv = np.linalg.solve(basis, offsets.T).T
+        rounded = np.column_stack(
+            (
+                np.rint(uv[:, 0] - phase_x) + phase_x,
+                np.rint(uv[:, 1] - phase_y) + phase_y,
+            )
+        )
+        residuals = np.linalg.norm(uv - rounded, axis=1)
+
+        best_by_grid: Dict[Tuple[float, float], Tuple[int, float]] = {}
+        for index, (grid_xy, residual) in enumerate(zip(rounded, residuals)):
+            grid_key = (float(grid_xy[0]), float(grid_xy[1]))
+            if (
+                residual > 0.24
+                or abs(grid_key[0]) > max_x
+                or abs(grid_key[1]) > max_y
+            ):
+                continue
+            current = best_by_grid.get(grid_key)
+            if current is None or residual < current[1]:
+                best_by_grid[grid_key] = (index, float(residual))
+
+        assignments = [
+            (center_index, np.array(grid_key, dtype=np.float32), residual)
+            for grid_key, (center_index, residual) in best_by_grid.items()
+        ]
+        if len(assignments) < 20:
+            return None
+        return basis_u.astype(np.float32), basis_v.astype(np.float32), assignments
 
     def _extract_round_blob_centers(self, gray: np.ndarray) -> np.ndarray:
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -1202,7 +2081,8 @@ class MultiCameraCalibrator:
     def _draw_detected_points(
         self, image: np.ndarray, observation: PatternObservation
     ) -> np.ndarray:
-        vis = image.copy()
+        gray8 = self._to_gray8(image)
+        vis = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
         points = observation.image_points.reshape(-1, 2)
 
         for point, point_id in zip(points, observation.point_ids):
@@ -1229,11 +2109,12 @@ class MultiCameraCalibrator:
     ) -> CameraParams:
         obj_points_list = []
         img_points_list = []
+        observations: List[Optional[PatternObservation]] = []
         detected_count = 0
         image_size = None
 
         for img_path in image_paths:
-            img = cv2.imread(img_path)
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
             if img is None:
                 logger.warning("Failed to read image: %s", img_path)
                 continue
@@ -1242,11 +2123,33 @@ class MultiCameraCalibrator:
                 image_size = (img.shape[1], img.shape[0])
 
             observation = self.detect_pattern_observation(img)
+            observations.append(observation)
             if observation is None:
                 continue
 
-            obj_points_list.append(observation.object_points.copy())
-            img_points_list.append(observation.image_points.copy())
+            if self.pattern_type == "volume_dots":
+                # Each detected LaVision level is internally very accurate,
+                # while a wrong cross-level correspondence produces a
+                # plausible-looking but physically impossible intrinsic fit.
+                # Use the square-fiducial level for stable intrinsics; both
+                # levels remain available in `observations` for display.
+                calibration_indices = [
+                    index
+                    for index, point_id in enumerate(observation.point_ids)
+                    if len(point_id) == 3
+                    and point_id[0] == 0.0
+                    and point_id[1:] != (0.0, 0.0)
+                ]
+            else:
+                calibration_indices = list(range(len(observation.point_ids)))
+            if len(calibration_indices) < 8:
+                continue
+            obj_points_list.append(
+                observation.object_points[calibration_indices].copy()
+            )
+            img_points_list.append(
+                observation.image_points[calibration_indices].copy()
+            )
             detected_count += 1
 
             if show_detection:
@@ -1273,8 +2176,38 @@ class MultiCameraCalibrator:
             len(image_paths),
         )
 
+        camera_matrix_guess = None
+        calibration_flags = 0
+        if self.pattern_type == "volume_dots":
+            focal_guess = float(max(image_size)) * 3.0
+            camera_matrix_guess = np.array(
+                [
+                    [focal_guess, 0.0, image_size[0] * 0.5],
+                    [0.0, focal_guess, image_size[1] * 0.5],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            calibration_flags |= (
+                cv2.CALIB_USE_INTRINSIC_GUESS
+                | cv2.CALIB_FIX_ASPECT_RATIO
+                | cv2.CALIB_FIX_PRINCIPAL_POINT
+                | cv2.CALIB_ZERO_TANGENT_DIST
+                | cv2.CALIB_FIX_K1
+                | cv2.CALIB_FIX_K2
+                | cv2.CALIB_FIX_K3
+                | cv2.CALIB_FIX_K4
+                | cv2.CALIB_FIX_K5
+                | cv2.CALIB_FIX_K6
+            )
+
         rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-            obj_points_list, img_points_list, image_size, None, None
+            obj_points_list,
+            img_points_list,
+            image_size,
+            camera_matrix_guess,
+            None,
+            flags=calibration_flags,
         )
 
         rvec_avg = np.mean(np.array([r.flatten() for r in rvecs]), axis=0)
@@ -1296,6 +2229,15 @@ class MultiCameraCalibrator:
             "img_points": img_points_list,
             "rvecs": rvecs,
             "tvecs": tvecs,
+            "observations": observations,
+            "full_object_points": (
+                observations[next(
+                    index for index, value in enumerate(observations)
+                    if value is not None
+                )].object_points.copy()
+                if any(value is not None for value in observations)
+                else np.empty((0, 3), dtype=np.float32)
+            ),
         }
 
         logger.info(
@@ -1318,7 +2260,195 @@ class MultiCameraCalibrator:
             logger.info("Calibrating camera %s with %d images", cam_id, len(img_paths))
             results[cam_id] = self.calibrate_camera(cam_id, img_paths, show_detection)
 
+        self.finalize_multi_camera_calibration()
         return results
+
+    def finalize_multi_camera_calibration(self) -> Dict[str, dict]:
+        """Place all cameras in one physically consistent target coordinate frame.
+
+        LaVision plates provide excellent per-level planar correspondences. For
+        same-resolution camera arrays, a shared robust focal estimate prevents
+        a weak single view from drifting to an extreme focal length. Relative
+        poses are then solved from the square-fiducial level common to each
+        camera pair and composed with the reference-camera board pose.
+        """
+        camera_ids = list(self.camera_params)
+        if len(camera_ids) < 2:
+            return {}
+
+        if self.pattern_type == "volume_dots":
+            image_sizes = {
+                tuple(self.camera_params[camera_id].image_size)
+                for camera_id in camera_ids
+            }
+            widths = [size[0] for size in image_sizes]
+            heights = [size[1] for size in image_sizes]
+            same_sensor_format = (
+                max(widths) - min(widths) <= 2
+                and max(heights) - min(heights) <= 2
+            )
+            if same_sensor_format:
+                focal_values = [
+                    0.5
+                    * (
+                        self.camera_params[camera_id].camera_matrix[0][0]
+                        + self.camera_params[camera_id].camera_matrix[1][1]
+                    )
+                    for camera_id in camera_ids
+                ]
+                shared_focal = float(np.median(focal_values))
+                fixed_flags = (
+                    cv2.CALIB_USE_INTRINSIC_GUESS
+                    | cv2.CALIB_FIX_FOCAL_LENGTH
+                    | cv2.CALIB_FIX_PRINCIPAL_POINT
+                    | cv2.CALIB_ZERO_TANGENT_DIST
+                    | cv2.CALIB_FIX_K1
+                    | cv2.CALIB_FIX_K2
+                    | cv2.CALIB_FIX_K3
+                    | cv2.CALIB_FIX_K4
+                    | cv2.CALIB_FIX_K5
+                    | cv2.CALIB_FIX_K6
+                )
+                for camera_id in camera_ids:
+                    data = self._calib_data[camera_id]
+                    image_size = tuple(
+                        self.camera_params[camera_id].image_size
+                    )
+                    camera_matrix = np.array(
+                        [
+                            [shared_focal, 0.0, image_size[0] * 0.5],
+                            [0.0, shared_focal, image_size[1] * 0.5],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        dtype=np.float64,
+                    )
+                    rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+                        data["obj_points"],
+                        data["img_points"],
+                        image_size,
+                        camera_matrix,
+                        None,
+                        flags=fixed_flags,
+                    )
+                    params = self.camera_params[camera_id]
+                    params.camera_matrix = camera_matrix.tolist()
+                    params.dist_coeffs = dist_coeffs.flatten().tolist()
+                    params.rms_error = float(rms)
+                    data["rvecs"] = rvecs
+                    data["tvecs"] = tvecs
+
+        reference_id = camera_ids[0]
+        reference_data = self._calib_data[reference_id]
+        if not reference_data.get("rvecs") or not reference_data.get("tvecs"):
+            return {}
+
+        reference_rvec = np.asarray(reference_data["rvecs"][0]).reshape(3, 1)
+        reference_tvec = np.asarray(reference_data["tvecs"][0]).reshape(3, 1)
+        reference_rotation, _ = cv2.Rodrigues(reference_rvec)
+        joint_poses: Dict[str, dict] = {
+            reference_id: {
+                "rvec": reference_rvec.reshape(3),
+                "tvec": reference_tvec.reshape(3),
+                "stereo_rms": 0.0,
+            }
+        }
+
+        for camera_id in camera_ids[1:]:
+            other_data = self._calib_data[camera_id]
+            obj_points = []
+            reference_points = []
+            other_points = []
+            for reference_obs, other_obs in zip(
+                reference_data.get("observations", []),
+                other_data.get("observations", []),
+            ):
+                if reference_obs is None or other_obs is None:
+                    continue
+                common_ids = sorted(
+                    [
+                        point_id
+                        for point_id in (
+                            set(reference_obs.point_ids)
+                            & set(other_obs.point_ids)
+                        )
+                        if (
+                            len(point_id) != 3
+                            or (
+                                point_id[0] == 0.0
+                                and point_id[1:] != (0.0, 0.0)
+                            )
+                        )
+                    ],
+                    key=self._point_sort_key,
+                )
+                if len(common_ids) < 8:
+                    continue
+                reference_map = dict(
+                    zip(
+                        reference_obs.point_ids,
+                        reference_obs.image_points.reshape(-1, 2),
+                    )
+                )
+                other_map = dict(
+                    zip(
+                        other_obs.point_ids,
+                        other_obs.image_points.reshape(-1, 2),
+                    )
+                )
+                obj_points.append(self._object_points_from_ids(common_ids))
+                reference_points.append(
+                    np.asarray(
+                        [reference_map[point_id] for point_id in common_ids],
+                        dtype=np.float32,
+                    ).reshape(-1, 1, 2)
+                )
+                other_points.append(
+                    np.asarray(
+                        [other_map[point_id] for point_id in common_ids],
+                        dtype=np.float32,
+                    ).reshape(-1, 1, 2)
+                )
+
+            if len(obj_points) < 2:
+                logger.warning(
+                    "Camera %s has insufficient paired observations for joint alignment",
+                    camera_id,
+                )
+                continue
+
+            reference_params = self.camera_params[reference_id]
+            other_params = self.camera_params[camera_id]
+            stereo_rms, _, _, _, _, relative_rotation, relative_translation, _, _ = (
+                cv2.stereoCalibrate(
+                    obj_points,
+                    reference_points,
+                    other_points,
+                    np.asarray(reference_params.camera_matrix, dtype=np.float64),
+                    np.asarray(reference_params.dist_coeffs, dtype=np.float64),
+                    np.asarray(other_params.camera_matrix, dtype=np.float64),
+                    np.asarray(other_params.dist_coeffs, dtype=np.float64),
+                    tuple(reference_params.image_size),
+                    flags=cv2.CALIB_FIX_INTRINSIC,
+                )
+            )
+            world_to_camera = relative_rotation @ reference_rotation
+            world_translation = (
+                relative_rotation @ reference_tvec + relative_translation
+            )
+            world_rvec, _ = cv2.Rodrigues(world_to_camera)
+            joint_poses[camera_id] = {
+                "rvec": world_rvec.reshape(3),
+                "tvec": world_translation.reshape(3),
+                "stereo_rms": float(stereo_rms),
+            }
+
+        for camera_id, pose in joint_poses.items():
+            params = self.camera_params[camera_id]
+            params.rvec = np.asarray(pose["rvec"]).reshape(3).tolist()
+            params.tvec = np.asarray(pose["tvec"]).reshape(3).tolist()
+
+        self._joint_camera_poses = joint_poses
+        return joint_poses
 
     def stereo_calibrate_pair(
         self,
@@ -1337,8 +2467,8 @@ class MultiCameraCalibrator:
         img2_pts = []
 
         for img1_path, img2_path in image_pairs:
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
+            img1 = cv2.imread(img1_path, cv2.IMREAD_UNCHANGED)
+            img2 = cv2.imread(img2_path, cv2.IMREAD_UNCHANGED)
             if img1 is None or img2 is None:
                 continue
 
@@ -1351,6 +2481,12 @@ class MultiCameraCalibrator:
                 set(obs1.point_ids) & set(obs2.point_ids),
                 key=self._point_sort_key,
             )
+            if self.pattern_type == "volume_dots":
+                common_ids = [
+                    point_id
+                    for point_id in common_ids
+                    if not (len(point_id) == 3 and point_id[1:] == (0.0, 0.0))
+                ]
             if len(common_ids) < 5:
                 continue
 
@@ -1451,6 +2587,11 @@ class MultiCameraCalibrator:
             "square_size": self.square_size,
             "circle_radius": self.circle_radius,
             "level_separation": self.level_separation,
+            "origin_point_id": (
+                list(self.origin_point_id)
+                if self.origin_point_id is not None
+                else None
+            ),
             "num_cameras": len(self.camera_params),
             "cameras": {},
         }
@@ -1498,6 +2639,11 @@ class MultiCameraCalibrator:
                 "level_separation",
                 max(1.0, 0.2 * float(calib.square_size)),
             )
+            origin_point_id = summary.get("origin_point_id")
+            calib.origin_point_id = (
+                tuple(origin_point_id) if origin_point_id is not None else None
+            )
+            calib.obj_points = calib._generate_object_points()
             calib.obj_points = calib._generate_object_points()
 
         logger.info("Loaded calibration results for %d cameras", len(calib.camera_params))

@@ -1,0 +1,38 @@
+{
+  "calibration_type": "single_image_scale",
+  "image_path": "C:/Users/songyuchen/Seafile/Code/BubbleandPIV/bubble1/calibration_images/single_camera/camera_1/frame_01.png",
+  "image_size": [
+    1280,
+    960
+  ],
+  "ruler_distance_px": 439.25399782867487,
+  "actual_size_mm": 100.0,
+  "mm_per_px": 0.22765871339662494,
+  "px_per_mm": 4.392539978286749,
+  "camera_matrix": [
+    [
+      4.392539978286749,
+      0.0,
+      640.0
+    ],
+    [
+      0.0,
+      4.392539978286749,
+      480.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "dist_coeffs": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "rms": 0.0,
+  "n_images": 1
+}

@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QStatusBar, QToolBar, QAction, QActionGroup, QFrame, QListWidget,
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
     QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy,
-    QGraphicsDropShadowEffect, QDialog, QDialogButtonBox
+    QGraphicsDropShadowEffect, QDialog, QDialogButtonBox, QToolButton
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher,
@@ -34,6 +34,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from calibration.camera_calibrator import MultiCameraCalibrator, CameraParams
 from mart.mart_reconstructor import (
@@ -228,6 +229,9 @@ class CalibrationWorker(QThread):
                 self.progress.emit(f"正在标定相机 {cam_id}...")
                 params = self.calibrator.calibrate_camera(cam_id, img_paths)
                 results[cam_id] = params
+            if len(results) >= 2:
+                self.progress.emit("正在联合对齐多相机坐标系...")
+                self.calibrator.finalize_multi_camera_calibration()
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(str(e))
@@ -253,17 +257,45 @@ class PreviewImageLoader(QThread):
         detection = None
         if self.detection_config:
             try:
-                detector = MultiCameraCalibrator(**self.detection_config)
+                config = dict(self.detection_config)
+                auto_detect = bool(config.pop("auto_detect", False))
+                config.pop("origin_point_id", None)
                 source = image
                 if image.ndim == 2:
                     source = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                 elif image.ndim == 3 and image.shape[2] == 4:
                     source = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                observation = detector.detect_pattern_observation(source)
+
+                detected_type = str(config.get("pattern_type", "checkerboard"))
+                detected_size = tuple(config.get("pattern_size", (11, 8)))
+                inferred_size = False
+                if auto_detect:
+                    auto_result = MultiCameraCalibrator.detect_pattern_automatically(
+                        source,
+                        pattern_size_hint=detected_size,
+                        pattern_type_hint=detected_type,
+                        square_size=float(config.get("square_size", 1.0)),
+                        circle_radius=float(config.get("circle_radius", 0.5)),
+                        level_separation=config.get("level_separation"),
+                    )
+                    if auto_result is None:
+                        observation = None
+                    else:
+                        observation = auto_result["observation"]
+                        detected_type = str(auto_result["pattern_type"])
+                        detected_size = tuple(auto_result["pattern_size"])
+                        inferred_size = bool(auto_result["inferred_size"])
+                else:
+                    detector = MultiCameraCalibrator(**config)
+                    observation = detector.detect_pattern_observation(source)
+
                 if observation is not None:
                     detection = {
                         "points": observation.image_points.reshape(-1, 2).tolist(),
                         "point_ids": [tuple(point_id) for point_id in observation.point_ids],
+                        "pattern_type": detected_type,
+                        "pattern_size": detected_size,
+                        "inferred_size": inferred_size,
                     }
             except Exception as exc:
                 detection = {"error": str(exc)}
@@ -1525,6 +1557,8 @@ class PIV2DPreviewWidget(QWidget):
 class CalibrationPreviewWidget(QWidget):
     """Interactive calibration image viewer with colorbar, pixel readout, and ruler."""
     rulerDistanceChanged = pyqtSignal(float)
+    patternDetected = pyqtSignal(str, int, int)
+    originPointChanged = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1534,12 +1568,15 @@ class CalibrationPreviewWidget(QWidget):
         self._current_array = None
         self._current_gray = None
         self._current_is_static = False
+        self._current_is_3d = False
         self._current_title = ""
         self._current_with_colorbar = True
         self._detection_config: Optional[dict] = None
         self._current_detection = None
+        self._selected_origin_point_id = None
         self._preview_request_id = 0
         self._preview_loaders = []
+        self._pending_preview_request = None
         self._ruler_enabled = False
         self._ruler_points = []
         self._ruler_dragging = False
@@ -1569,7 +1606,33 @@ class CalibrationPreviewWidget(QWidget):
         self.next_camera_btn = QPushButton("下一组")
         self.next_camera_btn.clicked.connect(self._show_next_camera)
         camera_row.addWidget(self.next_camera_btn)
+        self.scene_view_combo = QComboBox()
+        self.scene_view_combo.addItems(
+            ["空间视角", "标定板正视", "XZ 侧视", "YZ 侧视"]
+        )
+        self.scene_view_combo.currentIndexChanged.connect(
+            self._on_scene_view_changed
+        )
+        self.scene_view_combo.setVisible(False)
+        camera_row.addWidget(self.scene_view_combo)
         layout.addLayout(camera_row)
+
+        detection_row = QHBoxLayout()
+        self.auto_detect_check = QCheckBox("自动识别标定板")
+        self.auto_detect_check.setChecked(True)
+        self.auto_detect_check.toggled.connect(self._on_auto_detection_toggled)
+        detection_row.addWidget(self.auto_detect_check)
+        self.select_origin_btn = QPushButton("在图中选择中心原点")
+        self.select_origin_btn.setCheckable(True)
+        self.select_origin_btn.setToolTip("启用后，在右侧图像中点击一个已识别点作为坐标原点")
+        detection_row.addWidget(self.select_origin_btn)
+        self.clear_origin_btn = QPushButton("清除原点")
+        self.clear_origin_btn.clicked.connect(self.clear_origin_point)
+        self.clear_origin_btn.setEnabled(False)
+        detection_row.addWidget(self.clear_origin_btn)
+        self.origin_label = QLabel("原点：未选择")
+        detection_row.addWidget(self.origin_label, stretch=1)
+        layout.addLayout(detection_row)
 
         self.figure = Figure(figsize=(6, 4), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
@@ -1607,13 +1670,59 @@ class CalibrationPreviewWidget(QWidget):
 
     def set_detection_config(self, config: Optional[dict]):
         self._detection_config = dict(config) if config else None
+        if self._detection_config is not None:
+            checked = bool(self._detection_config.get("auto_detect", True))
+            self.auto_detect_check.blockSignals(True)
+            self.auto_detect_check.setChecked(checked)
+            self.auto_detect_check.blockSignals(False)
+
+    def set_origin_point_id(self, point_id):
+        self._selected_origin_point_id = (
+            tuple(point_id) if point_id is not None else None
+        )
+        self._update_origin_label()
+        self._redraw_current()
+
+    def origin_point_id(self):
+        return self._selected_origin_point_id
+
+    def clear_origin_point(self):
+        self._selected_origin_point_id = None
+        self.select_origin_btn.setChecked(False)
+        self._update_origin_label()
+        self.originPointChanged.emit(None)
+        self._redraw_current()
+
+    def _update_origin_label(self):
+        if self._selected_origin_point_id is None:
+            self.origin_label.setText("原点：未选择")
+            self.clear_origin_btn.setEnabled(False)
+            return
+        label = ",".join(
+            f"{float(value):g}" for value in self._selected_origin_point_id
+        )
+        self.origin_label.setText(f"原点：({label})")
+        self.clear_origin_btn.setEnabled(True)
+
+    def _on_auto_detection_toggled(self, checked: bool):
+        if self._detection_config is None:
+            self._detection_config = {}
+        self._detection_config["auto_detect"] = bool(checked)
+        if not checked:
+            self.select_origin_btn.setChecked(False)
+        if not self._current_is_static:
+            self._render_current_dataset_image()
 
     def clear(self):
+        self._preview_request_id += 1
+        self._pending_preview_request = None
+        self.scene_view_combo.setVisible(False)
         self._datasets = {}
         self._camera_ids = []
         self._current_array = None
         self._current_gray = None
         self._current_is_static = False
+        self._current_is_3d = False
         self._current_title = ""
         self._current_detection = None
         self._ruler_points = []
@@ -1641,6 +1750,7 @@ class CalibrationPreviewWidget(QWidget):
         datasets: Dict[str, List[str]],
         selected_key: Optional[str] = None,
     ):
+        self.scene_view_combo.setVisible(False)
         filtered = {
             key: [path for path in paths if path]
             for key, paths in datasets.items()
@@ -1651,6 +1761,7 @@ class CalibrationPreviewWidget(QWidget):
         self._current_array = None
         self._current_gray = None
         self._current_is_static = False
+        self._current_is_3d = False
         self._current_title = ""
         self._current_detection = None
 
@@ -1675,7 +1786,9 @@ class CalibrationPreviewWidget(QWidget):
         self._render_current_dataset_image()
 
     def show_static_image(self, image_path: str, title: Optional[str] = None):
+        self.scene_view_combo.setVisible(False)
         self._current_is_static = True
+        self._current_is_3d = False
         self.camera_combo.setEnabled(False)
         self.prev_camera_btn.setEnabled(False)
         self.next_camera_btn.setEnabled(False)
@@ -1688,6 +1801,383 @@ class CalibrationPreviewWidget(QWidget):
             title or os.path.basename(image_path),
             with_colorbar=True,
         )
+
+    def show_calibration_scene(
+        self,
+        camera_poses: Dict[str, dict],
+        board_points: np.ndarray,
+        pattern_type: str,
+        title: str = "Camera calibration 3D view",
+    ):
+        """Render camera centers, optical directions and calibration target."""
+        points = np.asarray(board_points, dtype=np.float64).reshape(-1, 3)
+        if points.size == 0:
+            self._render_placeholder("没有可显示的标定板三维点")
+            return
+
+        self._preview_request_id += 1
+        self._pending_preview_request = None
+        self._current_array = None
+        self._current_gray = None
+        self._current_detection = None
+        self._current_is_static = True
+        self._current_is_3d = True
+        self._current_title = title
+        self.scene_view_combo.blockSignals(True)
+        self.scene_view_combo.setCurrentIndex(0)
+        self.scene_view_combo.blockSignals(False)
+        self.scene_view_combo.setVisible(True)
+        self.camera_combo.setEnabled(False)
+        self.prev_camera_btn.setEnabled(False)
+        self.next_camera_btn.setEnabled(False)
+        self.image_slider.setEnabled(False)
+        self.image_index_label.setText("3D")
+        self.pixel_label.setText("鼠标左键拖动旋转，滚轮缩放")
+
+        self.figure.clear()
+        self.axes = self.figure.add_subplot(111, projection="3d")
+        ax = self.axes
+
+        board_span = max(
+            float(np.ptp(points[:, 0])),
+            float(np.ptp(points[:, 1])),
+            float(np.ptp(points[:, 2])),
+            1.0,
+        )
+        board_center = np.mean(points, axis=0)
+        layer_values = np.unique(np.round(points[:, 2], decimals=6))
+        layer_colors = ["#2f80ed", "#00b894", "#9b51e0", "#f2c94c"]
+
+        # Render every physical target level as a translucent plate rather than
+        # leaving the user to infer orientation from a point cloud.
+        for layer_index, layer_z in enumerate(layer_values):
+            layer_mask = np.isclose(points[:, 2], layer_z, atol=1e-5)
+            layer_points = points[layer_mask]
+            if len(layer_points) == 0:
+                continue
+            xmin, xmax = (
+                float(layer_points[:, 0].min()),
+                float(layer_points[:, 0].max()),
+            )
+            ymin, ymax = (
+                float(layer_points[:, 1].min()),
+                float(layer_points[:, 1].max()),
+            )
+            color = layer_colors[layer_index % len(layer_colors)]
+            corners = np.array(
+                [
+                    [xmin, ymin, layer_z],
+                    [xmax, ymin, layer_z],
+                    [xmax, ymax, layer_z],
+                    [xmin, ymax, layer_z],
+                ],
+                dtype=np.float64,
+            )
+            plate = Poly3DCollection(
+                [corners],
+                facecolor=color,
+                edgecolor=color,
+                linewidth=1.6,
+                alpha=0.16,
+            )
+            ax.add_collection3d(plate)
+            closed = np.vstack([corners, corners[0]])
+            ax.plot(
+                closed[:, 0],
+                closed[:, 1],
+                closed[:, 2],
+                color=color,
+                linewidth=1.5,
+            )
+            ax.scatter(
+                layer_points[:, 0],
+                layer_points[:, 1],
+                layer_points[:, 2],
+                s=16,
+                color=color,
+                edgecolors="white",
+                linewidths=0.25,
+                depthshade=False,
+                label=f"标定板层 {layer_index + 1} (Z={layer_z:g} mm)",
+            )
+
+        ax.scatter(
+            [0.0], [0.0], [0.0],
+            s=95, marker="*", color="#ff3b30", depthshade=False,
+            label="标定原点",
+        )
+
+        # Board coordinate frame: RGB follows the conventional X/Y/Z colors.
+        board_axis_length = board_span * 0.34
+        board_axes = np.eye(3, dtype=np.float64) * board_axis_length
+        axis_colors = ("#e74c3c", "#27ae60", "#2980b9")
+        axis_labels = ("Xb", "Yb", "Zb / 板面法向")
+        for direction, color, label in zip(
+            board_axes, axis_colors, axis_labels
+        ):
+            ax.quiver(
+                0.0, 0.0, 0.0,
+                direction[0], direction[1], direction[2],
+                color=color,
+                linewidth=2.4,
+                arrow_length_ratio=0.14,
+            )
+            endpoint = direction * 1.08
+            ax.text(
+                endpoint[0], endpoint[1], endpoint[2],
+                label, color=color, fontsize=9, fontweight="bold",
+            )
+
+        normal_start = np.array(
+            [board_center[0], board_center[1], float(np.max(layer_values))],
+            dtype=np.float64,
+        )
+        normal_length = board_span * 0.48
+        ax.quiver(
+            normal_start[0], normal_start[1], normal_start[2],
+            0.0, 0.0, normal_length,
+            color="#1565c0",
+            linewidth=3.0,
+            arrow_length_ratio=0.16,
+        )
+        ax.text(
+            normal_start[0],
+            normal_start[1],
+            normal_start[2] + normal_length * 1.08,
+            "标定板正面 (+Z)",
+            color="#1565c0",
+            fontsize=9,
+            ha="center",
+            fontweight="bold",
+        )
+
+        scene_points = [
+            points,
+            np.zeros((1, 3), dtype=np.float64),
+            board_axes,
+            (normal_start + np.array([0.0, 0.0, normal_length])).reshape(1, 3),
+        ]
+        camera_colors = [
+            "#566573", "#f1c40f", "#95a5a6", "#e84393",
+            "#2d98da", "#20bf6b", "#eb3b5a", "#8854d0",
+        ]
+
+        for index, (camera_id, pose) in enumerate(camera_poses.items()):
+            rotation_vector = np.asarray(
+                pose["rvec"], dtype=np.float64
+            ).reshape(3, 1)
+            translation = np.asarray(
+                pose["tvec"], dtype=np.float64
+            ).reshape(3, 1)
+            rotation, _ = cv2.Rodrigues(rotation_vector)
+            center = (-rotation.T @ translation).reshape(3)
+            color = camera_colors[index % len(camera_colors)]
+            camera_right = rotation.T[:, 0]
+            camera_up = rotation.T[:, 1]
+            camera_forward = rotation.T[:, 2]
+            to_board = board_center - center
+            to_board_norm = max(float(np.linalg.norm(to_board)), 1e-9)
+            if float(np.dot(camera_forward, to_board)) < 0.0:
+                camera_forward = -camera_forward
+
+            camera_distance = float(np.linalg.norm(center - board_center))
+            frustum_depth = max(
+                board_span * 0.42, camera_distance * 0.075, 1.0
+            )
+            half_width = frustum_depth * 0.55
+            half_height = frustum_depth * 0.40
+            camera_corners = np.array(
+                [
+                    [-half_width, -half_height, frustum_depth],
+                    [half_width, -half_height, frustum_depth],
+                    [half_width, half_height, frustum_depth],
+                    [-half_width, half_height, frustum_depth],
+                ],
+                dtype=np.float64,
+            )
+            world_corners = center + (rotation.T @ camera_corners.T).T
+            optical_length = max(
+                board_span * 0.9,
+                min(camera_distance * 0.58, camera_distance - board_span * 0.2),
+            )
+            optical_end = center + camera_forward * optical_length
+
+            ax.scatter(
+                [center[0]], [center[1]], [center[2]],
+                s=72, marker="s", color=color, edgecolors="black",
+                linewidths=0.6, depthshade=False, label=f"相机 {camera_id}",
+            )
+            alignment = float(
+                np.clip(np.dot(camera_forward, to_board / to_board_norm), -1.0, 1.0)
+            )
+            aiming_error = float(np.degrees(np.arccos(alignment)))
+            ax.text(
+                center[0], center[1], center[2],
+                f"  {camera_id}\n  光轴偏角 {aiming_error:.1f}°",
+                color=color, fontsize=9, fontweight="bold",
+            )
+            ax.quiver(
+                center[0], center[1], center[2],
+                *(camera_forward * optical_length),
+                color=color,
+                linewidth=3.0,
+                arrow_length_ratio=0.07,
+            )
+            ax.plot(
+                [center[0], board_center[0]],
+                [center[1], board_center[1]],
+                [center[2], board_center[2]],
+                color=color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.48,
+            )
+
+            frustum_faces = [
+                [center, world_corners[0], world_corners[1]],
+                [center, world_corners[1], world_corners[2]],
+                [center, world_corners[2], world_corners[3]],
+                [center, world_corners[3], world_corners[0]],
+                list(world_corners),
+            ]
+            ax.add_collection3d(
+                Poly3DCollection(
+                    frustum_faces,
+                    facecolor=color,
+                    edgecolor=color,
+                    linewidth=0.9,
+                    alpha=0.09,
+                )
+            )
+            closed = np.vstack([world_corners, world_corners[0]])
+            ax.plot(
+                closed[:, 0], closed[:, 1], closed[:, 2],
+                color=color, linewidth=1.4,
+            )
+
+            # Camera-local axes make roll as well as viewing direction visible.
+            camera_axis_length = max(board_span * 0.16, frustum_depth * 0.34)
+            for direction, axis_color in zip(
+                (camera_right, camera_up, camera_forward), axis_colors
+            ):
+                ax.quiver(
+                    center[0], center[1], center[2],
+                    *(direction * camera_axis_length),
+                    color=axis_color,
+                    linewidth=1.5,
+                    arrow_length_ratio=0.16,
+                )
+            zc_end = center + camera_forward * camera_axis_length
+            ax.text(
+                zc_end[0], zc_end[1], zc_end[2],
+                " 视线方向", color="#2980b9", fontsize=8,
+            )
+
+            # A small camera body behind the optical center reinforces which
+            # side of the frustum is the camera and which side is the scene.
+            body_center = center - camera_forward * camera_axis_length * 0.18
+            body_width = camera_axis_length * 0.62
+            body_height = camera_axis_length * 0.44
+            body_corners = np.array(
+                [
+                    body_center - camera_right * body_width - camera_up * body_height,
+                    body_center + camera_right * body_width - camera_up * body_height,
+                    body_center + camera_right * body_width + camera_up * body_height,
+                    body_center - camera_right * body_width + camera_up * body_height,
+                ]
+            )
+            ax.add_collection3d(
+                Poly3DCollection(
+                    [body_corners],
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.8,
+                    alpha=0.62,
+                )
+            )
+            scene_points.extend(
+                [
+                    center.reshape(1, 3),
+                    world_corners,
+                    body_corners,
+                    optical_end.reshape(1, 3),
+                ]
+            )
+
+        all_points = np.vstack(scene_points)
+        mins = all_points.min(axis=0)
+        maxs = all_points.max(axis=0)
+        center = (mins + maxs) / 2.0
+        radius = max(float(np.max(maxs - mins)) / 2.0, 1.0) * 1.08
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+        self._scene_full_limits = (
+            (center[0] - radius, center[0] + radius),
+            (center[1] - radius, center[1] + radius),
+            (center[2] - radius, center[2] + radius),
+        )
+        board_radius = board_span * 0.72
+        self._scene_board_limits = (
+            (board_center[0] - board_radius, board_center[0] + board_radius),
+            (board_center[1] - board_radius, board_center[1] + board_radius),
+            (board_center[2] - board_radius, board_center[2] + board_radius),
+        )
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Y (mm)")
+        ax.set_zlabel("Z (mm)")
+        ax.set_title(title)
+        ax.view_init(elev=24, azim=-58)
+        ax.set_proj_type("persp", focal_length=0.9)
+        ax.legend(loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        if self._plot_theme:
+            apply_scientific_figure_theme(
+                self.figure, self.canvas, self._plot_theme
+            )
+        self.info_label.setText(
+            f"{title} | {len(camera_poses)} 台相机 | "
+            f"{len(points)} 个标定板点"
+        )
+        self.canvas.draw_idle()
+
+    def _on_scene_view_changed(self, index: int):
+        if not self._current_is_3d or not hasattr(self, "axes"):
+            return
+        views = {
+            0: (24, -58),   # spatial/isometric
+            1: (90, -90),   # board front, looking along Z
+            2: (0, -90),    # XZ side
+            3: (0, 0),      # YZ side
+        }
+        elev, azim = views.get(index, views[0])
+        limits = (
+            getattr(self, "_scene_board_limits", None)
+            if index == 1
+            else getattr(self, "_scene_full_limits", None)
+        )
+        if limits is not None:
+            self.axes.set_xlim(*limits[0])
+            self.axes.set_ylim(*limits[1])
+            self.axes.set_zlim(*limits[2])
+        legend = self.axes.get_legend()
+        if index == 1:
+            self.axes.set_proj_type("ortho")
+            self.axes.set_zticks([])
+            self.axes.set_zlabel("")
+            if legend is not None:
+                legend.set_visible(False)
+        else:
+            self.axes.set_proj_type("persp", focal_length=0.9)
+            self.axes.set_zlabel("Z (mm)")
+            if limits is not None:
+                self.axes.set_zticks(np.linspace(limits[2][0], limits[2][1], 5))
+            if legend is not None:
+                legend.set_visible(True)
+        self.axes.view_init(elev=elev, azim=azim)
+        self.canvas.draw_idle()
 
     def enable_ruler(self, enabled: bool = True):
         self._ruler_enabled = enabled
@@ -1753,6 +2243,22 @@ class CalibrationPreviewWidget(QWidget):
         self._current_gray = None
         self._render_placeholder("正在加载预览...")
 
+        request = (request_id, image_path, title, with_colorbar)
+        if self._preview_loaders:
+            # OpenCV work already running in a QThread cannot be safely killed.
+            # Retain only the newest navigation/configuration request.
+            self._pending_preview_request = request
+            return
+        self._start_preview_loader(*request)
+
+    def _start_preview_loader(
+        self,
+        request_id: int,
+        image_path: str,
+        title: str,
+        with_colorbar: bool,
+    ):
+        self._pending_preview_request = None
         loader = PreviewImageLoader(request_id, image_path, self._detection_config)
         loader.loaded.connect(
             lambda rid, path, image, detection, label=title, colorbar=with_colorbar:
@@ -1766,6 +2272,10 @@ class CalibrationPreviewWidget(QWidget):
     def _cleanup_preview_loader(self, loader):
         if loader in self._preview_loaders:
             self._preview_loaders.remove(loader)
+        if not self._preview_loaders and self._pending_preview_request is not None:
+            request = self._pending_preview_request
+            self._pending_preview_request = None
+            self._start_preview_loader(*request)
 
     def _on_preview_error(self, request_id: int, _image_path: str):
         if request_id != self._preview_request_id:
@@ -1790,6 +2300,11 @@ class CalibrationPreviewWidget(QWidget):
         render_source = self._current_gray if with_colorbar else image
         self._render_array(render_source, title=title, with_colorbar=with_colorbar)
         self._update_detection_status()
+        if detection and detection.get("pattern_type") and detection.get("pattern_size"):
+            pattern_w, pattern_h = detection["pattern_size"]
+            self.patternDetected.emit(
+                str(detection["pattern_type"]), int(pattern_w), int(pattern_h)
+            )
 
     def _render_array(self, array, title: str = "", with_colorbar: bool = True):
         if array is None:
@@ -1946,6 +2461,9 @@ class CalibrationPreviewWidget(QWidget):
             return
         if event.xdata is None or event.ydata is None:
             return
+        if self.select_origin_btn.isChecked():
+            self._select_origin_at(float(event.xdata), float(event.ydata))
+            return
         if self._ruler_enabled:
             self._ruler_points = [
                 (float(event.xdata), float(event.ydata)),
@@ -1957,6 +2475,32 @@ class CalibrationPreviewWidget(QWidget):
             return
         self._pan_start = (float(event.xdata), float(event.ydata))
         self._pan_limits = (self.axes.get_xlim(), self.axes.get_ylim())
+
+    def _select_origin_at(self, x: float, y: float):
+        detection = self._current_detection or {}
+        points = np.asarray(detection.get("points", []), dtype=np.float32)
+        point_ids = detection.get("point_ids", [])
+        if points.size == 0 or not point_ids:
+            self.info_label.setText(
+                f"{self._current_title} | 当前图像没有可选择的识别点"
+            )
+            return
+        points = points.reshape(-1, 2)
+        distances = np.hypot(points[:, 0] - x, points[:, 1] - y)
+        index = int(np.argmin(distances))
+        xlim = self.axes.get_xlim()
+        select_radius = max(10.0, abs(xlim[1] - xlim[0]) * 0.02)
+        if float(distances[index]) > select_radius:
+            self.info_label.setText(
+                f"{self._current_title} | 请点击绿色识别点附近"
+            )
+            return
+        self._selected_origin_point_id = tuple(point_ids[index])
+        self.select_origin_btn.setChecked(False)
+        self._update_origin_label()
+        self.originPointChanged.emit(self._selected_origin_point_id)
+        self._redraw_current()
+        self._update_detection_status()
 
     def _on_mouse_release(self, event):
         if self._ruler_enabled and self._ruler_dragging:
@@ -2097,15 +2641,53 @@ class CalibrationPreviewWidget(QWidget):
                 bbox={"facecolor": "#111", "alpha": 0.55, "pad": 1},
             )
 
+        if self._selected_origin_point_id is not None:
+            normalized_ids = [tuple(point_id) for point_id in point_ids]
+            if self._selected_origin_point_id in normalized_ids:
+                origin_index = normalized_ids.index(self._selected_origin_point_id)
+                origin = points[origin_index]
+                self.axes.scatter(
+                    [origin[0]],
+                    [origin[1]],
+                    s=180,
+                    marker="*",
+                    facecolors="#ff3b30",
+                    edgecolors="white",
+                    linewidths=1.2,
+                    zorder=6,
+                )
+                self.axes.text(
+                    origin[0] + 8,
+                    origin[1] + 8,
+                    "O",
+                    color="white",
+                    fontsize=9,
+                    fontweight="bold",
+                    bbox={"facecolor": "#ff3b30", "alpha": 0.9, "pad": 2},
+                    zorder=7,
+                )
+
     def _update_detection_status(self):
         if not self._current_detection:
-            self.info_label.setText(f"{self._current_title} | 已识别圆点/角点")
+            self.info_label.setText(f"{self._current_title} | 未识别到标定点")
             return
         if self._current_detection.get("error"):
-            self.info_label.setText(f"{self._current_title} | 识别失败")
+            self.info_label.setText(
+                f"{self._current_title} | 识别失败: "
+                f"{self._current_detection['error']}"
+            )
             return
         count = len(self._current_detection.get("points", []))
-        self.info_label.setText(f"{self._current_title} | 已识别 {count} 个圆点/角点")
+        pattern_type = self._current_detection.get("pattern_type", "unknown")
+        pattern_size = self._current_detection.get("pattern_size", ("?", "?"))
+        origin_text = ""
+        if self._selected_origin_point_id is not None:
+            origin_text = " | 已选择中心原点"
+        self.info_label.setText(
+            f"{self._current_title} | {pattern_type} "
+            f"{pattern_size[0]}×{pattern_size[1]} | "
+            f"已识别 {count} 个点{origin_text}"
+        )
 
     def _update_ruler_distance(self):
         if len(self._ruler_points) != 2:
@@ -2970,58 +3552,6 @@ class ImagePreviewPanel(QWidget):
         self._orig_image = None
 
 
-class _IEColorbarWidget(QWidget):
-    """图像处理查看器的颜色条组件，显示 min-max 值映射。"""
-
-    def __init__(self, sp_func, parent=None):
-        super().__init__(parent)
-        self._sp = sp_func
-        self._vmin = 0.0
-        self._vmax = 255.0
-        self.setMinimumWidth(self._sp(200))
-
-    def set_range(self, vmin, vmax):
-        self._vmin = vmin
-        self._vmax = vmax
-        self.update()
-
-    def paintEvent(self, event):
-        from PyQt5.QtGui import QPainter, QLinearGradient, QPen
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        w = self.width()
-        h = self.height()
-        margin = self._sp(40)
-        bar_h = self._sp(8)
-        y0 = (h - bar_h) // 2
-
-        # 渐变色条（灰度：黑→白）
-        gradient = QLinearGradient(margin, 0, w - margin, 0)
-        gradient.setColorAt(0.0, QColor(0, 0, 0))
-        gradient.setColorAt(1.0, QColor(255, 255, 255))
-        painter.fillRect(margin, y0, w - 2 * margin, bar_h, gradient)
-
-        # 边框
-        painter.setPen(QPen(QColor(100, 100, 100), 1))
-        painter.drawRect(margin, y0, w - 2 * margin, bar_h)
-
-        # 标签
-        painter.setPen(QColor(170, 170, 170))
-        font = painter.font()
-        font.setPointSize(max(7, int(9 * self._sp(1) / 1.0)))
-        painter.setFont(font)
-
-        vmin_str = f"{self._vmin:.0f}" if abs(self._vmin) < 1e4 else f"{self._vmin:.1e}"
-        vmax_str = f"{self._vmax:.0f}" if abs(self._vmax) < 1e4 else f"{self._vmax:.1e}"
-
-        painter.drawText(0, y0 + bar_h + self._sp(12), vmin_str)
-        painter.drawText(w - margin, y0 + bar_h + self._sp(12), vmax_str)
-        painter.drawText(w // 2, y0 + bar_h + self._sp(12), f"{(self._vmin + self._vmax) / 2:.0f}")
-
-        painter.end()
-
-
 class _IEImageViewer(ScientificImageViewer):
     """Image-editor viewer using the shared scientific image interactions."""
 
@@ -3445,6 +3975,8 @@ class BubbleTomographyGUI(QMainWindow):
         # 单相机标定数据
         self.single_camera_params: Optional[dict] = None   # {camera_matrix, dist_coeffs, rms}
         self.stereo_params: Optional[dict] = None          # {R, T, E, F, rms}
+        self.calibration_origin_point_id = None
+        self.calibration_origin_pattern_type = None
 
         # 射线追踪数据
         self.rt_processor: Optional[RaytraceProcessor] = None
@@ -3657,6 +4189,7 @@ class BubbleTomographyGUI(QMainWindow):
         # Page 7-8: AI辅助
         self._create_ai_module_page("ai_assistant", "AI辅助模型", local_default=False)
         self._create_ai_module_page("local_model", "本地模型", local_default=True)
+        self._create_camera_acquisition_page()
 
         image_editor_page = self.content_stack.widget(6)
         if image_editor_page is not None:
@@ -4312,6 +4845,20 @@ class BubbleTomographyGUI(QMainWindow):
         self._toggle_preview_action.triggered.connect(self._on_toggle_preview)
         window_menu.addAction(self._toggle_preview_action)
 
+        # ===== 相机采集入口（独立菜单栏动作） =====
+        self.camera_acquisition_action = QAction(
+            self._make_camera_icon("#2d98da", self._sp(22)),
+            "相机采集(&C)",
+            self,
+        )
+        self.camera_acquisition_action.setToolTip(
+            "打开相机厂商采集软件接口预留页面"
+        )
+        self.camera_acquisition_action.triggered.connect(
+            self._show_camera_acquisition_page
+        )
+        menubar.addAction(self.camera_acquisition_action)
+
         # ===== 帮助菜单 =====
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -4821,7 +5368,57 @@ class BubbleTomographyGUI(QMainWindow):
         if hasattr(self, "_preview_panel"):
             for viewer in self._preview_panel.findChildren(ScientificImageViewer):
                 viewer.apply_theme(theme)
+        self._apply_camera_acquisition_theme()
         self._apply_image_editor_theme()
+
+    def _apply_camera_acquisition_theme(self):
+        if not hasattr(self, "camera_acquisition_page"):
+            return
+        theme = self._theme_palette()
+        self.camera_acquisition_page.setStyleSheet(
+            f"QWidget#cameraAcquisitionPage {{ "
+            f"background: {theme['background']}; color: {theme['text_main']}; }}"
+        )
+        self.camera_acquisition_title.setStyleSheet(
+            f"color: {theme['text_main']}; font-size: 24px; font-weight: bold;"
+        )
+        self.camera_acquisition_subtitle.setStyleSheet(
+            f"color: {theme['text_secondary']}; font-size: 12px;"
+        )
+        self.camera_vendor_group.setStyleSheet(
+            f"QGroupBox {{ color: {theme['text_main']}; font-weight: bold; "
+            f"background: {theme['surface']}; border: 1px solid {theme['border']}; "
+            "border-radius: 8px; margin-top: 12px; padding-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 12px; "
+            "padding: 0 5px; }"
+        )
+        card_style = (
+            f"QToolButton {{ border: 1px solid {theme['border']}; "
+            f"border-radius: 10px; padding: 10px; color: {theme['text_main']}; "
+            f"background: {theme['surface_alt']}; }}"
+            f"QToolButton:hover {{ border: 2px solid {theme['accent_hover']}; "
+            f"background: {theme['hover']}; }}"
+            f"QToolButton:checked {{ border: 2px solid {theme['success']}; "
+            f"background: {theme['surface']}; font-weight: bold; }}"
+        )
+        for button in self.camera_vendor_buttons.values():
+            button.setStyleSheet(card_style)
+        self.camera_acquisition_display.setStyleSheet(
+            "QFrame#cameraAcquisitionDisplay { "
+            f"border: 2px dashed {theme['border']}; border-radius: 12px; "
+            f"background: {theme['surface']}; }}"
+        )
+        self.camera_acquisition_status.setStyleSheet(
+            f"color: {theme['text_secondary']}; font-size: 13px;"
+        )
+        self.launch_camera_vendor_button.setStyleSheet(
+            f"QPushButton {{ color: {theme['accent_text']}; "
+            f"background: {theme['accent']}; border: none; "
+            "border-radius: 6px; padding: 8px 18px; }"
+            f"QPushButton:hover {{ background: {theme['accent_hover']}; }}"
+            f"QPushButton:disabled {{ color: {theme['text_secondary']}; "
+            f"background: {theme['surface_alt']}; }}"
+        )
 
     def _apply_global_style(self):
         """应用全局样式 — DaVis 10 深色主题。"""
@@ -5252,6 +5849,276 @@ class BubbleTomographyGUI(QMainWindow):
     def _show_version_info(self):
         self._create_version_info_dialog().exec_()
 
+    @staticmethod
+    def _make_camera_icon(
+        color: str = "#2d98da", size: int = 48, label: str = ""
+    ) -> QIcon:
+        """Create a dependency-free camera icon for menus and vendor cards."""
+        from PyQt5.QtGui import QPainter, QPen
+
+        size = max(16, int(size))
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#dfe6e9"), max(1, size // 24)))
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(
+            int(size * 0.08),
+            int(size * 0.27),
+            int(size * 0.84),
+            int(size * 0.57),
+            max(2, size // 10),
+            max(2, size // 10),
+        )
+        painter.drawRoundedRect(
+            int(size * 0.20),
+            int(size * 0.16),
+            int(size * 0.28),
+            int(size * 0.18),
+            max(1, size // 14),
+            max(1, size // 14),
+        )
+        painter.setBrush(QColor("#17202a"))
+        painter.drawEllipse(
+            int(size * 0.31),
+            int(size * 0.34),
+            int(size * 0.38),
+            int(size * 0.38),
+        )
+        painter.setBrush(QColor("#74b9ff"))
+        painter.drawEllipse(
+            int(size * 0.40),
+            int(size * 0.43),
+            int(size * 0.20),
+            int(size * 0.20),
+        )
+        if label:
+            painter.setPen(QColor("white"))
+            font = painter.font()
+            font.setBold(True)
+            font.setPixelSize(max(7, size // 7))
+            painter.setFont(font)
+            painter.drawText(
+                0,
+                int(size * 0.73),
+                size,
+                int(size * 0.22),
+                Qt.AlignCenter,
+                label[:3].upper(),
+            )
+        painter.end()
+        return QIcon(pixmap)
+
+    def _create_camera_acquisition_page(self):
+        """Create a vendor-neutral placeholder for future camera SDK adapters."""
+        page = QWidget()
+        page.setObjectName("cameraAcquisitionPage")
+        self.camera_acquisition_page = page
+        self.camera_vendor_adapters = {}
+        self.selected_camera_vendor = None
+
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(
+            self._sp(42), self._sp(30), self._sp(42), self._sp(34)
+        )
+        layout.setSpacing(self._sp(18))
+
+        header_row = QHBoxLayout()
+        header_icon = QLabel()
+        header_icon.setPixmap(
+            self._make_camera_icon("#2d98da", self._sp(64)).pixmap(
+                self._sp(64), self._sp(64)
+            )
+        )
+        header_row.addWidget(header_icon)
+        header_text = QVBoxLayout()
+        self.camera_acquisition_title = QLabel("相机采集")
+        self.camera_acquisition_title.setStyleSheet(
+            "color: #ecf0f1; font-size: 24px; font-weight: bold;"
+        )
+        self.camera_acquisition_subtitle = QLabel(
+            "相机厂商 SDK / 采集软件接口预留页；当前不直接连接硬件。"
+        )
+        self.camera_acquisition_subtitle.setStyleSheet(
+            "color: #bdc3c7; font-size: 12px;"
+        )
+        header_text.addWidget(self.camera_acquisition_title)
+        header_text.addWidget(self.camera_acquisition_subtitle)
+        header_row.addLayout(header_text, stretch=1)
+        layout.addLayout(header_row)
+
+        self.camera_vendor_group = QGroupBox("选择相机厂商")
+        self.camera_vendor_group.setStyleSheet(
+            "QGroupBox { color: #dfe6e9; font-weight: bold; "
+            "border: 1px solid #566573; border-radius: 8px; "
+            "margin-top: 12px; padding-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 12px; "
+            "padding: 0 5px; }"
+        )
+        vendor_layout = QGridLayout(self.camera_vendor_group)
+        vendor_layout.setHorizontalSpacing(self._sp(14))
+        vendor_layout.setVerticalSpacing(self._sp(14))
+        self.camera_vendor_button_group = QButtonGroup(self)
+        self.camera_vendor_button_group.setExclusive(True)
+        self.camera_vendor_buttons = {}
+
+        vendors = [
+            ("phantom", "Phantom", "#e17055", "高速相机"),
+            ("pco", "PCO", "#0984e3", "科研相机"),
+            ("sony", "Sony", "#6c5ce7", "工业/专业相机"),
+            ("nikon", "Nikon", "#f1c40f", "专业相机"),
+            ("photron", "Photron", "#d63031", "高速相机"),
+            ("basler", "Basler", "#00b894", "工业相机"),
+            ("flir", "FLIR", "#e67e22", "工业/红外相机"),
+            ("allied_vision", "Allied Vision", "#2d98da", "工业相机"),
+        ]
+        for index, (key, name, color, description) in enumerate(vendors):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            button.setIcon(
+                self._make_camera_icon(color, self._sp(58), name[:3])
+            )
+            button.setIconSize(QSize(self._sp(58), self._sp(58)))
+            button.setText(f"{name}\n{description}")
+            button.setMinimumSize(self._sp(155), self._sp(112))
+            button.setCursor(Qt.PointingHandCursor)
+            button.setProperty("vendorKey", key)
+            button.setStyleSheet(
+                "QToolButton { border: 1px solid #566573; border-radius: 10px; "
+                "padding: 10px; color: #ecf0f1; "
+                "background: rgba(80, 90, 100, 35); }"
+                "QToolButton:hover { border: 2px solid #3498db; "
+                "background: rgba(52, 152, 219, 45); }"
+                "QToolButton:checked { border: 2px solid #2ecc71; "
+                "background: rgba(46, 204, 113, 55); font-weight: bold; }"
+            )
+            button.clicked.connect(
+                lambda _checked=False, vendor_key=key, vendor_name=name:
+                    self._select_camera_vendor(vendor_key, vendor_name)
+            )
+            self.camera_vendor_button_group.addButton(button)
+            self.camera_vendor_buttons[key] = button
+            vendor_layout.addWidget(button, index // 4, index % 4)
+            self.camera_vendor_adapters[key] = None
+        layout.addWidget(self.camera_vendor_group)
+
+        self.camera_acquisition_display = QFrame()
+        self.camera_acquisition_display.setObjectName(
+            "cameraAcquisitionDisplay"
+        )
+        self.camera_acquisition_display.setMinimumHeight(self._sp(230))
+        self.camera_acquisition_display.setStyleSheet(
+            "QFrame#cameraAcquisitionDisplay { "
+            "border: 2px dashed #5d6d7e; border-radius: 12px; "
+            "background: rgba(30, 40, 50, 30); }"
+        )
+        display_layout = QVBoxLayout(self.camera_acquisition_display)
+        display_layout.setAlignment(Qt.AlignCenter)
+        self.camera_acquisition_display_icon = QLabel()
+        self.camera_acquisition_display_icon.setAlignment(Qt.AlignCenter)
+        self.camera_acquisition_display_icon.setPixmap(
+            self._make_camera_icon("#636e72", self._sp(92)).pixmap(
+                self._sp(92), self._sp(92)
+            )
+        )
+        display_layout.addWidget(self.camera_acquisition_display_icon)
+        self.camera_acquisition_status = QLabel(
+            "请选择相机厂商\n此区域预留实时图像、曝光参数和采集控制接口"
+        )
+        self.camera_acquisition_status.setAlignment(Qt.AlignCenter)
+        self.camera_acquisition_status.setStyleSheet(
+            "color: #d5d8dc; font-size: 13px;"
+        )
+        display_layout.addWidget(self.camera_acquisition_status)
+        layout.addWidget(self.camera_acquisition_display, stretch=1)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self.launch_camera_vendor_button = QPushButton(
+            "启动厂商采集软件 / SDK"
+        )
+        self.launch_camera_vendor_button.setStyleSheet(
+            "QPushButton { color: #ecf0f1; background: #2d98da; "
+            "border: none; border-radius: 6px; padding: 8px 18px; }"
+            "QPushButton:hover { background: #3498db; }"
+            "QPushButton:disabled { color: #7f8c8d; background: #3d4248; }"
+        )
+        self.launch_camera_vendor_button.setEnabled(False)
+        self.launch_camera_vendor_button.clicked.connect(
+            self._launch_selected_camera_vendor
+        )
+        action_row.addWidget(self.launch_camera_vendor_button)
+        layout.addLayout(action_row)
+
+        self.content_stack.addWidget(page)
+
+    def _show_camera_acquisition_page(self):
+        self.content_stack.setCurrentWidget(self.camera_acquisition_page)
+        self._nav_btn_group.setExclusive(False)
+        for button in self._nav_buttons.values():
+            button.setChecked(False)
+        self._nav_btn_group.setExclusive(True)
+        self.statusBar().showMessage("相机采集接口预留页面")
+
+    def _select_camera_vendor(self, vendor_key: str, vendor_name: str):
+        self.selected_camera_vendor = vendor_key
+        self.launch_camera_vendor_button.setEnabled(True)
+        self.launch_camera_vendor_button.setText(
+            f"启动 {vendor_name} 采集软件 / SDK"
+        )
+        self.camera_acquisition_display_icon.setPixmap(
+            self.camera_vendor_buttons[vendor_key].icon().pixmap(
+                self._sp(92), self._sp(92)
+            )
+        )
+        adapter_ready = callable(
+            self.camera_vendor_adapters.get(vendor_key)
+        )
+        state = "接口已注册，可以启动" if adapter_ready else "接口待接入"
+        self.camera_acquisition_status.setText(
+            f"已选择：{vendor_name}\n{state}\n"
+            "后续可在此区域接入实时预览、触发、曝光和录像控制"
+        )
+        self.statusBar().showMessage(f"相机采集：已选择 {vendor_name}")
+
+    def register_camera_vendor_adapter(self, vendor_key: str, callback):
+        """Register a callable that opens a vendor SDK or acquisition program."""
+        if vendor_key not in self.camera_vendor_adapters:
+            raise ValueError(f"Unsupported camera vendor: {vendor_key}")
+        if callback is not None and not callable(callback):
+            raise TypeError("camera vendor adapter must be callable or None")
+        self.camera_vendor_adapters[vendor_key] = callback
+        if self.selected_camera_vendor == vendor_key:
+            button = self.camera_vendor_buttons[vendor_key]
+            vendor_name = button.text().splitlines()[0]
+            self._select_camera_vendor(vendor_key, vendor_name)
+
+    def _launch_selected_camera_vendor(self):
+        vendor_key = self.selected_camera_vendor
+        if not vendor_key:
+            return
+        adapter = self.camera_vendor_adapters.get(vendor_key)
+        if callable(adapter):
+            try:
+                adapter()
+                return
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "相机采集接口", f"启动厂商接口失败：{exc}"
+                )
+                return
+        vendor_name = self.camera_vendor_buttons[
+            vendor_key
+        ].text().splitlines()[0]
+        QMessageBox.information(
+            self,
+            "相机采集接口预留",
+            f"{vendor_name} 的厂商 SDK/采集软件接口尚未接入。\n"
+            "可通过 register_camera_vendor_adapter() 注册启动回调。",
+        )
+
     def _create_calibration_page(self):
         """创建标定页：左侧参数 + 右侧预览。"""
         page = QWidget()
@@ -5396,7 +6263,7 @@ class BubbleTomographyGUI(QMainWindow):
         grid.addWidget(self.level_separation_spin, 4, 1)
 
         self.pattern_type_combo.currentIndexChanged.connect(
-            lambda _index: self._refresh_calibration_preview()
+            self._on_calibration_pattern_type_changed
         )
         self.pattern_w_spin.valueChanged.connect(
             lambda _value: self._refresh_calibration_preview()
@@ -5439,11 +6306,18 @@ class BubbleTomographyGUI(QMainWindow):
         cam_layout.addLayout(cam_btn_layout)
 
         self.camera_list = QListWidget()
+        self.camera_list.itemDoubleClicked.connect(
+            lambda _item: self._load_calibration_images()
+        )
         cam_layout.addWidget(self.camera_list)
 
-        btn_load_calib_images = QPushButton("加载选中相机的标定图像...")
-        btn_load_calib_images.clicked.connect(self._load_calibration_images)
-        cam_layout.addWidget(btn_load_calib_images)
+        self.btn_load_calib_images = QPushButton("加载选中相机的标定图像...")
+        self.btn_load_calib_images.clicked.connect(self._load_calibration_images)
+        self.btn_load_calib_images.setEnabled(False)
+        self.camera_list.currentRowChanged.connect(
+            lambda row: self.btn_load_calib_images.setEnabled(row >= 0)
+        )
+        cam_layout.addWidget(self.btn_load_calib_images)
 
         self.calib_image_label = QLabel("未加载标定图像")
         self.calib_image_label.setStyleSheet("color: gray;")
@@ -5500,6 +6374,12 @@ class BubbleTomographyGUI(QMainWindow):
         if viz_context == "calibration":
             preview_widget = CalibrationPreviewWidget()
             preview_widget.rulerDistanceChanged.connect(self._on_calib_ruler_distance_changed)
+            preview_widget.patternDetected.connect(
+                self._on_calib_pattern_detected
+            )
+            preview_widget.originPointChanged.connect(
+                self._on_calib_origin_point_changed
+            )
             preview_widget.setStyleSheet(
                 "border: 1px solid #ccc; background-color: #f8f8f8; padding: 4px;"
             )
@@ -6740,6 +7620,24 @@ class BubbleTomographyGUI(QMainWindow):
 
         self._refresh_calibration_preview()
 
+    def _on_calibration_pattern_type_changed(self, _index: int) -> None:
+        pattern_type = self._pattern_type_items().get(
+            self.pattern_type_combo.currentText(), "checkerboard"
+        )
+        if pattern_type == "volume_dots":
+            # LaVision 025-3.3: 3.3 mm same-plane pitch and 1 mm separation.
+            widgets_and_values = (
+                (self.pattern_w_spin, 8),
+                (self.pattern_h_spin, 7),
+                (self.square_size_spin, 3.3),
+                (self.level_separation_spin, 1.0),
+            )
+            for widget, value in widgets_and_values:
+                widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(False)
+        self._refresh_calibration_preview()
+
     def _pattern_type_items(self) -> Dict[str, str]:
         return {
             "checkerboard (棋盘格)": "checkerboard",
@@ -6765,10 +7663,97 @@ class BubbleTomographyGUI(QMainWindow):
                 self.pattern_h_spin.value(),
             ),
             "square_size": self.square_size_spin.value(),
+            "auto_detect": True,
         }
         if hasattr(self, "level_separation_spin"):
             config["level_separation"] = self.level_separation_spin.value()
+        if self.calibration_origin_point_id is not None:
+            config["origin_point_id"] = self.calibration_origin_point_id
         return config
+
+    def _on_calib_pattern_detected(
+        self, pattern_type: str, pattern_w: int, pattern_h: int
+    ):
+        pattern_text = self._pattern_type_key_to_text(pattern_type)
+        if pattern_text is None:
+            return
+
+        if (
+            self.calibration_origin_point_id is not None
+            and self.calibration_origin_pattern_type not in (None, pattern_type)
+        ):
+            self.calibration_origin_point_id = None
+            self.calibration_origin_pattern_type = None
+            self.calib_preview_label.set_origin_point_id(None)
+
+        combo_index = self.pattern_type_combo.findText(pattern_text)
+        controls = [
+            self.pattern_type_combo,
+            self.pattern_w_spin,
+            self.pattern_h_spin,
+        ]
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            if combo_index >= 0:
+                self.pattern_type_combo.setCurrentIndex(combo_index)
+            self.pattern_w_spin.setValue(int(pattern_w))
+            self.pattern_h_spin.setValue(int(pattern_h))
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+
+        self.calib_preview_label.set_detection_config(
+            self._current_calibration_detection_config()
+        )
+        self.statusBar().showMessage(
+            f"自动识别标定板：{pattern_type} {pattern_w}×{pattern_h}"
+        )
+
+    def _on_calib_origin_point_changed(self, point_id):
+        self.calibration_origin_point_id = (
+            tuple(point_id) if point_id is not None else None
+        )
+        if self.calibration_origin_point_id is None:
+            self.calibration_origin_pattern_type = None
+            self.statusBar().showMessage("已清除标定中心原点")
+        else:
+            self.calibration_origin_pattern_type = self._pattern_type_items().get(
+                self.pattern_type_combo.currentText(), "checkerboard"
+            )
+            point_text = ",".join(
+                f"{float(value):g}"
+                for value in self.calibration_origin_point_id
+            )
+            self.statusBar().showMessage(
+                f"已选择标定中心原点：({point_text})"
+            )
+        self.calib_preview_label.set_detection_config(
+            self._current_calibration_detection_config()
+        )
+
+    def _ensure_auto_calibration_spec(self, image_paths: List[str]) -> bool:
+        """Synchronously resolve board type before a calibration run starts."""
+        if not image_paths:
+            return False
+        image = robust_imread(image_paths[0], cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return False
+        config = self._current_calibration_detection_config()
+        result = MultiCameraCalibrator.detect_pattern_automatically(
+            image,
+            pattern_size_hint=tuple(config["pattern_size"]),
+            pattern_type_hint=str(config["pattern_type"]),
+            square_size=float(config["square_size"]),
+            level_separation=config.get("level_separation"),
+        )
+        if result is None:
+            return False
+        pattern_w, pattern_h = result["pattern_size"]
+        self._on_calib_pattern_detected(
+            str(result["pattern_type"]), int(pattern_w), int(pattern_h)
+        )
+        return True
 
     def _infer_and_apply_pattern_spec(self, image_paths: List[str]):
         if not image_paths:
@@ -6901,7 +7886,8 @@ class BubbleTomographyGUI(QMainWindow):
             pattern_type=pattern_type,
             pattern_size=pattern_size,
             square_size=square_size,
-            level_separation=level_separation
+            level_separation=level_separation,
+            origin_point_id=self.calibration_origin_point_id,
         )
 
         try:
@@ -7207,6 +8193,36 @@ class BubbleTomographyGUI(QMainWindow):
             'n_pairs': len(objpoints)
         }
 
+        try:
+            solved, rvec_left, tvec_left = cv2.solvePnP(
+                np.asarray(objpoints[0], dtype=np.float32),
+                np.asarray(imgpoints_l[0], dtype=np.float32),
+                K_l,
+                D_l,
+            )
+            if solved:
+                rotation_left, _ = cv2.Rodrigues(rvec_left)
+                rotation_right = R @ rotation_left
+                translation_right = R @ tvec_left + T
+                rvec_right, _ = cv2.Rodrigues(rotation_right)
+                self.calib_preview_label.show_calibration_scene(
+                    {
+                        "left": {
+                            "rvec": rvec_left.reshape(3),
+                            "tvec": tvec_left.reshape(3),
+                        },
+                        "right": {
+                            "rvec": rvec_right.reshape(3),
+                            "tvec": translation_right.reshape(3),
+                        },
+                    },
+                    np.asarray(objpoints[0], dtype=np.float32),
+                    pattern_type,
+                    title="双相机位置与标定板三维视图",
+                )
+        except Exception as exc:
+            self.calib_result_text.append(f"三维标定视图生成失败: {exc}")
+
         report = (
             f"=== 双目标定完成 ===\n\n"
             f"图像对数: {len(objpoints)}\n"
@@ -7245,6 +8261,7 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "左右相机各至少需要 3 张图像")
             return
 
+        self._ensure_auto_calibration_spec(self._stereo_left_files)
         self._prepare_module_output("calibration", "双目标定")
         pattern_type = self._pattern_type_items().get(
             self.pattern_type_combo.currentText(), "checkerboard"
@@ -7259,7 +8276,8 @@ class BubbleTomographyGUI(QMainWindow):
             pattern_type=pattern_type,
             pattern_size=pattern_size,
             square_size=square_size,
-            level_separation=level_separation
+            level_separation=level_separation,
+            origin_point_id=self.calibration_origin_point_id,
         )
 
         objpoints = []
@@ -7346,6 +8364,36 @@ class BubbleTomographyGUI(QMainWindow):
             'n_pairs': len(objpoints)
         }
 
+        try:
+            solved, rvec_left, tvec_left = cv2.solvePnP(
+                np.asarray(objpoints[0], dtype=np.float32),
+                np.asarray(imgpoints_l[0], dtype=np.float32),
+                K_l,
+                D_l,
+            )
+            if solved:
+                rotation_left, _ = cv2.Rodrigues(rvec_left)
+                rotation_right = R @ rotation_left
+                translation_right = R @ tvec_left + T
+                rvec_right, _ = cv2.Rodrigues(rotation_right)
+                self.calib_preview_label.show_calibration_scene(
+                    {
+                        "left": {
+                            "rvec": rvec_left.reshape(3),
+                            "tvec": tvec_left.reshape(3),
+                        },
+                        "right": {
+                            "rvec": rvec_right.reshape(3),
+                            "tvec": translation_right.reshape(3),
+                        },
+                    },
+                    np.asarray(objpoints[0], dtype=np.float32),
+                    pattern_type,
+                    title="双相机位置与标定板三维视图",
+                )
+        except Exception as exc:
+            self.calib_result_text.append(f"三维标定视图生成失败: {exc}")
+
         report = (
             f"=== 双目标定完成 ===\n\n"
             f"标定板类? {pattern_type}\n"
@@ -7379,22 +8427,33 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请输入相机ID")
             return
         if cam_id in self.camera_calib_images:
-            QMessageBox.warning(self, "警告", f"相机 {cam_id} 已存?")
+            QMessageBox.warning(self, "警告", f"相机 {cam_id} 已存在")
             return
         self.camera_calib_images[cam_id] = []
-        self.camera_list.addItem(f"{cam_id} (0 张标定图?")
+        item = QListWidgetItem(f"{cam_id} (0 张标定图)")
+        item.setData(Qt.UserRole, cam_id)
+        self.camera_list.addItem(item)
+        self.camera_list.setCurrentItem(item)
         self.cam_id_input.clear()
-        self.statusBar().showMessage(f"已添加相? {cam_id}")
+        self.statusBar().showMessage(
+            f"已添加并选中相机: {cam_id}，现在可以加载标定图像"
+        )
 
     def _remove_camera(self):
         current = self.camera_list.currentRow()
         if current < 0:
             return
-        cam_ids = list(self.camera_calib_images.keys())
-        cam_id = cam_ids[current]
+        item = self.camera_list.item(current)
+        cam_id = item.data(Qt.UserRole)
+        if not cam_id:
+            cam_id = list(self.camera_calib_images.keys())[current]
         self.camera_calib_images.pop(cam_id, None)
         self.camera_list.takeItem(current)
-        self.statusBar().showMessage(f"已移除相? {cam_id}")
+        if self.camera_list.count() > 0:
+            self.camera_list.setCurrentRow(
+                min(current, self.camera_list.count() - 1)
+            )
+        self.statusBar().showMessage(f"已移除相机: {cam_id}")
 
     def _load_calibration_images(self):
         current = self.camera_list.currentRow()
@@ -7402,21 +8461,21 @@ class BubbleTomographyGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请先选择相机")
             return
 
-        cam_ids = list(self.camera_calib_images.keys())
-        cam_id = cam_ids[current]
+        item = self.camera_list.item(current)
+        cam_id = item.data(Qt.UserRole)
+        if not cam_id:
+            cam_id = list(self.camera_calib_images.keys())[current]
 
         files, _ = QFileDialog.getOpenFileNames(
-            self, f"选择相机 {cam_id} 的标定图?, """,
+            self, f"选择相机 {cam_id} 的标定图像", "",
             "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;所有文件 (*)"
         )
 
         if files:
             self.camera_calib_images[cam_id] = files
-            self.camera_list.item(current).setText(
-                f"{cam_id} ({len(files)} 张标定图?"
-            )
+            item.setText(f"{cam_id} ({len(files)} 张标定图)")
             self.calib_image_label.setText(
-                f"相机 {cam_id}: 已加?{len(files)} 张标定图?"
+                f"相机 {cam_id}: 已加载 {len(files)} 张标定图像"
             )
             self.calib_image_label.setStyleSheet("color: green;")
             self.statusBar().showMessage(
@@ -7510,8 +8569,12 @@ class BubbleTomographyGUI(QMainWindow):
         self._refresh_calibration_preview()
 
     def _run_calibration(self):
-        if len(self.camera_calib_images) < 1:
-            QMessageBox.warning(self, "警告", "至少要添加 1 个相机才能进行相机标定")
+        if len(self.camera_calib_images) < 3:
+            QMessageBox.warning(
+                self,
+                "警告",
+                "多相机联合标定至少需要添加 3 个相机",
+            )
             return
 
         for cam_id, imgs in self.camera_calib_images.items():
@@ -7519,6 +8582,8 @@ class BubbleTomographyGUI(QMainWindow):
                 QMessageBox.warning(self, "警告", f"相机 {cam_id} 至少需要 3 张标定图像")
                 return
 
+        first_images = next(iter(self.camera_calib_images.values()), [])
+        self._ensure_auto_calibration_spec(first_images)
         pattern_map = {
             "checkerboard (棋盘格)": "checkerboard",
             "circles (对称圆点阵)": "circles",
@@ -7535,7 +8600,8 @@ class BubbleTomographyGUI(QMainWindow):
             pattern_type=pattern_type,
             pattern_size=pattern_size,
             square_size=square_size,
-            level_separation=level_separation
+            level_separation=level_separation,
+            origin_point_id=self.calibration_origin_point_id,
         )
 
         self.progress_bar.setVisible(True)
@@ -7551,6 +8617,83 @@ class BubbleTomographyGUI(QMainWindow):
         self.statusBar().showMessage(msg)
         self.calib_result_text.append(msg)
 
+    def _show_multi_camera_calibration_scene(self):
+        if self.calibrator is None:
+            return
+
+        camera_poses = {}
+        board_points = None
+        joint_poses = getattr(self.calibrator, "_joint_camera_poses", {})
+        for camera_id, params in self.calibrator.camera_params.items():
+            calibration_data = self.calibrator._calib_data.get(camera_id, {})
+            rvecs = calibration_data.get("rvecs", [])
+            tvecs = calibration_data.get("tvecs", [])
+            object_sets = calibration_data.get("obj_points", [])
+            if camera_id in joint_poses:
+                camera_poses[camera_id] = {
+                    "rvec": np.asarray(
+                        joint_poses[camera_id]["rvec"]
+                    ).reshape(3),
+                    "tvec": np.asarray(
+                        joint_poses[camera_id]["tvec"]
+                    ).reshape(3),
+                }
+            elif rvecs and tvecs:
+                camera_poses[camera_id] = {
+                    "rvec": np.asarray(rvecs[0]).reshape(3),
+                    "tvec": np.asarray(tvecs[0]).reshape(3),
+                }
+            else:
+                camera_poses[camera_id] = {
+                    "rvec": np.asarray(params.rvec).reshape(3),
+                    "tvec": np.asarray(params.tvec).reshape(3),
+                }
+            if board_points is None:
+                full_object_points = calibration_data.get("full_object_points")
+                if full_object_points is not None and np.asarray(
+                    full_object_points
+                ).size:
+                    board_points = np.asarray(
+                        full_object_points, dtype=np.float32
+                    )
+                elif object_sets:
+                    board_points = np.asarray(object_sets[0], dtype=np.float32)
+
+        if board_points is None:
+            board_points = np.asarray(
+                self.calibrator.obj_points, dtype=np.float32
+            )
+        if not camera_poses or board_points.size == 0:
+            return
+
+        if joint_poses:
+            # Present the rig in the conventional laboratory frame used by the
+            # reference layout: +X from camera 1 toward camera 3, +Z from the
+            # target toward the cameras. This is a proper 180° rotation about X.
+            display_rotation = np.diag([1.0, -1.0, -1.0])
+            board_points = (
+                display_rotation @ board_points.astype(np.float64).T
+            ).T.astype(np.float32)
+            transformed_poses = {}
+            for camera_id, pose in camera_poses.items():
+                rotation, _ = cv2.Rodrigues(
+                    np.asarray(pose["rvec"], dtype=np.float64).reshape(3, 1)
+                )
+                display_world_to_camera = rotation @ display_rotation.T
+                display_rvec, _ = cv2.Rodrigues(display_world_to_camera)
+                transformed_poses[camera_id] = {
+                    "rvec": display_rvec.reshape(3),
+                    "tvec": np.asarray(pose["tvec"]).reshape(3),
+                }
+            camera_poses = transformed_poses
+
+        self.calib_preview_label.show_calibration_scene(
+            camera_poses,
+            board_points,
+            self.calibrator.pattern_type,
+            title="多相机位置与标定板三维视图",
+        )
+
     def _on_calib_finished(self, results):
         self.calibration_results = results
         self.progress_bar.setVisible(False)
@@ -7562,19 +8705,10 @@ class BubbleTomographyGUI(QMainWindow):
         if output_dir:
             self.calibrator.save_results(output_dir)
 
-        # 保存标定结果预?
         try:
-            self.visualizer.plot_projection_comparison(
-                {cam_id: np.random.rand(100, 100) for cam_id in results},
-                "标定完成 - 各相机已就绪",
-                os.path.join(self.visualizer.output_dir, 'calib_complete.png')
-            )
-            self.calib_preview_label.show_static_image(
-                os.path.join(self.visualizer.output_dir, 'calib_complete.png'),
-                title="标定完成预览"
-            )
-        except Exception:
-            pass
+            self._show_multi_camera_calibration_scene()
+        except Exception as exc:
+            self.calib_result_text.append(f"三维标定视图生成失败: {exc}")
         self._watch_and_refresh_output(output_dir)
 
         QMessageBox.information(self, "完成",
@@ -7602,6 +8736,7 @@ class BubbleTomographyGUI(QMainWindow):
                 self.calibration_results = self.calibrator.camera_params
                 report = self.calibrator.get_calibration_report()
                 self.calib_result_text.setPlainText(report)
+                self._show_multi_camera_calibration_scene()
                 QMessageBox.information(
                     self, "完成",
                     f"已加载 {len(self.calibration_results)} 个相机的标定结果"
@@ -11290,11 +12425,6 @@ class BubbleTomographyGUI(QMainWindow):
         )
         of_lay.addWidget(self.ie_orig_info_bar)
 
-        # 颜色条
-        self.ie_orig_colorbar = _IEColorbarWidget(self._sp)
-        self.ie_orig_colorbar.setFixedHeight(self._sp(20))
-        of_lay.addWidget(self.ie_orig_colorbar)
-
         viewer_splitter.addWidget(orig_frame)
 
         # 结果图区
@@ -11345,10 +12475,6 @@ class BubbleTomographyGUI(QMainWindow):
         )
         annotated_layout.addWidget(self.ie_result_info_bar)
 
-        # 颜色条
-        self.ie_result_colorbar = _IEColorbarWidget(self._sp)
-        self.ie_result_colorbar.setFixedHeight(self._sp(20))
-        annotated_layout.addWidget(self.ie_result_colorbar)
         self.ie_result_tabs.addTab(annotated_tab, "处理/气泡标注图")
 
         distribution_tab = QWidget()
@@ -12467,14 +13593,6 @@ class BubbleTomographyGUI(QMainWindow):
                     pixmap.scaled(self.ie_preview_label.size(),
                                   Qt.KeepAspectRatio, Qt.SmoothTransformation))
             h, w = result.shape[:2]
-
-            # 更新颜色条
-            if hasattr(self, 'ie_result_colorbar'):
-                vmin, vmax = float(display_result.min()), float(display_result.max())
-                self.ie_result_colorbar.set_range(vmin, vmax)
-            if hasattr(self, 'ie_orig_colorbar'):
-                vmin, vmax = float(img.min()), float(img.max())
-                self.ie_orig_colorbar.set_range(vmin, vmax)
 
             # 更新 image viewer 的原始图像数据（用于鼠标悬停像素值读取）
             self.ie_preview_label.set_image_data(display_result)

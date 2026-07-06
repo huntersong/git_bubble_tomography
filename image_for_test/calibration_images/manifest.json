@@ -1,0 +1,177 @@
+{
+  "pattern_type": "checkerboard",
+  "pattern_size_inner_corners": [
+    11,
+    8
+  ],
+  "gui_square_size_mm": 5.0,
+  "image_size_px": [
+    1280,
+    960
+  ],
+  "synchronized_by_filename": true,
+  "datasets": {
+    "single_camera": {
+      "frame_count": 12,
+      "cameras": {
+        "camera_1": {
+          "position_mm": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\single_camera\\camera_1\\frame_12.png"
+          ]
+        }
+      }
+    },
+    "stereo": {
+      "frame_count": 12,
+      "cameras": {
+        "left": {
+          "position_mm": [
+            -13.333,
+            0.0,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\left\\frame_12.png"
+          ]
+        },
+        "right": {
+          "position_mm": [
+            13.333,
+            0.0,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\stereo\\right\\frame_12.png"
+          ]
+        }
+      }
+    },
+    "multi_camera": {
+      "frame_count": 12,
+      "cameras": {
+        "cam1": {
+          "position_mm": [
+            -15.0,
+            -9.167,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam1\\frame_12.png"
+          ]
+        },
+        "cam2": {
+          "position_mm": [
+            15.0,
+            -9.167,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam2\\frame_12.png"
+          ]
+        },
+        "cam3": {
+          "position_mm": [
+            -15.0,
+            9.167,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam3\\frame_12.png"
+          ]
+        },
+        "cam4": {
+          "position_mm": [
+            15.0,
+            9.167,
+            0.0
+          ],
+          "images": [
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_01.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_02.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_03.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_04.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_05.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_06.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_07.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_08.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_09.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_10.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_11.png",
+            "C:\\Users\\songyuchen\\Seafile\\Code\\BubbleandPIV\\bubble1\\calibration_images\\multi_camera\\cam4\\frame_12.png"
+          ]
+        }
+      }
+    }
+  }
+}
