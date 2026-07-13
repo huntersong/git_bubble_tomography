@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 组织测定：标定板 (棋盘格) + 标尺 -->
+  <rect x="3" y="3" width="11" height="11" rx="1"/>
+  <path d="M3 6.5h5.5M9.5 3v5.5M3 10.5h11M10.5 3v11"/>
+  <rect x="15" y="3" width="6" height="2" rx="0.5" fill="currentColor" stroke="none" opacity="0.3"/>
+  <rect x="15" y="3" width="6" height="2" rx="0.5"/>
+  <path d="M3 19h18M3 19l1-2M3 19l-1-2M21 19l-1-2M21 19l1-2" stroke-width="1"/>
+  <path d="M9 19v2M15 19v2" stroke-width="1"/>
+  <circle cx="12" cy="20" r="0.5" fill="currentColor"/>
+</svg>

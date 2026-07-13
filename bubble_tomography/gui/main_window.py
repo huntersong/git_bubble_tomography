@@ -6,7 +6,9 @@ import sys
 import os
 import html
 import json
+import platform
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -24,14 +26,16 @@ from PyQt5.QtWidgets import (
     QMessageBox, QScrollArea, QGridLayout, QCheckBox, QSlider,
     QStatusBar, QToolBar, QAction, QActionGroup, QFrame, QListWidget,
     QStackedWidget, QButtonGroup, QAbstractItemView, QToolBox,
-    QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy,
+    QMenu, QTreeWidget, QTreeWidgetItem, QSizePolicy, QFontComboBox,
     QGraphicsDropShadowEffect, QDialog, QDialogButtonBox, QToolButton
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher,
-    QVariantAnimation, QEasingCurve
+    QVariantAnimation, QEasingCurve, QSettings, QByteArray,
+    PYQT_VERSION_STR, QT_VERSION_STR
 )
-from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag, QPainter, QMovie
+from PyQt5.QtSvg import QSvgRenderer
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -62,6 +66,187 @@ from utils.image_editor import (
 from utils.bub_analysis import BubAnalysisParams
 from ptv import PTVConfig, PTVTracker, PTVVelocityCalculator
 from utils.cpu_parallel import default_worker_count, limited_opencv_threads
+from utils.video_importer import (
+    VIDEO_EXTS,
+    convert_frame_bit_depth,
+    export_video_frames,
+    open_video_reader,
+    probe_video,
+)
+
+
+APP_VERSION = "v2.0.20260627"
+
+
+def _app_resource_path(relative_path: str) -> Path:
+    """Return a resource path that works in source and PyInstaller builds."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / relative_path
+
+
+class StartupSplash(QWidget):
+    """Frameless startup splash with a looping microscopy animation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.SplashScreen | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(760, 430)
+        self._movie: Optional[QMovie] = None
+
+        shell = QFrame(self)
+        shell.setObjectName("splashShell")
+        shell.setGeometry(0, 0, self.width(), self.height())
+        shell.setStyleSheet("""
+            QFrame#splashShell {
+                background: #111827;
+                border: 1px solid rgba(168, 199, 255, 0.45);
+                border-radius: 22px;
+            }
+            QLabel {
+                background: transparent;
+                color: #DCE7FF;
+                font-family: "Microsoft YaHei UI", "Segoe UI";
+            }
+        """)
+        shadow = QGraphicsDropShadowEffect(shell)
+        shadow.setBlurRadius(34)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        shell.setGraphicsEffect(shadow)
+
+        layout = QHBoxLayout(shell)
+        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setSpacing(24)
+
+        self.movie_label = QLabel()
+        self.movie_label.setFixedSize(360, 260)
+        self.movie_label.setAlignment(Qt.AlignCenter)
+        self.movie_label.setStyleSheet("""
+            QLabel {
+                border-radius: 18px;
+                border: 1px solid rgba(122, 166, 255, 0.35);
+                background: #0B1220;
+            }
+        """)
+        layout.addWidget(self.movie_label, 0, Qt.AlignVCenter)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(10)
+        layout.addLayout(info_col, stretch=1)
+
+        title = QLabel("三维图像模块")
+        title.setStyleSheet("font-size: 30px; font-weight: 800; color: #FFFFFF;")
+        info_col.addWidget(title)
+
+        subtitle = QLabel("Bubble Tomography / PIV Workstation")
+        subtitle.setStyleSheet("font-size: 14px; color: #A8C7FF; font-weight: 600;")
+        info_col.addWidget(subtitle)
+
+        version = QLabel(APP_VERSION)
+        version.setStyleSheet("""
+            QLabel {
+                color: #FFFFFF;
+                background: #2D68E8;
+                border-radius: 9px;
+                padding: 6px 12px;
+                font-size: 14px;
+                font-weight: 700;
+            }
+        """)
+        version.setFixedWidth(180)
+        info_col.addWidget(version)
+
+        info_col.addSpacing(8)
+        params = QLabel(self._runtime_summary())
+        params.setWordWrap(True)
+        params.setStyleSheet("""
+            QLabel {
+                color: #CFE0FF;
+                font-size: 12px;
+                line-height: 1.45;
+                background: rgba(255,255,255,0.055);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                padding: 12px;
+            }
+        """)
+        info_col.addWidget(params)
+
+        info_col.addStretch()
+        status = QLabel("正在加载图像处理、三维重建、PIV 与 AI 辅助模块...")
+        status.setStyleSheet("font-size: 12px; color: #FFB07A; font-weight: 600;")
+        status.setWordWrap(True)
+        info_col.addWidget(status)
+
+        gif_path = _app_resource_path("assets/splash/startup.gif")
+        if gif_path.exists():
+            self._movie = QMovie(str(gif_path))
+            self._movie.setCacheMode(QMovie.CacheAll)
+            self._movie.setScaledSize(self.movie_label.size())
+            self.movie_label.setMovie(self._movie)
+            self._movie.start()
+        else:
+            fallback = QPixmap(str(_app_resource_path("assets/icons/app/icon-256.svg")))
+            self.movie_label.setPixmap(
+                fallback.scaled(
+                    180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+
+    @staticmethod
+    def _runtime_summary() -> str:
+        cpu_count = os.cpu_count() or 1
+        build_mode = "PyInstaller EXE" if getattr(sys, "frozen", False) else "Python Source"
+        return (
+            f"版本: {APP_VERSION}\n"
+            f"运行模式: {build_mode}\n"
+            f"系统: {platform.system()} {platform.release()} ({platform.machine()})\n"
+            f"Python: {platform.python_version()}    Qt: {QT_VERSION_STR}    PyQt: {PYQT_VERSION_STR}\n"
+            f"OpenCV: {cv2.__version__}    NumPy: {np.__version__}\n"
+            f"CPU: {cpu_count} 核    默认并行: {default_worker_count()} workers"
+        )
+
+    def center_on_screen(self):
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        self.move(
+            geo.center().x() - self.width() // 2,
+            geo.center().y() - self.height() // 2,
+        )
+
+
+def _svg_pixmap(path: str, size: int, color: str) -> QPixmap:
+    """Render a currentColor SVG as a tinted pixmap."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    try:
+        svg = Path(path).read_text(encoding="utf-8").replace("currentColor", color)
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+    except Exception:
+        fallback = QIcon(path).pixmap(size, size)
+        if not fallback.isNull():
+            pixmap = fallback
+    return pixmap
+
+
+def _svg_icon(path: str, size: int, normal_color: str, active_color: str = "#FFFFFF") -> QIcon:
+    """Create a stateful icon from a currentColor SVG."""
+    icon = QIcon()
+    if path and Path(path).exists():
+        icon.addPixmap(_svg_pixmap(path, size, normal_color), QIcon.Normal, QIcon.Off)
+        icon.addPixmap(_svg_pixmap(path, size, active_color), QIcon.Active, QIcon.Off)
+        icon.addPixmap(_svg_pixmap(path, size, active_color), QIcon.Selected, QIcon.On)
+        icon.addPixmap(_svg_pixmap(path, size, active_color), QIcon.Normal, QIcon.On)
+    return icon
 
 
 class IOSNavButton(QPushButton):
@@ -358,7 +543,8 @@ class BatchReconstructionWorker(QThread):
                  camera_params: Dict[str, dict],
                  reference_images: Dict[str, np.ndarray],
                  image_processor: BubbleImageProcessor,
-                 projection_type: str):
+                 projection_type: str,
+                 max_workers: Optional[int] = None):
         super().__init__()
         self.reconstructor = reconstructor
         self.bubble_images_sequence = bubble_images_sequence
@@ -366,6 +552,7 @@ class BatchReconstructionWorker(QThread):
         self.reference_images = reference_images
         self.image_processor = image_processor
         self.projection_type = projection_type
+        self.max_workers = max_workers
         self._camera_params_for_preprocess = {}
 
     def run(self):
@@ -388,7 +575,8 @@ class BatchReconstructionWorker(QThread):
                 projections = self.image_processor.prepare_projection_data(
                     cam_imgs, self._camera_params_for_preprocess,
                     self.reference_images,
-                    projection_type=self.projection_type
+                    projection_type=self.projection_type,
+                    max_workers=self.max_workers
                 )
 
                 # MART重建
@@ -3724,11 +3912,13 @@ class _IEAlgoCard(QFrame):
 
     add_requested = pyqtSignal(str)  # step_key
 
-    def __init__(self, key, label, desc, sp_func, parent=None):
+    def __init__(self, key, label, desc, sp_func, icon_path: str = "", parent=None):
         super().__init__(parent)
         self._sp = sp_func
         self._key = key
         self._label = label
+        self._name_label = None
+        self._desc_label = None
         self.setCursor(Qt.PointingHandCursor)
         self.setProperty("algo_key", key)
         self.setStyleSheet(
@@ -3737,17 +3927,52 @@ class _IEAlgoCard(QFrame):
             "QFrame:hover { background: #454545; border-color: #6a6a6a; }"
             "QLabel { color: #ddd; border: none; }"
         )
-        c_lay = QVBoxLayout(self)
-        c_lay.setContentsMargins(self._sp(6), self._sp(4), self._sp(6), self._sp(4))
-        c_lay.setSpacing(0)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(self._sp(7), self._sp(5), self._sp(7), self._sp(5))
+        row.setSpacing(self._sp(7))
+
+        if icon_path and Path(icon_path).exists():
+            icon_lbl = QLabel()
+            pixmap = _svg_icon(icon_path, self._sp(24), "#A8C7FF").pixmap(
+                self._sp(24), self._sp(24)
+            )
+            icon_lbl.setPixmap(pixmap)
+            icon_lbl.setFixedSize(self._sp(28), self._sp(28))
+            icon_lbl.setAlignment(Qt.AlignCenter)
+            icon_lbl.setStyleSheet("border: none; background: transparent;")
+            row.addWidget(icon_lbl)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(0)
+        row.addLayout(text_col, stretch=1)
 
         name_lbl = QLabel(f"<b>{label}</b>")
+        self._name_label = name_lbl
         name_lbl.setStyleSheet("font-size: 12px; color: #eee; border: none;")
-        c_lay.addWidget(name_lbl)
+        text_col.addWidget(name_lbl)
 
         desc_lbl = QLabel(desc)
+        self._desc_label = desc_lbl
         desc_lbl.setStyleSheet("font-size: 10px; color: #999; border: none;")
-        c_lay.addWidget(desc_lbl)
+        desc_lbl.setWordWrap(True)
+        text_col.addWidget(desc_lbl)
+
+    def apply_theme(self, theme: Dict[str, str]):
+        self.setStyleSheet(
+            f"QFrame {{ background: {theme['surface_alt']}; "
+            f"border: 1px solid {theme['border']}; border-radius: 8px; padding: 4px; }}"
+            f"QFrame:hover {{ background: {theme['hover']}; border-color: {theme['accent_hover']}; }}"
+            "QLabel { border: none; background: transparent; }"
+        )
+        if self._name_label is not None:
+            self._name_label.setStyleSheet(
+                f"font-size: 12px; color: {theme['text_main']}; border: none; background: transparent;"
+            )
+        if self._desc_label is not None:
+            self._desc_label.setStyleSheet(
+                f"font-size: 10px; color: {theme['text_secondary']}; border: none; background: transparent;"
+            )
 
     def mousePressEvent(self, event):
         """点击添加到工作流。"""
@@ -3878,6 +4103,52 @@ class _IEWorkflowCanvas(QWidget):
 class BubbleTomographyGUI(QMainWindow):
     """气泡三维层析重建系统主窗口"""
 
+    MODULE_ICON_FILES = {
+        "image_editor": "func-image-process.svg",
+        "video_import": "func-image-process.svg",
+        "calibration": "func-tissue-measure.svg",
+        "reconstruction": "func-bubble-rebuild.svg",
+        "raytrace": "func-kuna-3d.svg",
+        "particle": "func-piv-3d.svg",
+        "piv2d": "func-piv-2d.svg",
+        "ptv": "func-ptv.svg",
+        "ai_assistant": "func-ai-assist.svg",
+        "local_model": "func-local-model.svg",
+        "crop": "func-roi.svg",
+        "mirror": "func-transform.svg",
+        "rotate": "func-radial.svg",
+        "gray": "func-image-process.svg",
+        "bit_depth": "func-image-process.svg",
+        "gray_math": "func-radial.svg",
+        "bc": "func-image-process.svg",
+        "threshold": "func-bubble-analysis.svg",
+        "arithmetic": "func-cpu-gpu.svg",
+        "bub_analysis": "func-bubble-analysis.svg",
+    }
+
+    @staticmethod
+    def _resource_path(relative_path: str) -> Path:
+        """Return a resource path that works in source and PyInstaller builds."""
+        return _app_resource_path(relative_path)
+
+    def _app_icon_path(self) -> str:
+        return str(self._resource_path("assets/icons/app/icon-256.svg"))
+
+    def _function_icon_path(self, key: str) -> str:
+        icon_name = key if key.endswith(".svg") else self.MODULE_ICON_FILES.get(key, "")
+        if not icon_name and key.startswith("func-"):
+            icon_name = f"{key}.svg"
+        if not icon_name:
+            icon_name = "func-image-process.svg"
+        return str(self._resource_path(f"assets/icons/function/{icon_name}"))
+
+    def _function_icon(self, key: str) -> QIcon:
+        icon_path = self._function_icon_path(key)
+        theme = self._theme_palette() if hasattr(self, "current_theme") else {}
+        normal = theme.get("text_secondary", "#B9BBC6")
+        active = theme.get("accent_text", "#FFFFFF")
+        return _svg_icon(icon_path, self._sp(22), normal, active)
+
     @staticmethod
     def _detect_ui_scale() -> float:
         """根据 DPI 和屏幕尺寸检测 UI 缩放比例。"""
@@ -3917,15 +4188,49 @@ class BubbleTomographyGUI(QMainWindow):
 
         return re.sub(r"(\d+)px", repl, stylesheet)
 
+    def _load_app_preferences(self):
+        """Load persisted UI and compute preferences."""
+        self._settings = QSettings("BubbleTomography", "BubbleTomographyGUI")
+        cpu_count = os.cpu_count() or 1
+        default_font_size = max(10.0, min(15.0, 10.0 * self.ui_scale))
+        self.app_font_family = self._settings.value(
+            "ui/font_family", "Microsoft YaHei UI", type=str
+        )
+        self.app_font_size = float(
+            self._settings.value("ui/font_size", default_font_size)
+        )
+        self.compute_cpu_cores = int(
+            self._settings.value("compute/cpu_cores", cpu_count)
+        )
+        self.compute_cpu_cores = max(1, min(cpu_count, self.compute_cpu_cores))
+        self.compute_gpu_name = self._settings.value(
+            "compute/gpu_name", "", type=str
+        )
+        self.compute_gpu_enabled = (
+            self._settings.value("compute/gpu_enabled", False, type=bool)
+            and bool(self.compute_gpu_name)
+        )
+
+    def _save_app_preferences(self):
+        if not hasattr(self, "_settings"):
+            return
+        self._settings.setValue("ui/font_family", self.app_font_family)
+        self._settings.setValue("ui/font_size", float(self.app_font_size))
+        self._settings.setValue("compute/cpu_cores", int(self.compute_cpu_cores))
+        self._settings.setValue("compute/gpu_name", self.compute_gpu_name)
+        self._settings.setValue("compute/gpu_enabled", bool(self.compute_gpu_enabled))
+
     def _apply_scaled_fonts(self):
         """设置全局字体，适配 4K 屏幕。"""
         app = QApplication.instance()
         if app is None:
             return
 
-        font = QFont("Microsoft YaHei")
+        font = QFont(getattr(self, "app_font_family", "Microsoft YaHei"))
         font.setStyleStrategy(QFont.PreferAntialias)
-        font.setPointSizeF(max(10.0, min(15.0, 10.0 * self.ui_scale)))
+        font.setPointSizeF(float(getattr(
+            self, "app_font_size", max(10.0, min(15.0, 10.0 * self.ui_scale))
+        )))
         app.setFont(font)
 
     def _scale_existing_stylesheets(self):
@@ -3939,8 +4244,15 @@ class BubbleTomographyGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ui_scale = self._detect_ui_scale()
+        self._load_app_preferences()
         self.current_theme = "midnight"
         self.setWindowTitle("三维图像模块")
+        app_icon = QIcon(self._app_icon_path())
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(app_icon)
         self.setMinimumSize(1200, 800)
 
         # 数据存储
@@ -4029,7 +4341,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         # === 左侧导航 ===
         self._nav_panel = QWidget()
-        self._nav_panel.setFixedWidth(self._sp(208))
+        self._nav_panel.setFixedWidth(self._sp(220))
         self._nav_panel.setStyleSheet("""
             QWidget#navPanel {
                 background-color: #2c3e50;
@@ -4052,6 +4364,7 @@ class BubbleTomographyGUI(QMainWindow):
         nav_sections = [
             ("通用图像模块", [
                 ("image_editor", "图像处理"),
+                ("video_import", "视频导入"),
             ]),
             ("三维图像模块", [
                 ("calibration", "相机标定"),
@@ -4097,6 +4410,8 @@ class BubbleTomographyGUI(QMainWindow):
             for page_id, text in nav_items:
                 btn = IOSNavButton(text)
                 btn.setCheckable(True)
+                btn.setIcon(self._function_icon(page_id))
+                btn.setIconSize(QSize(self._sp(19), self._sp(19)))
                 btn.setMinimumHeight(self._sp(38))
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.setStyleSheet("""
@@ -4186,7 +4501,10 @@ class BubbleTomographyGUI(QMainWindow):
         # Page 6: 通用图像处理
         self._create_image_editor_page()
 
-        # Page 7-8: AI辅助
+        # Page 7: 视频导入
+        self._create_video_import_page()
+
+        # Page 8-9: AI辅助
         self._create_ai_module_page("ai_assistant", "AI辅助模型", local_default=False)
         self._create_ai_module_page("local_model", "本地模型", local_default=True)
         self._create_camera_acquisition_page()
@@ -4774,6 +5092,16 @@ class BubbleTomographyGUI(QMainWindow):
         clear_log_action.triggered.connect(self._clear_current_log)
         edit_menu.addAction(clear_log_action)
 
+        edit_menu.addSeparator()
+
+        preference_action = QAction("设置 Preference...", self)
+        preference_action.triggered.connect(self._show_preference_dialog)
+        edit_menu.addAction(preference_action)
+
+        compute_action = QAction("CPU/GPU 调度...", self)
+        compute_action.triggered.connect(self._show_compute_dialog)
+        edit_menu.addAction(compute_action)
+
         # ===== 窗口菜单 =====
         window_menu = menubar.addMenu("窗口(&W)")
 
@@ -4804,6 +5132,10 @@ class BubbleTomographyGUI(QMainWindow):
         nav_to_ie = QAction("图像处理", self)
         nav_to_ie.triggered.connect(lambda: self._navigate_to(5))
         window_menu.addAction(nav_to_ie)
+
+        nav_to_video_import = QAction("视频导入", self)
+        nav_to_video_import.triggered.connect(lambda: self._navigate_to(9))
+        window_menu.addAction(nav_to_video_import)
 
         window_menu.addSeparator()
 
@@ -4906,6 +5238,201 @@ class BubbleTomographyGUI(QMainWindow):
         corner_layout.addWidget(self._preview_toggle_btn)
         menubar.setCornerWidget(corner_widget, Qt.TopRightCorner)
 
+    def _show_preference_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("设置 Preference")
+        dialog.setMinimumWidth(self._sp(420))
+        layout = QVBoxLayout(dialog)
+
+        hint = QLabel("字体建议使用 Microsoft YaHei，字号建议 10-15 pt；可选范围 8-24 pt。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("字体类型"))
+        font_combo = QFontComboBox()
+        font_combo.setCurrentFont(QFont(self.app_font_family))
+        font_row.addWidget(font_combo, stretch=1)
+        layout.addLayout(font_row)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("字体尺寸"))
+        size_spin = QSpinBox()
+        size_spin.setRange(8, 24)
+        size_spin.setValue(int(round(float(self.app_font_size))))
+        size_spin.setSuffix(" pt")
+        size_row.addWidget(size_spin)
+        layout.addLayout(size_row)
+
+        preview = QLabel("预览：三维图像模块 / Bubble Tomography / 12345")
+        preview.setFrameShape(QFrame.StyledPanel)
+        preview.setMinimumHeight(self._sp(44))
+        preview.setAlignment(Qt.AlignCenter)
+        layout.addWidget(preview)
+
+        def update_preview():
+            preview.setFont(QFont(font_combo.currentFont().family(), size_spin.value()))
+
+        font_combo.currentFontChanged.connect(lambda _font: update_preview())
+        size_spin.valueChanged.connect(lambda _value: update_preview())
+        update_preview()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.RestoreDefaults
+        )
+        buttons.button(QDialogButtonBox.RestoreDefaults).setText("推荐默认")
+        layout.addWidget(buttons)
+
+        def restore_defaults():
+            font_combo.setCurrentFont(QFont("Microsoft YaHei"))
+            size_spin.setValue(int(round(max(10.0, min(15.0, 10.0 * self.ui_scale)))))
+
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(restore_defaults)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.app_font_family = font_combo.currentFont().family()
+        self.app_font_size = size_spin.value()
+        self._save_app_preferences()
+        self._apply_scaled_fonts()
+        self.statusBar().showMessage(
+            f"字体已设置为 {self.app_font_family} {self.app_font_size} pt", 4000
+        )
+
+    def _detect_compute_devices(self):
+        cpu_name = platform.processor() or platform.machine() or "Unknown CPU"
+        cpu_count = os.cpu_count() or 1
+        gpus = []
+
+        try:
+            cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
+            for i in range(cuda_count):
+                try:
+                    info = cv2.cuda.DeviceInfo(i)
+                    name = info.name()
+                except Exception:
+                    name = f"OpenCV CUDA Device {i}"
+                gpus.append(name)
+        except Exception:
+            pass
+
+        if not gpus:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                for line in result.stdout.splitlines():
+                    name = line.strip()
+                    if name and name not in gpus:
+                        gpus.append(name)
+            except Exception:
+                pass
+
+        if not gpus and os.name == "nt":
+            try:
+                result = subprocess.run(
+                    ["wmic", "path", "win32_VideoController", "get", "name"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+                for line in result.stdout.splitlines():
+                    name = line.strip()
+                    if name and name.lower() != "name" and name not in gpus:
+                        gpus.append(name)
+            except Exception:
+                pass
+
+        return cpu_name, cpu_count, gpus
+
+    def _show_compute_dialog(self):
+        cpu_name, cpu_count, gpus = self._detect_compute_devices()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("CPU/GPU 调度")
+        dialog.setMinimumWidth(self._sp(500))
+        layout = QVBoxLayout(dialog)
+
+        info = QLabel(
+            f"CPU: {cpu_name}\n逻辑核心数: {cpu_count}\n"
+            f"显卡: {', '.join(gpus) if gpus else '未检测到可用显卡'}"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        cpu_row = QHBoxLayout()
+        cpu_row.addWidget(QLabel("计算使用 CPU 核数"))
+        cpu_spin = QSpinBox()
+        cpu_spin.setRange(1, cpu_count)
+        cpu_spin.setValue(max(1, min(cpu_count, int(self.compute_cpu_cores))))
+        cpu_spin.setToolTip("默认使用全部逻辑核心；需要保留软件响应时建议空余 2 个核心。")
+        cpu_row.addWidget(cpu_spin)
+        reserve_btn = QPushButton("保留 2 核")
+        reserve_btn.clicked.connect(lambda: cpu_spin.setValue(max(1, cpu_count - 2)))
+        cpu_row.addWidget(reserve_btn)
+        all_btn = QPushButton("使用全核")
+        all_btn.clicked.connect(lambda: cpu_spin.setValue(cpu_count))
+        cpu_row.addWidget(all_btn)
+        layout.addLayout(cpu_row)
+
+        gpu_row = QHBoxLayout()
+        gpu_check = QCheckBox("启用显卡图像处理")
+        gpu_check.setChecked(bool(self.compute_gpu_enabled and gpus))
+        gpu_check.setEnabled(bool(gpus))
+        gpu_combo = QComboBox()
+        gpu_combo.addItem("不使用显卡")
+        for name in gpus:
+            gpu_combo.addItem(name)
+        if self.compute_gpu_name:
+            idx = gpu_combo.findText(self.compute_gpu_name)
+            if idx >= 0:
+                gpu_combo.setCurrentIndex(idx)
+        gpu_combo.setEnabled(bool(gpus))
+        gpu_row.addWidget(gpu_check)
+        gpu_row.addWidget(gpu_combo, stretch=1)
+        layout.addLayout(gpu_row)
+
+        note = QLabel("未选择显卡时，图像处理默认只使用 CPU 全核。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.compute_cpu_cores = cpu_spin.value()
+        self.compute_gpu_enabled = bool(gpu_check.isChecked() and gpu_combo.currentIndex() > 0)
+        self.compute_gpu_name = gpu_combo.currentText() if self.compute_gpu_enabled else ""
+        self._save_app_preferences()
+        self._sync_compute_controls()
+        gpu_text = self.compute_gpu_name if self.compute_gpu_enabled else "不使用显卡"
+        self.statusBar().showMessage(
+            f"计算调度已设置: CPU {self.compute_cpu_cores}/{cpu_count} 核, GPU {gpu_text}",
+            5000,
+        )
+
+    def _sync_compute_controls(self):
+        if hasattr(self, "ie_workers_spin"):
+            cpu_count = os.cpu_count() or 1
+            self.ie_workers_spin.setRange(1, cpu_count)
+            self.ie_workers_spin.setValue(max(1, min(cpu_count, self.compute_cpu_cores)))
+
+    def _on_ie_workers_changed(self, value):
+        self.compute_cpu_cores = int(value)
+        self._save_app_preferences()
+
     def _on_toggle_preview(self):
         """切换右侧预览面板的可见性。"""
         if self._preview_panel.is_expanded():
@@ -4931,45 +5458,45 @@ class BubbleTomographyGUI(QMainWindow):
         """Return the active macOS-inspired UI palette."""
         palettes = {
             "midnight": {
-                "background": "#1E1E20",
-                "sidebar": "#28282B",
-                "sidebar_header": "#242428",
-                "sidebar_path": "#232326",
-                "surface": "#323236",
-                "surface_alt": "#3A3A3F",
-                "input": "#323236",
-                "hover": "#3A3A3F",
-                "pressed": "#46464C",
-                "border": "#4A4A50",
+                "background": "#1C1C1E",
+                "sidebar": "#24262D",
+                "sidebar_header": "#202229",
+                "sidebar_path": "#23262E",
+                "surface": "#2C2F38",
+                "surface_alt": "#343844",
+                "input": "#2C2F38",
+                "hover": "#394050",
+                "pressed": "#1F50C7",
+                "border": "#4C5363",
                 "text_main": "#F5F5F7",
-                "text_secondary": "#98989D",
-                "accent": "#0A84FF",
-                "accent_hover": "#2997FF",
+                "text_secondary": "#B9BBC6",
+                "accent": "#2D68E8",
+                "accent_hover": "#4F86F5",
                 "accent_text": "#FFFFFF",
-                "success": "#32D74B",
-                "warning": "#FF9F0A",
-                "danger": "#FF453A",
+                "success": "#2EB867",
+                "warning": "#FF6E40",
+                "danger": "#E5484D",
                 "shadow": "rgba(0, 0, 0, 70)",
             },
             "silicon": {
-                "background": "#F5F5F7",
-                "sidebar": "#EBEBF0",
-                "sidebar_header": "#E2E2E7",
-                "sidebar_path": "#F0F0F4",
+                "background": "#FAFAF9",
+                "sidebar": "#F5F5F4",
+                "sidebar_header": "#E8E8E6",
+                "sidebar_path": "#FFFFFF",
                 "surface": "#FFFFFF",
-                "surface_alt": "#F2F2F6",
+                "surface_alt": "#F5F5F4",
                 "input": "#FFFFFF",
-                "hover": "#E5F0FF",
-                "pressed": "#D7E8FF",
-                "border": "#D2D2D7",
-                "text_main": "#1D1D1F",
-                "text_secondary": "#86868B",
-                "accent": "#0066CC",
-                "accent_hover": "#0A74D9",
+                "hover": "#EAF1FF",
+                "pressed": "#CFE0FF",
+                "border": "#D4D4D2",
+                "text_main": "#1F1F1D",
+                "text_secondary": "#737370",
+                "accent": "#2D68E8",
+                "accent_hover": "#1F50C7",
                 "accent_text": "#FFFFFF",
-                "success": "#248A3D",
-                "warning": "#B26A00",
-                "danger": "#D70015",
+                "success": "#2EB867",
+                "warning": "#E55A2B",
+                "danger": "#E5484D",
                 "shadow": "rgba(0, 0, 0, 26)",
             },
         }
@@ -5088,11 +5615,12 @@ class BubbleTomographyGUI(QMainWindow):
         return f"""
             QPushButton {{
                 text-align: left;
-                padding: 8px 12px;
+                padding: 8px 12px 8px 10px;
                 border: 1px solid {theme['border']};
-                border-radius: 8px;
+                border-radius: 10px;
                 color: {theme['text_secondary']};
                 font-size: 13px;
+                font-weight: 600;
                 background-color: {theme['surface_alt']};
             }}
             QPushButton:hover {{
@@ -5146,7 +5674,7 @@ class BubbleTomographyGUI(QMainWindow):
         common_button = f"""
             QPushButton {{
                 background: {surface_alt}; color: {text}; border: 1px solid {border};
-                border-radius: 3px; padding: 4px 10px; font-size: 12px;
+                border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600;
             }}
             QPushButton:hover {{ background: {theme['hover']}; border-color: {accent_hover}; }}
             QPushButton:pressed {{ background: {theme['pressed']}; }}
@@ -5283,6 +5811,10 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_filename_edit.setStyleSheet(self._scale_stylesheet(input_style))
         if hasattr(self, "ie_fps_spin"):
             self.ie_fps_spin.setStyleSheet(self._scale_stylesheet(input_style))
+        if hasattr(self, "_ie_algo_cards"):
+            for card in self._ie_algo_cards.values():
+                if hasattr(card, "apply_theme"):
+                    card.apply_theme(theme)
 
         if hasattr(self, "_ie_workflow_nodes"):
             for step_key, info in self._ie_workflow_nodes.items():
@@ -5310,8 +5842,10 @@ class BubbleTomographyGUI(QMainWindow):
             """)
         if hasattr(self, "_nav_buttons"):
             nav_style = self._nav_button_stylesheet(theme)
-            for btn in self._nav_buttons.values():
+            for page_id, btn in self._nav_buttons.items():
                 btn.setStyleSheet(nav_style)
+                btn.setIcon(self._function_icon(page_id))
+                btn.setIconSize(QSize(self._sp(19), self._sp(19)))
                 if isinstance(btn, IOSNavButton):
                     shadow_alpha = 115 if self.current_theme == "midnight" else 55
                     btn.set_shadow_color(QColor(0, 0, 0, shadow_alpha))
@@ -5321,14 +5855,14 @@ class BubbleTomographyGUI(QMainWindow):
                     QFrame#navSectionCard {{
                         background-color: {theme['surface']};
                         border: 2px solid {theme['border']};
-                        border-radius: 10px;
+                        border-radius: 12px;
                     }}
                 """)
         if hasattr(self, "_nav_section_labels"):
             for label in self._nav_section_labels:
                 label.setStyleSheet(
                     f"color: {theme['text_main']}; font-size: 14px; "
-                    "font-weight: bold; padding: 5px 8px 6px 8px; "
+                    "font-weight: 700; padding: 6px 8px 7px 8px; "
                     f"border-bottom: 1px solid {theme['border']};"
                 )
         if hasattr(self, "_nav_version_label"):
@@ -6359,6 +6893,10 @@ class BubbleTomographyGUI(QMainWindow):
         right_layout.setContentsMargins(
             self._sp(6), self._sp(6), self._sp(6), self._sp(6)
         )
+        collapsible_widgets = []
+        right_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", collapsible_widgets)
+        )
 
         # 上部: 日志 + 预览工具栏
         top_splitter = QSplitter(Qt.Horizontal)
@@ -6395,13 +6933,104 @@ class BubbleTomographyGUI(QMainWindow):
 
         top_splitter.setSizes([self._sp(500), self._sp(500)])
         right_layout.addWidget(top_splitter, stretch=1)
+        collapsible_widgets.append(top_splitter)
 
         # 下部: 可视化工具栏
         viz_bar = self._make_viz_toolbar(viz_context)
         if viz_bar:
             right_layout.addWidget(viz_bar)
+            collapsible_widgets.append(viz_bar)
 
         return right_panel, log_text, preview_widget
+
+    def _make_region_toggle_bar(self, title: str, widgets: List[QWidget]):
+        bar = QFrame()
+        bar.setStyleSheet(
+            "QFrame { background: #1e2d3d; border: 1px solid #34495e; border-radius: 3px; }"
+            "QLabel { color: #ecf0f1; font-size: 12px; font-weight: bold; border: none; }"
+            "QToolButton { background: transparent; color: #bdc3c7; border: none; "
+            "font-size: 14px; font-weight: bold; min-width: 20px; min-height: 20px; }"
+            "QToolButton:hover { color: #ecf0f1; }"
+        )
+        bar.setFixedHeight(self._sp(30))
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(self._sp(6), 0, self._sp(6), 0)
+        layout.setSpacing(self._sp(4))
+        title_label = QLabel(title)
+        layout.addWidget(title_label)
+        layout.addStretch()
+        up_btn = QToolButton()
+        up_btn.setText("▸")
+        up_btn.setToolTip("隐藏该区域")
+        down_btn = QToolButton()
+        down_btn.setText("▾")
+        down_btn.setToolTip("展开该区域")
+        down_btn.hide()
+        layout.addWidget(up_btn)
+        layout.addWidget(down_btn)
+        state = {"expanded": True, "width": None, "min": None, "max": None}
+
+        def set_visible(visible: bool):
+            container = bar.parentWidget()
+            for widget in widgets:
+                widget.setVisible(visible)
+            title_label.setVisible(visible)
+            up_btn.setVisible(visible)
+            down_btn.setVisible(not visible)
+            state["expanded"] = visible
+
+            if container is None:
+                return
+
+            if visible:
+                if state["min"] is not None:
+                    container.setMinimumWidth(state["min"])
+                if state["width"] is not None:
+                    container.resize(max(self._sp(120), int(state["width"])), container.height())
+                container.setMaximumWidth(state["max"] or 16777215)
+                splitter = container.parentWidget()
+                if isinstance(splitter, QSplitter) and state["width"]:
+                    index = splitter.indexOf(container)
+                    sizes = splitter.sizes()
+                    if 0 <= index < len(sizes):
+                        target = max(self._sp(120), int(state["width"]))
+                        delta = max(0, target - sizes[index])
+                        sizes[index] = target
+                        if delta and len(sizes) > 1:
+                            donor = max(
+                                (i for i in range(len(sizes)) if i != index),
+                                key=lambda i: sizes[i],
+                            )
+                            sizes[donor] = max(self._sp(40), sizes[donor] - delta)
+                        splitter.setSizes(sizes)
+                return
+
+            state["width"] = max(container.width(), self._sp(120))
+            state["min"] = container.minimumWidth()
+            state["max"] = container.maximumWidth()
+            collapsed_width = self._sp(34)
+            container.setMinimumWidth(collapsed_width)
+            container.setMaximumWidth(collapsed_width)
+            container.resize(collapsed_width, container.height())
+
+            splitter = container.parentWidget()
+            if isinstance(splitter, QSplitter):
+                index = splitter.indexOf(container)
+                sizes = splitter.sizes()
+                if 0 <= index < len(sizes):
+                    released = max(0, sizes[index] - collapsed_width)
+                    sizes[index] = collapsed_width
+                    if released and len(sizes) > 1:
+                        donor = max(
+                            (i for i in range(len(sizes)) if i != index),
+                            key=lambda i: sizes[i],
+                        )
+                        sizes[donor] += released
+                    splitter.setSizes(sizes)
+
+        up_btn.clicked.connect(lambda: set_visible(False))
+        down_btn.clicked.connect(lambda: set_visible(True))
+        return bar
 
     def _make_viz_toolbar(self, context=""):
         """创建可视化工具栏。"""
@@ -6731,6 +7360,10 @@ class BubbleTomographyGUI(QMainWindow):
         right_container_layout.setContentsMargins(
             self._sp(6), self._sp(6), self._sp(6), self._sp(6)
         )
+        recon_right_widgets = []
+        right_container_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", recon_right_widgets)
+        )
 
         # Log and preview area
         mid_splitter = QSplitter(Qt.Vertical)
@@ -6753,10 +7386,12 @@ class BubbleTomographyGUI(QMainWindow):
 
         mid_splitter.setSizes([self._sp(250), self._sp(400)])
         right_container_layout.addWidget(mid_splitter, stretch=1)
+        recon_right_widgets.append(mid_splitter)
 
         # Visualization toolbar
         viz_toolbar = self._make_viz_toolbar("reconstruction")
         right_container_layout.addWidget(viz_toolbar)
+        recon_right_widgets.append(viz_toolbar)
 
         # === 时间点选择 ===
         timepoint_group = QGroupBox("时间点选择")
@@ -6808,6 +7443,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         timepoint_group.setLayout(tp_layout)
         right_container_layout.addWidget(timepoint_group)
+        recon_right_widgets.append(timepoint_group)
 
         layout.addWidget(left_panel, stretch=1)
         layout.addWidget(right_container, stretch=2)
@@ -7050,6 +7686,10 @@ class BubbleTomographyGUI(QMainWindow):
         right_container_layout.setContentsMargins(
             self._sp(6), self._sp(6), self._sp(6), self._sp(6)
         )
+        particle_right_widgets = []
+        right_container_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", particle_right_widgets)
+        )
 
         # Log and preview area
         mid_splitter = QSplitter(Qt.Vertical)
@@ -7087,10 +7727,12 @@ class BubbleTomographyGUI(QMainWindow):
 
         mid_splitter.setSizes([self._sp(140), self._sp(260), self._sp(360)])
         right_container_layout.addWidget(mid_splitter, stretch=1)
+        particle_right_widgets.append(mid_splitter)
 
         # Visualization toolbar
         viz_toolbar = self._make_viz_toolbar("particle")
         right_container_layout.addWidget(viz_toolbar)
+        particle_right_widgets.append(viz_toolbar)
 
         # === 时间点选择 ===
         piv_timepoint_group = QGroupBox("时间点选择")
@@ -7147,6 +7789,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         piv_timepoint_group.setLayout(piv_tp_layout)
         right_container_layout.addWidget(piv_timepoint_group)
+        particle_right_widgets.append(piv_timepoint_group)
 
         self.particle_parameter_scroll = QScrollArea()
         self.particle_parameter_scroll.setWidgetResizable(True)
@@ -9090,7 +9733,8 @@ class BubbleTomographyGUI(QMainWindow):
             self.camera_bubble_images,
             camera_params_for_preprocess,
             self.camera_reference_images,
-            projection_type=self.proj_type_combo.currentText()
+            projection_type=self.proj_type_combo.currentText(),
+            max_workers=self.compute_cpu_cores
         )
 
         # Image preview
@@ -9209,7 +9853,8 @@ class BubbleTomographyGUI(QMainWindow):
             camera_params=camera_params_for_recon,
             reference_images=self.camera_reference_images,
             image_processor=self.image_processor,
-            projection_type=self.proj_type_combo.currentText()
+            projection_type=self.proj_type_combo.currentText(),
+            max_workers=self.compute_cpu_cores
         )
         self.batch_worker.progress.connect(self.recon_log.append)
         self.batch_worker.timepoint_done.connect(
@@ -9651,6 +10296,10 @@ class BubbleTomographyGUI(QMainWindow):
         right_container_layout.setContentsMargins(
             self._sp(6), self._sp(6), self._sp(6), self._sp(6)
         )
+        rt_right_widgets = []
+        right_container_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", rt_right_widgets)
+        )
 
         # Log and preview area
         mid_splitter = QSplitter(Qt.Vertical)
@@ -9671,10 +10320,12 @@ class BubbleTomographyGUI(QMainWindow):
 
         mid_splitter.setSizes([self._sp(250), self._sp(400)])
         right_container_layout.addWidget(mid_splitter, stretch=1)
+        rt_right_widgets.append(mid_splitter)
 
         # Visualization toolbar
         viz_toolbar = self._make_viz_toolbar("raytrace")
         right_container_layout.addWidget(viz_toolbar)
+        rt_right_widgets.append(viz_toolbar)
 
         layout.addWidget(left_panel, stretch=1)
         layout.addWidget(right_container, stretch=2)
@@ -10852,7 +11503,18 @@ class BubbleTomographyGUI(QMainWindow):
         left_scroll.setWidget(left_panel)
 
         right_panel = QWidget()
-        right_layout = QHBoxLayout(right_panel)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(
+            self._sp(6), self._sp(6), self._sp(6), self._sp(6)
+        )
+        piv2d_right_widgets = []
+        right_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", piv2d_right_widgets)
+        )
+        piv2d_content = QWidget()
+        piv2d_content_layout = QHBoxLayout(piv2d_content)
+        piv2d_content_layout.setContentsMargins(0, 0, 0, 0)
+        piv2d_content_layout.setSpacing(self._sp(6))
         preview_splitter = QSplitter(Qt.Vertical)
 
         top_widget = QWidget()
@@ -10952,8 +11614,10 @@ class BubbleTomographyGUI(QMainWindow):
         self.piv2d_pair_info_label.setStyleSheet("color: #666;")
         timeline_layout.addWidget(self.piv2d_pair_info_label)
 
-        right_layout.addWidget(preview_splitter, stretch=1)
-        right_layout.addWidget(timeline_panel)
+        piv2d_content_layout.addWidget(preview_splitter, stretch=1)
+        piv2d_content_layout.addWidget(timeline_panel)
+        right_layout.addWidget(piv2d_content, stretch=1)
+        piv2d_right_widgets.append(piv2d_content)
 
         layout.addWidget(left_scroll)
         layout.addWidget(right_panel, stretch=1)
@@ -11793,6 +12457,10 @@ class BubbleTomographyGUI(QMainWindow):
 
         results = QWidget()
         results_layout = QVBoxLayout(results)
+        ptv_right_widgets = []
+        results_layout.addWidget(
+            self._make_region_toggle_bar("右侧功能区", ptv_right_widgets)
+        )
         self.ptv_figure = Figure(figsize=(7, 5), tight_layout=True)
         self.ptv_canvas = FigureCanvas(self.ptv_figure)
         self.ptv_axes = self.ptv_figure.add_subplot(111, projection="3d")
@@ -11800,11 +12468,13 @@ class BubbleTomographyGUI(QMainWindow):
         self.ptv_axes.set_ylabel("Y (mm)")
         self.ptv_axes.set_zlabel("Z (mm)")
         results_layout.addWidget(self.ptv_canvas, stretch=1)
+        ptv_right_widgets.append(self.ptv_canvas)
         self.ptv_log = QTextEdit()
         self.ptv_log.setReadOnly(True)
         self.ptv_log.setMaximumHeight(self._sp(170))
         self.ptv_log.setPlaceholderText("PTV 运行日志与统计结果")
         results_layout.addWidget(self.ptv_log)
+        ptv_right_widgets.append(self.ptv_log)
         splitter.addWidget(results)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -11993,6 +12663,8 @@ class BubbleTomographyGUI(QMainWindow):
         tb_lay.setContentsMargins(self._sp(8), self._sp(4), self._sp(8), self._sp(4))
 
         self.ie_run_btn = QPushButton("处理")
+        self.ie_run_btn.setIcon(self._function_icon("func-cpu-gpu"))
+        self.ie_run_btn.setIconSize(QSize(self._sp(16), self._sp(16)))
         self.ie_run_btn.setFixedWidth(self._sp(80))
         self.ie_run_btn.setStyleSheet(
             "QPushButton { background: #2196F3; color: white; border: none; "
@@ -12015,8 +12687,10 @@ class BubbleTomographyGUI(QMainWindow):
         tb_lay.addWidget(self.ie_reset_btn)
 
         self.ie_crop_select_btn = QPushButton("框选裁剪")
+        self.ie_crop_select_btn.setIcon(self._function_icon("crop"))
+        self.ie_crop_select_btn.setIconSize(QSize(self._sp(16), self._sp(16)))
         self.ie_crop_select_btn.setCheckable(True)
-        self.ie_crop_select_btn.setFixedWidth(self._sp(96))
+        self.ie_crop_select_btn.setFixedWidth(self._sp(110))
         self.ie_crop_select_btn.setToolTip("在右侧源图像中按住鼠标左键框选裁剪区域")
         self.ie_crop_select_btn.toggled.connect(self._ie_toggle_crop_selection)
         tb_lay.addWidget(self.ie_crop_select_btn)
@@ -12130,12 +12804,15 @@ class BubbleTomographyGUI(QMainWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
         lay.setSpacing(self._sp(4))
+        collapsible_widgets = []
+        lay.addWidget(self._make_region_toggle_bar("操作功能区", collapsible_widgets))
 
         # 搜索框
         self.ie_ops_search = QLineEdit()
         self.ie_ops_search.setPlaceholderText("🔍 搜索算法...")
         self.ie_ops_search.textChanged.connect(self._ie_filter_ops)
         lay.addWidget(self.ie_ops_search)
+        collapsible_widgets.append(self.ie_ops_search)
 
         # 可滚动区域
         scroll = QScrollArea()
@@ -12194,14 +12871,40 @@ class BubbleTomographyGUI(QMainWindow):
         scroll_lay.addStretch()
         scroll.setWidget(scroll_content)
         lay.addWidget(scroll, stretch=1)
+        collapsible_widgets.append(scroll)
 
         return panel
 
     def _ie_make_algo_card(self, key, label, desc):
         """创建单个算法卡片（可点击添加 / 可拖拽到画布）。"""
-        card = _IEAlgoCard(key, label, desc, self._sp)
+        card = _IEAlgoCard(key, label, desc, self._sp, self._function_icon_path(key))
         card.add_requested.connect(self._ie_add_node)
         return card
+
+    def _open_video_import_dialog(self):
+        from gui.video_import_dialog import VideoImportDialog
+
+        dialog = VideoImportDialog(self)
+        dialog.exec_()
+        output_dir = getattr(dialog, "last_output_dir", "")
+        if hasattr(self, "ie_log"):
+            self.ie_log.append("视频导入窗口已关闭。")
+        if output_dir and hasattr(self, "_watch_output_dir"):
+            self._watch_output_dir(output_dir)
+
+    def _create_video_import_page(self):
+        from gui.video_import_dialog import VideoImportWidget
+
+        self.video_import_page = VideoImportWidget(self)
+        self.video_import_page.export_finished.connect(self._on_video_import_export_finished)
+        self.content_stack.addWidget(self.video_import_page)
+
+    def _on_video_import_export_finished(self, output_dir: str):
+        if output_dir and hasattr(self, "_watch_output_dir"):
+            self._watch_output_dir(output_dir)
+        if hasattr(self, "_file_tree_panel"):
+            self._file_tree_panel.watch_extra_dir(output_dir)
+            self._file_tree_panel.refresh()
 
     def _ie_create_workflow_canvas(self, _IE):
         """中栏：工作流画布 — 垂直节点卡片流，支持拖拽添加和节点排序。"""
@@ -12216,12 +12919,8 @@ class BubbleTomographyGUI(QMainWindow):
         c_lay.setSpacing(0)
 
         # 标题
-        title = QLabel("⚙ 工作流")
-        title.setStyleSheet(
-            "color: #ccc; font-size: 14px; font-weight: bold; "
-            "padding: 4px; border: none;"
-        )
-        c_lay.addWidget(title)
+        collapsible_widgets = []
+        c_lay.addWidget(self._make_region_toggle_bar("工作流", collapsible_widgets))
 
         # 可滚动节点区域
         self.ie_canvas_scroll = QScrollArea()
@@ -12240,6 +12939,7 @@ class BubbleTomographyGUI(QMainWindow):
 
         self.ie_canvas_scroll.setWidget(self.ie_canvas_content)
         c_lay.addWidget(self.ie_canvas_scroll, stretch=1)
+        collapsible_widgets.append(self.ie_canvas_scroll)
 
         # 节点引用列表
         self._ie_workflow_nodes = {}  # key -> node widget
@@ -12255,6 +12955,8 @@ class BubbleTomographyGUI(QMainWindow):
         v_lay = QVBoxLayout(viewer)
         v_lay.setContentsMargins(self._sp(4), self._sp(4), self._sp(4), self._sp(4))
         v_lay.setSpacing(0)
+        collapsible_widgets = []
+        v_lay.addWidget(self._make_region_toggle_bar("查看功能区", collapsible_widgets))
 
         # 输入源选择区域
         source_bar = QFrame()
@@ -12276,6 +12978,8 @@ class BubbleTomographyGUI(QMainWindow):
         sg_lay = QHBoxLayout(self.ie_single_widget)
         sg_lay.setContentsMargins(0, 0, 0, 0)
         btn_open_single = QPushButton("📄 选择图像")
+        btn_open_single.setIcon(self._function_icon("image_editor"))
+        btn_open_single.setIconSize(QSize(self._sp(15), self._sp(15)))
         btn_open_single.clicked.connect(self._ie_open_single)
         sg_lay.addWidget(btn_open_single)
         self.ie_single_label = QLabel("未选择文件")
@@ -12288,12 +12992,16 @@ class BubbleTomographyGUI(QMainWindow):
         bg_lay = QHBoxLayout(self.ie_batch_widget)
         bg_lay.setContentsMargins(0, 0, 0, 0)
         btn_src_dir = QPushButton("输入目录")
+        btn_src_dir.setIcon(self._function_icon("image_editor"))
+        btn_src_dir.setIconSize(QSize(self._sp(15), self._sp(15)))
         btn_src_dir.clicked.connect(self._ie_pick_src_dir)
         bg_lay.addWidget(btn_src_dir)
         self.ie_src_label = QLabel("未选择")
         self.ie_src_label.setStyleSheet("color: #888; border: none;")
         bg_lay.addWidget(self.ie_src_label)
         btn_dst_dir = QPushButton("输出目录")
+        btn_dst_dir.setIcon(self._function_icon("func-transform"))
+        btn_dst_dir.setIconSize(QSize(self._sp(15), self._sp(15)))
         btn_dst_dir.clicked.connect(self._ie_pick_dst_dir)
         bg_lay.addWidget(btn_dst_dir)
         self.ie_dst_label = QLabel("未选择")
@@ -12301,9 +13009,10 @@ class BubbleTomographyGUI(QMainWindow):
         bg_lay.addWidget(self.ie_dst_label)
         bg_lay.addWidget(QLabel("CPU workers"))
         self.ie_workers_spin = QSpinBox()
-        self.ie_workers_spin.setRange(1, default_worker_count(os.cpu_count()))
-        self.ie_workers_spin.setValue(default_worker_count())
-        self.ie_workers_spin.setToolTip("Parallel image-processing workers; default leaves CPU cores free.")
+        self.ie_workers_spin.setRange(1, os.cpu_count() or 1)
+        self.ie_workers_spin.setValue(max(1, min(os.cpu_count() or 1, self.compute_cpu_cores)))
+        self.ie_workers_spin.setToolTip("图像处理并行核数；默认全核，可在 编辑 > CPU/GPU 调度 中保留 2 核。")
+        self.ie_workers_spin.valueChanged.connect(self._on_ie_workers_changed)
         bg_lay.addWidget(self.ie_workers_spin)
         sb_lay.addWidget(self.ie_batch_widget)
         self.ie_batch_widget.hide()
@@ -12311,6 +13020,8 @@ class BubbleTomographyGUI(QMainWindow):
         # 保存/批量按钮
         sb_lay.addStretch()
         self.ie_batch_run_btn = QPushButton("▶ 批量处理")
+        self.ie_batch_run_btn.setIcon(self._function_icon("func-cpu-gpu"))
+        self.ie_batch_run_btn.setIconSize(QSize(self._sp(15), self._sp(15)))
         self.ie_batch_run_btn.setStyleSheet(
             "QPushButton { background: #E64A19; color: white; border: none; "
             "  border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
@@ -12321,6 +13032,8 @@ class BubbleTomographyGUI(QMainWindow):
         sb_lay.addWidget(self.ie_batch_run_btn)
 
         btn_save_single = QPushButton("💾 保存")
+        btn_save_single.setIcon(self._function_icon("func-transform"))
+        btn_save_single.setIconSize(QSize(self._sp(15), self._sp(15)))
         btn_save_single.setStyleSheet(
             "QPushButton { background: #388E3C; color: white; border: none; "
             "  border-radius: 3px; padding: 4px 12px; font-weight: bold; }"
@@ -12375,6 +13088,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_source_scroll.setWidget(source_bar)
         v_lay.addWidget(self.ie_source_scroll)
         v_lay.addWidget(fname_bar)
+        collapsible_widgets.extend([self.ie_source_scroll, fname_bar])
 
         # 上下分割的图像查看器
         viewer_splitter = QSplitter(Qt.Vertical)
@@ -12501,6 +13215,7 @@ class BubbleTomographyGUI(QMainWindow):
         rf_lay.addWidget(self.ie_result_tabs, stretch=1)
 
         viewer_splitter.addWidget(result_frame)
+        collapsible_widgets.append(viewer_splitter)
 
         viewer_splitter.setStretchFactor(0, 1)
         viewer_splitter.setStretchFactor(1, 1)
@@ -12571,6 +13286,7 @@ class BubbleTomographyGUI(QMainWindow):
         fn_lay.addWidget(self.ie_fps_spin)
 
         v_lay.addWidget(frame_nav)
+        collapsible_widgets.append(frame_nav)
 
         # 帧播放定时器
         self._ie_frame_timer = QTimer(self)
@@ -12590,6 +13306,7 @@ class BubbleTomographyGUI(QMainWindow):
             "QProgressBar::chunk { background: #4CAF50; border-radius: 2px; }"
         )
         v_lay.addWidget(self.ie_progress_bar)
+        collapsible_widgets.append(self.ie_progress_bar)
 
         # 日志区
         self.ie_log = QTextEdit()
@@ -12601,6 +13318,7 @@ class BubbleTomographyGUI(QMainWindow):
             "  border-radius: 4px; font-size: 11px; padding: 4px; }"
         )
         v_lay.addWidget(self.ie_log)
+        collapsible_widgets.append(self.ie_log)
 
         return viewer
 
@@ -12671,6 +13389,10 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _ie_add_node(self, step_key, request_preview=True):
         """添加处理节点到工作流画布。"""
+        if step_key == "video_import":
+            self.content_stack.setCurrentIndex(7)
+            self._nav_buttons["video_import"].setChecked(True)
+            return
         if step_key in self._ie_workflow_nodes:
             return  # 已存在
 
@@ -13823,8 +14545,9 @@ class BubbleTomographyGUI(QMainWindow):
             "particle": 4,
             "piv2d": 5,
             "ptv": 6,
-            "ai_assistant": 7,
-            "local_model": 8,
+            "video_import": 7,
+            "ai_assistant": 8,
+            "local_model": 9,
         }
         for page_id, nav_btn in self._nav_buttons.items():
             if btn is nav_btn:
@@ -13851,9 +14574,10 @@ class BubbleTomographyGUI(QMainWindow):
             3: 4,
             4: 5,
             5: 0,
-            6: 7,
-            7: 8,
+            6: 8,
+            7: 9,
             8: 6,
+            9: 7,
         }
         current_idx = legacy_to_current.get(page_idx, page_idx)
         self.content_stack.setCurrentIndex(current_idx)
@@ -13865,6 +14589,7 @@ class BubbleTomographyGUI(QMainWindow):
             "particle",
             "piv2d",
             "ptv",
+            "video_import",
             "ai_assistant",
             "local_model",
         ]
@@ -13898,6 +14623,8 @@ class BubbleTomographyGUI(QMainWindow):
             self.piv2d_log.clear()
         elif page_idx == 6:
             self.ptv_log.clear()
+        elif page_idx == 7 and hasattr(self, "video_import_page"):
+            self.video_import_page.log.clear()
 
     def _show_image(self, path):
         pixmap = QPixmap(path)
@@ -14050,8 +14777,21 @@ def run_gui():
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    splash = StartupSplash()
+    splash.center_on_screen()
+    splash.show()
+    app.processEvents()
+    splash_started = time.monotonic()
+
     window = BubbleTomographyGUI()
     window.show()
+    app.processEvents()
+
+    min_splash_ms = 1100
+    elapsed_ms = int((time.monotonic() - splash_started) * 1000)
+    close_delay = max(120, min_splash_ms - elapsed_ms)
+    QTimer.singleShot(close_delay, splash.close)
+    app._startup_splash = splash
     sys.exit(app.exec_())
 
 

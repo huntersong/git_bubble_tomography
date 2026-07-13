@@ -14,16 +14,20 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 block_cipher = None
 project_dir = os.path.abspath(SPECPATH)
 entry_script = os.path.join(project_dir, "main.py")
+assets_dir = os.path.join(project_dir, "assets")
 
 cv2_datas, cv2_binaries, cv2_hiddenimports = collect_all("cv2")
 cv2_hiddenimports += collect_submodules("cv2")
+app_datas = list(cv2_datas)
+if os.path.isdir(assets_dir):
+    app_datas.append((assets_dir, "assets"))
 
 
 a = Analysis(
     [entry_script],
     pathex=[project_dir],
     binaries=cv2_binaries,
-    datas=cv2_datas,
+    datas=app_datas,
     hiddenimports=[
         # PyQt5
         "PyQt5.sip",
@@ -78,6 +82,7 @@ a = Analysis(
         "utils.image_processor",
         "utils.image_editor",
         "utils.bub_analysis",
+        "utils.video_importer",
         "ptv",
         "ptv.tracker",
         "ptv.velocity",
@@ -87,6 +92,7 @@ a = Analysis(
         "raytrace.raytrace_reconstructor",
         "gui",
         "gui.main_window",
+        "gui.video_import_dialog",
     ],
     hookspath=[],
     hooksconfig={},

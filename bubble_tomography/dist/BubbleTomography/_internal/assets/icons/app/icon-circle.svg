@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  圆形变体 — Windows 11 / 托盘 / 应用列表
+  圆形纯色 + 居中单色图标
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2D68E8"/>
+      <stop offset="1" stop-color="#102B6E"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.4" cy="0.4" r="0.6">
+      <stop offset="0" stop-color="#7AA6FF" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#2D68E8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <circle cx="128" cy="128" r="128" fill="url(#bgGradient)"/>
+  <circle cx="128" cy="128" r="128" fill="url(#glow)"/>
+
+  <g transform="translate(128 128)">
+    <!-- 中心核 -->
+    <circle r="30" fill="#FF6E40"/>
+    <circle r="30" fill="none" stroke="#FFFFFF" stroke-width="2.5" opacity="0.4"/>
+    <!-- 主外环 -->
+    <circle r="56" fill="none" stroke="#FFFFFF" stroke-width="3" opacity="0.6"/>
+    <!-- 4 粒子 -->
+    <circle cx="0" cy="-56" r="5.5" fill="#FFFFFF"/>
+    <circle cx="56" cy="0" r="5.5" fill="#FFFFFF"/>
+    <circle cx="0" cy="56" r="5.5" fill="#FF6E40"/>
+    <circle cx="-56" cy="0" r="5.5" fill="#FF6E40"/>
+  </g>
+</svg>

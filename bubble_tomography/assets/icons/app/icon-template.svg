@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS Style Guide 「Template」风格单色图标
+  用作: 系统托盘、菜单栏、未激活状态、文档模板
+  透明背景，可被着色
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <g fill="currentColor" fill-rule="evenodd">
+    <!-- 中心核 -->
+    <circle cx="512" cy="512" r="120"/>
+    <!-- 主外环 -->
+    <circle cx="512" cy="512" r="220" fill="none" stroke="currentColor" stroke-width="36"/>
+    <!-- 4 个粒子 -->
+    <circle cx="512" cy="292" r="22"/>
+    <circle cx="732" cy="512" r="22"/>
+    <circle cx="512" cy="732" r="22"/>
+    <circle cx="292" cy="512" r="22"/>
+  </g>
+</svg>

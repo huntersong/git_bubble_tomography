@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 库纳机 3D 建模：立方体 + 网格 -->
+  <path d="M12 3L4 7.5v9L12 21l8-4.5v-9L12 3z"/>
+  <path d="M4 7.5L12 12l8-4.5M12 12v9"/>
+  <path d="M7 5.5l10 5.5M17 5.5L7 11" opacity="0.5"/>
+  <circle cx="12" cy="12" r="1" fill="currentColor"/>
+</svg>

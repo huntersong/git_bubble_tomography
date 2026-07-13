@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 图像处理：图像 + 调色板 -->
+  <rect x="3" y="4" width="18" height="16" rx="2"/>
+  <circle cx="8" cy="9" r="1.5"/>
+  <path d="M21 16l-5-5-4 4-3-3-6 6"/>
+  <path d="M14 6.5a2 2 0 11-2-2" stroke-width="1.2"/>
+  <circle cx="17" cy="7" r="0.8" fill="currentColor"/>
+</svg>

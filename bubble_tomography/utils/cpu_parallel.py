@@ -9,15 +9,17 @@ from typing import Iterator, Optional
 
 def default_worker_count(
     requested: Optional[int] = None,
-    reserve_cores: int = 2,
-    max_workers: int = 4,
+    reserve_cores: int = 0,
+    max_workers: Optional[int] = None,
 ) -> int:
-    """Return a worker count that leaves CPU headroom for the desktop."""
+    """Return a worker count for image processing."""
     cpu_count = os.cpu_count() or 1
     usable = max(1, cpu_count - max(0, reserve_cores))
     if requested is not None and requested > 0:
         return max(1, min(int(requested), usable))
-    return max(1, min(usable, max_workers))
+    if max_workers is not None and max_workers > 0:
+        return max(1, min(usable, int(max_workers)))
+    return usable
 
 
 @contextmanager

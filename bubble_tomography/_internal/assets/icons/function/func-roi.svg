@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- ROI 区域选择：虚线矩形 + 角点 -->
+  <rect x="4" y="4" width="16" height="16" rx="1" stroke-dasharray="2 2"/>
+  <path d="M2 7V2h5M22 7V2h-5M2 17v5h5M22 17v5h-5" stroke-width="2"/>
+</svg>
