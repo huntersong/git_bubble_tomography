@@ -61,7 +61,7 @@ from utils.image_editor import (
     CropParams, GrayParams, BrightnessContrastParams,
     MirrorParams, RotateParams, BitDepthParams, GrayMathParams,
     ArithmeticParams, ThresholdParams,
-    robust_imread, robust_imwrite,
+    robust_imread, robust_imwrite, MAX_IMAGE_STEP_TEMP_BYTES,
 )
 from utils.bub_analysis import BubAnalysisParams
 from ptv import PTVConfig, PTVTracker, PTVVelocityCalculator
@@ -13610,7 +13610,8 @@ class BubbleTomographyGUI(QMainWindow):
 
         d_lay = QVBoxLayout(dialog)
 
-        # 构建参数控件（复用现有逻辑）
+        # 参数控件属于当前对话框，每次打开都重新创建。Qt 会在对话框关闭时
+        # 销毁子控件，因此不能跨两次编辑复用这些 Python 属性。
         param_widget = QWidget()
         p_lay = QVBoxLayout(param_widget)
 
@@ -13652,16 +13653,18 @@ class BubbleTomographyGUI(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             if step_key == "crop":
                 self._ie_apply_crop_params_from_controls()
+            elif step_key == "rotate":
+                self._ie_apply_rotate_params_from_controls()
             elif step_key == "bub_analysis":
                 self._ie_apply_bub_analysis_params()
-            self._ie_sync_config_from_ui()
+            self._ie_sync_config_from_ui(step_key)
             # 更新节点参数摘要
             if step_key in self._ie_workflow_nodes:
                 param_lbl = self._ie_workflow_nodes[step_key]["param_label"]
                 param_lbl.setText(self._ie_get_param_summary(step_key))
             self._ie_request_preview()
 
-    # ===== 参数构建器（对话框版本，与原Tab版共享控件） =====
+    # ===== 参数构建器（对话框版本） =====
 
     def _build_crop_param_widget(self, layout):
         labels = ["X (px):", "Y (px):", "宽 (px):", "高 (px):"]
@@ -13696,145 +13699,218 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _build_mirror_param_widget(self, layout):
         layout.addWidget(QLabel("镜像方向:"))
-        if not hasattr(self, 'ie_mirror_combo'):
-            self.ie_mirror_combo = QComboBox()
-            self.ie_mirror_combo.addItems(["水平镜像", "垂直镜像", "水平+垂直"])
-            self.ie_mirror_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_mirror_combo = QComboBox()
+        self.ie_mirror_combo.addItems(["水平镜像", "垂直镜像", "水平+垂直"])
+        modes = ["horizontal", "vertical", "both"]
+        self.ie_mirror_combo.setCurrentIndex(
+            modes.index(self.ie_config.mirror.mode)
+            if self.ie_config.mirror.mode in modes else 0
+        )
         layout.addWidget(self.ie_mirror_combo)
 
     def _build_rotate_param_widget(self, layout):
         layout.addWidget(QLabel("旋转方式:"))
-        if not hasattr(self, 'ie_rotate_mode_combo'):
-            self.ie_rotate_mode_combo = QComboBox()
-            self.ie_rotate_mode_combo.addItems(["顺时针 90°", "逆时针 90°", "180°", "自定义角度"])
-            self.ie_rotate_mode_combo.currentIndexChanged.connect(self._ie_on_rotate_mode_changed)
+        cfg = self.ie_config.rotate
+        self.ie_rotate_mode_combo = QComboBox()
+        self.ie_rotate_mode_combo.addItems(["顺时针 90°", "逆时针 90°", "180°", "自定义角度"])
+        mode_index = {"cw90": 0, "ccw90": 1, "180": 2, "custom": 3}.get(cfg.mode, 0)
+        self.ie_rotate_mode_combo.setCurrentIndex(mode_index)
         layout.addWidget(self.ie_rotate_mode_combo)
         layout.addWidget(QLabel("角度:"))
-        if not hasattr(self, 'ie_rotate_angle_spin'):
-            self.ie_rotate_angle_spin = QDoubleSpinBox()
-            self.ie_rotate_angle_spin.setRange(-360.0, 360.0)
-            self.ie_rotate_angle_spin.setSingleStep(1.0)
-            self.ie_rotate_angle_spin.setEnabled(False)
-            self.ie_rotate_angle_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_rotate_angle_spin = QDoubleSpinBox()
+        self.ie_rotate_angle_spin.setRange(-360.0, 360.0)
+        self.ie_rotate_angle_spin.setDecimals(2)
+        self.ie_rotate_angle_spin.setSingleStep(1.0)
+        self.ie_rotate_angle_spin.setKeyboardTracking(False)
+        self.ie_rotate_angle_spin.setValue(float(cfg.angle))
+        self.ie_rotate_angle_spin.setEnabled(mode_index == 3)
         layout.addWidget(self.ie_rotate_angle_spin)
-        if not hasattr(self, 'ie_rotate_expand_check'):
-            self.ie_rotate_expand_check = QCheckBox("自动扩展画布")
-            self.ie_rotate_expand_check.setChecked(True)
-            self.ie_rotate_expand_check.stateChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_rotate_expand_check = QCheckBox("自动扩展画布")
+        self.ie_rotate_expand_check.setChecked(bool(cfg.expand))
         layout.addWidget(self.ie_rotate_expand_check)
         layout.addWidget(QLabel("边界灰度:"))
-        if not hasattr(self, 'ie_rotate_border_spin'):
-            self.ie_rotate_border_spin = QSpinBox()
-            self.ie_rotate_border_spin.setRange(0, 255)
-            self.ie_rotate_border_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_rotate_border_spin = QSpinBox()
+        self.ie_rotate_border_spin.setRange(0, 255)
+        self.ie_rotate_border_spin.setValue(int(np.clip(cfg.border_value, 0, 255)))
         layout.addWidget(self.ie_rotate_border_spin)
+        self.ie_rotate_mode_combo.currentIndexChanged.connect(
+            lambda idx: self.ie_rotate_angle_spin.setEnabled(idx == 3)
+        )
+
+    def _ie_apply_rotate_params_from_controls(self):
+        if not all(hasattr(self, name) for name in (
+            "ie_rotate_mode_combo",
+            "ie_rotate_angle_spin",
+            "ie_rotate_expand_check",
+            "ie_rotate_border_spin",
+        )):
+            return
+        cfg = self.ie_config.rotate
+        modes = ["cw90", "ccw90", "180", "custom"]
+        cfg.mode = modes[max(0, min(self.ie_rotate_mode_combo.currentIndex(), len(modes) - 1))]
+        cfg.angle = float(self.ie_rotate_angle_spin.value())
+        cfg.expand = bool(self.ie_rotate_expand_check.isChecked())
+        cfg.border_value = int(self.ie_rotate_border_spin.value())
+        cfg.enabled = True
 
     def _build_bit_depth_param_widget(self, layout):
         layout.addWidget(QLabel("源位深:"))
-        if not hasattr(self, 'ie_bit_depth_combo'):
-            self.ie_bit_depth_combo = QComboBox()
-            self.ie_bit_depth_combo.addItems(["自动识别", "24 位", "16 位", "12 位"])
-            self.ie_bit_depth_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_bit_depth_combo = QComboBox()
+        self.ie_bit_depth_combo.addItems(["自动识别", "24 位", "16 位", "12 位"])
+        source_bits = [0, 24, 16, 12]
+        bits = self.ie_config.bit_depth.source_bits
+        self.ie_bit_depth_combo.setCurrentIndex(
+            source_bits.index(bits) if bits in source_bits else 0
+        )
         layout.addWidget(self.ie_bit_depth_combo)
 
     def _build_gray_math_param_widget(self, layout):
         layout.addWidget(QLabel("计算方式:"))
-        if not hasattr(self, 'ie_gray_math_combo'):
-            self.ie_gray_math_combo = QComboBox()
-            self.ie_gray_math_combo.addItems(["平均", "log", "exp", "sqrt", "sqr"])
-            self.ie_gray_math_combo.currentIndexChanged.connect(self._ie_on_gray_math_changed)
+        self.ie_gray_math_combo = QComboBox()
+        self.ie_gray_math_combo.addItems(["平均", "log", "exp", "sqrt", "sqr"])
+        operations = ["average", "log", "exp", "sqrt", "sqr"]
+        operation = self.ie_config.gray_math.operation
+        op_index = operations.index(operation) if operation in operations else 0
+        self.ie_gray_math_combo.setCurrentIndex(op_index)
         layout.addWidget(self.ie_gray_math_combo)
         layout.addWidget(QLabel("平均核大小:"))
-        if not hasattr(self, 'ie_gray_math_kernel_spin'):
-            self.ie_gray_math_kernel_spin = QSpinBox()
-            self.ie_gray_math_kernel_spin.setRange(1, 99)
-            self.ie_gray_math_kernel_spin.setSingleStep(2)
-            self.ie_gray_math_kernel_spin.setValue(3)
-            self.ie_gray_math_kernel_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_gray_math_kernel_spin = QSpinBox()
+        self.ie_gray_math_kernel_spin.setRange(1, 99)
+        self.ie_gray_math_kernel_spin.setSingleStep(2)
+        self.ie_gray_math_kernel_spin.setValue(self.ie_config.gray_math.kernel_size)
+        self.ie_gray_math_kernel_spin.setEnabled(op_index == 0)
+        self.ie_gray_math_combo.currentIndexChanged.connect(
+            lambda idx: self.ie_gray_math_kernel_spin.setEnabled(idx == 0)
+        )
         layout.addWidget(self.ie_gray_math_kernel_spin)
 
     def _build_bc_param_widget(self, layout):
         layout.addWidget(QLabel("对比度 α:"))
-        if not hasattr(self, 'ie_alpha_spin'):
-            self.ie_alpha_spin = QDoubleSpinBox()
-            self.ie_alpha_spin.setRange(0.1, 5.0)
-            self.ie_alpha_spin.setSingleStep(0.1)
-            self.ie_alpha_spin.setValue(1.0)
-            self.ie_alpha_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_alpha_spin = QDoubleSpinBox()
+        self.ie_alpha_spin.setRange(0.1, 5.0)
+        self.ie_alpha_spin.setSingleStep(0.1)
+        self.ie_alpha_spin.setValue(self.ie_config.bc.alpha)
         layout.addWidget(self.ie_alpha_spin)
         layout.addWidget(QLabel("亮度 β:"))
-        if not hasattr(self, 'ie_beta_spin'):
-            self.ie_beta_spin = QSpinBox()
-            self.ie_beta_spin.setRange(-255, 255)
-            self.ie_beta_spin.setValue(0)
-            self.ie_beta_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_beta_spin = QSpinBox()
+        self.ie_beta_spin.setRange(-255, 255)
+        self.ie_beta_spin.setValue(self.ie_config.bc.beta)
         layout.addWidget(self.ie_beta_spin)
         layout.addWidget(QLabel("α 滑块:"))
-        if not hasattr(self, 'ie_alpha_slider'):
-            self.ie_alpha_slider = QSlider(Qt.Horizontal)
-            self.ie_alpha_slider.setRange(1, 50)
-            self.ie_alpha_slider.setValue(10)
-            self.ie_alpha_slider.valueChanged.connect(self._ie_alpha_slider_moved)
+        self.ie_alpha_slider = QSlider(Qt.Horizontal)
+        self.ie_alpha_slider.setRange(1, 50)
+        self.ie_alpha_slider.setValue(int(round(self.ie_config.bc.alpha * 10)))
         layout.addWidget(self.ie_alpha_slider)
         layout.addWidget(QLabel("β 滑块:"))
-        if not hasattr(self, 'ie_beta_slider'):
-            self.ie_beta_slider = QSlider(Qt.Horizontal)
-            self.ie_beta_slider.setRange(-255, 255)
-            self.ie_beta_slider.setValue(0)
-            self.ie_beta_slider.valueChanged.connect(self._ie_beta_slider_moved)
+        self.ie_beta_slider = QSlider(Qt.Horizontal)
+        self.ie_beta_slider.setRange(-255, 255)
+        self.ie_beta_slider.setValue(self.ie_config.bc.beta)
         layout.addWidget(self.ie_beta_slider)
+        self.ie_alpha_slider.valueChanged.connect(
+            lambda value: self.ie_alpha_spin.setValue(value / 10.0)
+        )
+        self.ie_alpha_spin.valueChanged.connect(
+            lambda value: self.ie_alpha_slider.setValue(int(round(value * 10)))
+        )
+        self.ie_beta_slider.valueChanged.connect(self.ie_beta_spin.setValue)
+        self.ie_beta_spin.valueChanged.connect(self.ie_beta_slider.setValue)
 
     def _build_arith_param_widget(self, layout):
         layout.addWidget(QLabel("操作:"))
-        if not hasattr(self, 'ie_arith_combo'):
-            self.ie_arith_combo = QComboBox()
-            self.ie_arith_combo.addItems(["加法 (add)", "减法 (subtract)"])
-            self.ie_arith_combo.currentIndexChanged.connect(lambda _: self._ie_request_preview())
+        cfg = self.ie_config.arithmetic
+        self.ie_arith_combo = QComboBox()
+        self.ie_arith_combo.addItems(["加法 (add)", "减法 (subtract)"])
+        self.ie_arith_combo.setCurrentIndex(1 if cfg.operation == "subtract" else 0)
         layout.addWidget(self.ie_arith_combo)
         layout.addWidget(QLabel("操作数来源:"))
-        if not hasattr(self, 'ie_operand_src_combo'):
-            self.ie_operand_src_combo = QComboBox()
-            self.ie_operand_src_combo.addItems(["使用标量值", "使用第二张图像"])
-            self.ie_operand_src_combo.currentIndexChanged.connect(self._ie_on_operand_src_changed)
+        self.ie_operand_src_combo = QComboBox()
+        self.ie_operand_src_combo.addItems(["使用标量值", "使用第二张图像"])
+        use_file = bool(cfg.operand_path)
+        self.ie_operand_src_combo.setCurrentIndex(1 if use_file else 0)
         layout.addWidget(self.ie_operand_src_combo)
         layout.addWidget(QLabel("标量值:"))
-        if not hasattr(self, 'ie_scalar_spin'):
-            self.ie_scalar_spin = QSpinBox()
-            self.ie_scalar_spin.setRange(0, 255)
-            self.ie_scalar_spin.setValue(0)
-            self.ie_scalar_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_scalar_spin = QSpinBox()
+        self.ie_scalar_spin.setRange(0, 255)
+        self.ie_scalar_spin.setValue(cfg.scalar_value)
+        self.ie_scalar_spin.setEnabled(not use_file)
         layout.addWidget(self.ie_scalar_spin)
+
+        self.ie_operand_widget = QWidget()
+        operand_layout = QHBoxLayout(self.ie_operand_widget)
+        operand_layout.setContentsMargins(0, 0, 0, 0)
+        self.ie_operand_path = cfg.operand_path
+        self.ie_operand_label = QLabel(
+            os.path.basename(cfg.operand_path) if cfg.operand_path else "未选择图像"
+        )
+        self.ie_operand_label.setWordWrap(True)
+        operand_layout.addWidget(self.ie_operand_label, 1)
+        operand_btn = QPushButton("选择...")
+        operand_btn.clicked.connect(self._ie_pick_operand)
+        operand_layout.addWidget(operand_btn)
+        self.ie_operand_widget.setVisible(use_file)
+        layout.addWidget(self.ie_operand_widget)
+
+        def update_operand_source(index):
+            file_selected = index == 1
+            self.ie_operand_widget.setVisible(file_selected)
+            self.ie_scalar_spin.setEnabled(not file_selected)
+
+        self.ie_operand_src_combo.currentIndexChanged.connect(update_operand_source)
 
     def _build_threshold_param_widget(self, layout):
         layout.addWidget(QLabel("模式:"))
-        if not hasattr(self, 'ie_thr_mode_combo'):
-            self.ie_thr_mode_combo = QComboBox()
-            self.ie_thr_mode_combo.addItems([
-                "全局阈值 (Global)", "大津法 (Otsu)",
-                "自适应均值 (Adaptive Mean)", "自适应高斯 (Adaptive Gaussian)"
-            ])
-            self.ie_thr_mode_combo.currentIndexChanged.connect(self._ie_on_thr_mode_changed)
+        cfg = self.ie_config.threshold
+        self.ie_thr_mode_combo = QComboBox()
+        self.ie_thr_mode_combo.addItems([
+            "全局阈值 (Global)", "大津法 (Otsu)",
+            "自适应均值 (Adaptive Mean)", "自适应高斯 (Adaptive Gaussian)"
+        ])
+        modes = ["global", "otsu", "adaptive_mean", "adaptive_gaussian"]
+        mode_index = modes.index(cfg.mode) if cfg.mode in modes else 0
+        self.ie_thr_mode_combo.setCurrentIndex(mode_index)
         layout.addWidget(self.ie_thr_mode_combo)
         layout.addWidget(QLabel("阈值:"))
-        if not hasattr(self, 'ie_thr_val_spin'):
-            self.ie_thr_val_spin = QSpinBox()
-            self.ie_thr_val_spin.setRange(0, 255)
-            self.ie_thr_val_spin.setValue(128)
-            self.ie_thr_val_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_thr_val_spin = QSpinBox()
+        self.ie_thr_val_spin.setRange(0, 255)
+        self.ie_thr_val_spin.setValue(cfg.threshold_value)
         layout.addWidget(self.ie_thr_val_spin)
-        if not hasattr(self, 'ie_thr_val_slider'):
-            self.ie_thr_val_slider = QSlider(Qt.Horizontal)
-            self.ie_thr_val_slider.setRange(0, 255)
-            self.ie_thr_val_slider.setValue(128)
-            self.ie_thr_val_slider.valueChanged.connect(self._ie_thr_slider_moved)
+        self.ie_thr_val_slider = QSlider(Qt.Horizontal)
+        self.ie_thr_val_slider.setRange(0, 255)
+        self.ie_thr_val_slider.setValue(cfg.threshold_value)
         layout.addWidget(self.ie_thr_val_slider)
         layout.addWidget(QLabel("最大值:"))
-        if not hasattr(self, 'ie_thr_max_spin'):
-            self.ie_thr_max_spin = QSpinBox()
-            self.ie_thr_max_spin.setRange(1, 255)
-            self.ie_thr_max_spin.setValue(255)
-            self.ie_thr_max_spin.valueChanged.connect(lambda _: self._ie_request_preview())
+        self.ie_thr_max_spin = QSpinBox()
+        self.ie_thr_max_spin.setRange(1, 255)
+        self.ie_thr_max_spin.setValue(cfg.max_value)
         layout.addWidget(self.ie_thr_max_spin)
+
+        self.ie_adapt_widget = QGroupBox("自适应阈值参数")
+        adapt_layout = QGridLayout(self.ie_adapt_widget)
+        adapt_layout.addWidget(QLabel("邻域大小:"), 0, 0)
+        self.ie_thr_block_spin = QSpinBox()
+        self.ie_thr_block_spin.setRange(3, 999)
+        self.ie_thr_block_spin.setSingleStep(2)
+        self.ie_thr_block_spin.setValue(max(3, cfg.block_size | 1))
+        adapt_layout.addWidget(self.ie_thr_block_spin, 0, 1)
+        adapt_layout.addWidget(QLabel("常数 C:"), 1, 0)
+        self.ie_thr_c_spin = QSpinBox()
+        self.ie_thr_c_spin.setRange(-255, 255)
+        self.ie_thr_c_spin.setValue(cfg.C)
+        adapt_layout.addWidget(self.ie_thr_c_spin, 1, 1)
+        self.ie_adapt_widget.setVisible(mode_index >= 2)
+        layout.addWidget(self.ie_adapt_widget)
+
+        self.ie_thr_val_slider.valueChanged.connect(self.ie_thr_val_spin.setValue)
+        self.ie_thr_val_spin.valueChanged.connect(self.ie_thr_val_slider.setValue)
+
+        def update_threshold_mode(index):
+            adaptive = index >= 2
+            self.ie_thr_val_spin.setEnabled(not adaptive)
+            self.ie_thr_val_slider.setEnabled(not adaptive)
+            self.ie_adapt_widget.setVisible(adaptive)
+
+        update_threshold_mode(mode_index)
+        self.ie_thr_mode_combo.currentIndexChanged.connect(update_threshold_mode)
 
     def _build_bub_analysis_param_widget(self, layout):
         cfg = self.ie_config.bub_analysis
@@ -14105,6 +14181,14 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _ie_on_rotate_mode_changed(self, idx):
         self.ie_rotate_angle_spin.setEnabled(idx == 3)
+        self._ie_on_rotate_params_changed()
+
+    def _ie_on_rotate_params_changed(self):
+        self._ie_apply_rotate_params_from_controls()
+        if "rotate" in getattr(self, "_ie_workflow_nodes", {}):
+            self._ie_workflow_nodes["rotate"]["param_label"].setText(
+                self._ie_get_param_summary("rotate")
+            )
         self._ie_request_preview()
 
     def _ie_on_gray_math_changed(self, idx):
@@ -14267,19 +14351,107 @@ class BubbleTomographyGUI(QMainWindow):
         if path:
             self.ie_operand_path = path
             self.ie_operand_label.setText(os.path.basename(path))
-            self._ie_request_preview()
 
     # 旧 _ie_get_step_order（基于 ie_step_list）已移除，新版在工作流画布上方定义
 
 
-    # _ie_sync_config_from_ui 已废弃——新工作流通过对话框直接更新 ie_config，
-    # 不再需要从 UI 控件同步。保留空方法以避免其他地方调用时出错。
-    def _ie_sync_config_from_ui(self):
-        """已废弃：新工作流通过对话框直接更新 ie_config，无需从 UI 同步。"""
-        pass
+    def _ie_sync_config_from_ui(self, step_key):
+        """在参数对话框确认后，将当前步骤的控件值一次性写回配置。"""
+        cfg = self.ie_config
+        if step_key == "mirror":
+            cfg.mirror.mode = ["horizontal", "vertical", "both"][
+                self.ie_mirror_combo.currentIndex()
+            ]
+        elif step_key == "bit_depth":
+            cfg.bit_depth.source_bits = [0, 24, 16, 12][
+                self.ie_bit_depth_combo.currentIndex()
+            ]
+        elif step_key == "gray_math":
+            cfg.gray_math.operation = ["average", "log", "exp", "sqrt", "sqr"][
+                self.ie_gray_math_combo.currentIndex()
+            ]
+            kernel = int(self.ie_gray_math_kernel_spin.value())
+            cfg.gray_math.kernel_size = kernel if kernel % 2 else kernel + 1
+        elif step_key == "bc":
+            cfg.bc.alpha = float(self.ie_alpha_spin.value())
+            cfg.bc.beta = int(self.ie_beta_spin.value())
+        elif step_key == "arithmetic":
+            cfg.arithmetic.operation = ["add", "subtract"][
+                self.ie_arith_combo.currentIndex()
+            ]
+            use_file = self.ie_operand_src_combo.currentIndex() == 1
+            cfg.arithmetic.operand_path = self.ie_operand_path if use_file else ""
+            cfg.arithmetic.scalar_value = int(self.ie_scalar_spin.value())
+        elif step_key == "threshold":
+            cfg.threshold.mode = [
+                "global", "otsu", "adaptive_mean", "adaptive_gaussian"
+            ][self.ie_thr_mode_combo.currentIndex()]
+            cfg.threshold.threshold_value = int(self.ie_thr_val_spin.value())
+            cfg.threshold.max_value = int(self.ie_thr_max_spin.value())
+            block_size = int(self.ie_thr_block_spin.value())
+            cfg.threshold.block_size = block_size if block_size % 2 else block_size + 1
+            cfg.threshold.C = int(self.ie_thr_c_spin.value())
 
-    # 旧的 _ie_sync_config_from_ui 方法已删除（引用了已不存在的旧版 UI 控件）
-    # 如果将来需要，应从 self.ie_config 属性中读取参数。
+    def _ie_estimate_processing_bytes(self, img: np.ndarray, step_order) -> int:
+        if img is None:
+            return 0
+        base = int(getattr(img, "nbytes", 0))
+        pixels = int(np.prod(img.shape[:2])) if getattr(img, "ndim", 0) >= 2 else 0
+        channels = img.shape[2] if getattr(img, "ndim", 0) == 3 else 1
+        dtype_size = getattr(getattr(img, "dtype", None), "itemsize", 1)
+        peak = base
+        for step in step_order:
+            if step in ("gray", "threshold"):
+                peak = max(peak, base + pixels)
+            elif step == "mirror":
+                peak = max(peak, base * 2)
+            elif step == "bit_depth":
+                if img.dtype == np.uint8 or np.issubdtype(img.dtype, np.integer):
+                    peak = max(peak, base + pixels)
+                else:
+                    peak = max(peak, base + pixels * channels * 4 + pixels)
+            elif step == "gray_math":
+                peak = max(peak, base + pixels * 8 + pixels)
+            elif step == "bc":
+                peak = max(peak, base * 2)
+            elif step == "arithmetic":
+                peak = max(peak, base + pixels * channels * 4 * 3)
+            elif step == "rotate":
+                if self.ie_config.rotate.mode == "custom" and self.ie_config.rotate.expand:
+                    h, w = img.shape[:2]
+                    angle = np.deg2rad(float(self.ie_config.rotate.angle))
+                    out_w = int(np.ceil(abs(w * np.cos(angle)) + abs(h * np.sin(angle))))
+                    out_h = int(np.ceil(abs(w * np.sin(angle)) + abs(h * np.cos(angle))))
+                    peak = max(peak, out_w * out_h * channels * dtype_size)
+                else:
+                    peak = max(peak, base * 2)
+        return int(peak)
+
+    def _ie_confirm_processing_if_risky(self, img: np.ndarray, step_order, total_files: int = 1) -> bool:
+        estimate = self._ie_estimate_processing_bytes(img, step_order)
+        if estimate <= MAX_IMAGE_STEP_TEMP_BYTES:
+            return True
+        size_mb = estimate / (1024 * 1024)
+        limit_mb = MAX_IMAGE_STEP_TEMP_BYTES / (1024 * 1024)
+        steps = " -> ".join(ImageEditor.STEP_LABELS.get(s, s) for s in step_order)
+        scope = "单张图像" if total_files <= 1 else f"批量处理 {total_files} 张图像"
+        reply = QMessageBox.question(
+            self,
+            "高内存计算提醒",
+            (
+                f"{scope} 的当前处理流程可能占用较高内存。\n\n"
+                f"流程: {steps}\n"
+                f"预计单张峰值临时内存: 约 {size_mb:.0f} MB\n"
+                f"安全提醒阈值: {limit_mb:.0f} MB\n\n"
+                "继续计算可能造成界面长时间无响应。是否继续？"
+            ),
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            self.ie_log.append("已取消高内存图像处理。")
+            return False
+        return True
 
     def _ie_do_preview(self):
         """处理（由"处理"按钮触发，不再自动预览）。"""
@@ -14296,6 +14468,11 @@ class BubbleTomographyGUI(QMainWindow):
         # 因为新工作流通过对话框直接更新 self.ie_config
         try:
             img = robust_imread(self.ie_single_path, _cv2.IMREAD_UNCHANGED)
+            if img is None:
+                QMessageBox.warning(self, "处理失败", "无法读取当前图像。")
+                return
+            if not self._ie_confirm_processing_if_risky(img, step_order):
+                return
             op_img = None
             if hasattr(self, 'ie_config') and self.ie_config.arithmetic.operand_path:
                 op_img = robust_imread(self.ie_config.arithmetic.operand_path,
@@ -14344,6 +14521,8 @@ class BubbleTomographyGUI(QMainWindow):
                 self.ie_bub_stats_label.setText("尚无气泡统计结果")
         except Exception as e:
             self.ie_log.append(f"处理失败: {e}")
+
+            QMessageBox.warning(self, "处理失败", str(e))
 
     def _ie_resolve_filename(self, original_path, index=None, step_order=None):
         """根据输出文件名模式生成实际文件名。"""
@@ -14446,6 +14625,20 @@ class BubbleTomographyGUI(QMainWindow):
         step_order = self._ie_get_step_order()
         if not step_order:
             QMessageBox.warning(self, "提示", "请至少勾选一个处理步骤")
+            return
+        from utils.image_editor import SUPPORTED_EXTS
+        batch_files = sorted(
+            str(f) for f in Path(self.ie_src_dir).iterdir()
+            if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
+        )
+        if not batch_files:
+            QMessageBox.warning(self, "提示", "输入目录中没有可处理的图像。")
+            return
+        first_img = robust_imread(batch_files[0], cv2.IMREAD_UNCHANGED)
+        if first_img is None:
+            QMessageBox.warning(self, "提示", "无法读取批量目录中的第一张图像。")
+            return
+        if not self._ie_confirm_processing_if_risky(first_img, step_order, len(batch_files)):
             return
         if not getattr(self, "ie_dst_dir_manual", False):
             self.ie_dst_dir = self._ie_next_default_output_dir(
@@ -14723,18 +14916,23 @@ class _IEBatchWorker(QThread):
                 worker_count = 1
 
             def process_one(index, file_path):
-                editor = ImageEditor(self.config)
-                dst_name = _ie_resolve_batch_filename(
-                    file_path.name, index, self.step_order, self.filename_pattern)
-                dst = str(Path(self.dst_dir) / dst_name)
-                img = robust_imread(str(file_path), _cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    return index, file_path.name, False
-                result = editor.process(img, op_img, step_order=self.step_order)
-                ok = robust_imwrite(dst, result)
-                if ok and editor.last_bub_analysis_result is not None:
-                    editor.last_bub_analysis_result.write_artifacts(dst)
-                return index, file_path.name, bool(ok)
+                try:
+                    editor = ImageEditor(self.config)
+                    dst_name = _ie_resolve_batch_filename(
+                        file_path.name, index, self.step_order, self.filename_pattern)
+                    dst = str(Path(self.dst_dir) / dst_name)
+                    img = robust_imread(str(file_path), _cv2.IMREAD_UNCHANGED)
+                    if img is None:
+                        return index, f"{file_path.name} (失败: 无法读取图像)", False
+                    result = editor.process(img, op_img, step_order=self.step_order)
+                    ok = robust_imwrite(dst, result)
+                    if ok and editor.last_bub_analysis_result is not None:
+                        editor.last_bub_analysis_result.write_artifacts(dst)
+                    if not ok:
+                        return index, f"{file_path.name} (失败: 无法写入结果)", False
+                    return index, file_path.name, True
+                except Exception as exc:
+                    return index, f"{file_path.name} (失败: {exc})", False
 
             if worker_count <= 1:
                 for i, f in enumerate(files):
@@ -14761,7 +14959,10 @@ class _IEBatchWorker(QThread):
 
                     done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
                     for future in done:
-                        _, fname, ok = future.result()
+                        try:
+                            _, fname, ok = future.result()
+                        except Exception as exc:
+                            fname, ok = f"未知文件 (失败: {exc})", False
                         completed += 1
                         if ok:
                             success += 1

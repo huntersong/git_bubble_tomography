@@ -12,6 +12,10 @@ import numpy as np
 
 from utils.bub_analysis import BubAnalysisParams, BubAnalysisProcessor, BubAnalysisResult
 
+MAX_ROTATE_OUTPUT_BYTES = 512 * 1024 * 1024
+MAX_ROTATE_OUTPUT_SIDE = 32767
+MAX_IMAGE_STEP_TEMP_BYTES = 512 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # 鲁棒图像加载：cv2.imread 无法处理某些 TIFF（例：12-bit/非标准BitsPerSample），
 # 此时回退到 PIL 读取。
@@ -204,6 +208,7 @@ class ImageEditor:
         operand_image: Optional[np.ndarray] = None,
         step_order: Optional[List[str]] = None,
     ) -> np.ndarray:
+        self._validate_image(image, "输入图像")
         img = image.copy()
         cfg = self.config
         steps = step_order if step_order is not None else [
@@ -235,6 +240,75 @@ class ImageEditor:
         if step == "bub_analysis":
             return cfg.bub_analysis.enabled
         return False
+
+    @staticmethod
+    def _validate_image(img: np.ndarray, name: str = "图像") -> None:
+        if img is None:
+            raise ValueError(f"{name}为空，无法处理。")
+        if not isinstance(img, np.ndarray):
+            raise TypeError(f"{name}不是有效的 numpy 图像数组。")
+        if img.size == 0 or img.ndim not in (2, 3):
+            raise ValueError(f"{name}尺寸无效。")
+        if img.ndim == 3 and img.shape[2] not in (1, 3, 4):
+            raise ValueError(f"{name}通道数不支持: {img.shape[2]}。")
+
+    @staticmethod
+    def _estimate_bytes(shape, dtype) -> int:
+        return int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+    @staticmethod
+    def _check_temp_budget(bytes_needed: int, step_label: str) -> None:
+        if bytes_needed > MAX_IMAGE_STEP_TEMP_BYTES:
+            size_mb = bytes_needed / (1024 * 1024)
+            limit_mb = MAX_IMAGE_STEP_TEMP_BYTES / (1024 * 1024)
+            raise ValueError(
+                f"{step_label}预计临时内存约 {size_mb:.0f} MB，超过安全上限 "
+                f"{limit_mb:.0f} MB。请先裁剪/缩小图像，或分批处理。"
+            )
+
+    @staticmethod
+    def _to_gray(img: np.ndarray, copy: bool = True) -> np.ndarray:
+        ImageEditor._validate_image(img)
+        if img.ndim == 2:
+            return img.copy() if copy else img
+        channels = img.shape[2]
+        if channels == 1:
+            gray = img[:, :, 0]
+            return gray.copy() if copy else gray
+        if channels == 3:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if channels == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+        raise ValueError(f"不支持的图像通道数: {channels}")
+
+    @staticmethod
+    def _to_bgr(img: np.ndarray) -> np.ndarray:
+        ImageEditor._validate_image(img)
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        channels = img.shape[2]
+        if channels == 1:
+            return cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR)
+        if channels == 3:
+            return img.copy()
+        if channels == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        raise ValueError(f"不支持的图像通道数: {channels}")
+
+    @staticmethod
+    def _match_operand_channels(src: np.ndarray, op: np.ndarray) -> np.ndarray:
+        if src.ndim == 2:
+            return ImageEditor._to_gray(op)
+        src_channels = src.shape[2]
+        if src_channels == 1:
+            return ImageEditor._to_gray(op)[:, :, None]
+        if src_channels == 3:
+            return ImageEditor._to_bgr(op)
+        if src_channels == 4:
+            bgr = ImageEditor._to_bgr(op)
+            alpha = np.full(src.shape[:2] + (1,), 255, dtype=bgr.dtype)
+            return np.dstack((bgr, alpha))
+        raise ValueError(f"不支持的源图像通道数: {src_channels}")
 
     def _run_step(
         self,
@@ -281,12 +355,12 @@ class ImageEditor:
 
     @staticmethod
     def _apply_gray(img: np.ndarray) -> np.ndarray:
-        if img.ndim == 2:
-            return img
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return ImageEditor._to_gray(img)
 
     @staticmethod
     def _apply_mirror(img: np.ndarray, p: MirrorParams) -> np.ndarray:
+        ImageEditor._validate_image(img)
+        ImageEditor._check_temp_budget(img.nbytes, "图像镜像")
         flip_code = 1
         if p.mode == "vertical":
             flip_code = 0
@@ -296,6 +370,8 @@ class ImageEditor:
 
     @staticmethod
     def _apply_rotate(img: np.ndarray, p: RotateParams) -> np.ndarray:
+        if img is None or img.size == 0:
+            return img
         if p.mode == "cw90":
             return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
         if p.mode == "ccw90":
@@ -304,17 +380,47 @@ class ImageEditor:
             return cv2.rotate(img, cv2.ROTATE_180)
 
         h, w = img.shape[:2]
+        angle = float(p.angle)
+        if not np.isfinite(angle):
+            angle = 0.0
+        angle = ((angle + 180.0) % 360.0) - 180.0
+        if abs(angle) < 1e-9:
+            return img.copy()
+
         center = (w / 2.0, h / 2.0)
-        matrix = cv2.getRotationMatrix2D(center, p.angle, 1.0)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
         out_w, out_h = w, h
         if p.expand:
             cos = abs(matrix[0, 0])
             sin = abs(matrix[0, 1])
-            out_w = int((h * sin) + (w * cos))
-            out_h = int((h * cos) + (w * sin))
+            out_w = max(1, int(np.ceil((h * sin) + (w * cos))))
+            out_h = max(1, int(np.ceil((h * cos) + (w * sin))))
             matrix[0, 2] += (out_w / 2.0) - center[0]
             matrix[1, 2] += (out_h / 2.0) - center[1]
-        border = [p.border_value] * img.shape[2] if img.ndim == 3 else p.border_value
+        else:
+            out_w = max(1, int(out_w))
+            out_h = max(1, int(out_h))
+
+        channels = img.shape[2] if img.ndim == 3 else 1
+        output_bytes = int(out_w) * int(out_h) * channels * img.dtype.itemsize
+        if (
+            out_w > MAX_ROTATE_OUTPUT_SIDE
+            or out_h > MAX_ROTATE_OUTPUT_SIDE
+            or output_bytes > MAX_ROTATE_OUTPUT_BYTES
+        ):
+            size_mb = output_bytes / (1024 * 1024)
+            raise ValueError(
+                "自定义旋转输出尺寸过大: "
+                f"{out_w}x{out_h}, 约 {size_mb:.0f} MB。"
+                "请关闭自动扩展画布，或先裁剪/缩小图像后再旋转。"
+            )
+
+        if np.issubdtype(img.dtype, np.integer):
+            info = np.iinfo(img.dtype)
+            border_value = int(np.clip(p.border_value, info.min, info.max))
+        else:
+            border_value = float(p.border_value)
+        border = tuple([border_value] * min(channels, 4)) if img.ndim == 3 else border_value
         return cv2.warpAffine(
             img,
             matrix,
@@ -326,32 +432,42 @@ class ImageEditor:
 
     @staticmethod
     def _apply_bit_depth_to_8bit(img: np.ndarray, p: BitDepthParams) -> np.ndarray:
+        ImageEditor._validate_image(img)
         if p.source_bits == 24 and img.ndim == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return ImageEditor._to_gray(img)
 
-        data = img.astype(np.float32)
+        if img.dtype == np.uint8:
+            return ImageEditor._to_gray(img) if img.ndim == 3 else img.copy()
+
         if p.source_bits in (12, 16):
             max_value = float((1 << p.source_bits) - 1)
         elif img.dtype == np.uint16:
             max_value = 65535.0
-        elif img.dtype == np.uint8:
-            if img.ndim == 3:
-                return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            return img.copy()
+        elif np.issubdtype(img.dtype, np.integer):
+            info = np.iinfo(img.dtype)
+            max_value = float(info.max)
         else:
+            ImageEditor._check_temp_budget(
+                ImageEditor._estimate_bytes(img.shape, np.float32) + img.size,
+                "转 8 位图",
+            )
+            data = np.nan_to_num(img.astype(np.float32), copy=False)
             max_value = float(np.nanmax(data)) if data.size else 255.0
 
         if max_value <= 0:
             out_shape = img.shape[:2] if img.ndim == 3 else img.shape
             return np.zeros(out_shape, dtype=np.uint8)
-        result = np.clip(data * 255.0 / max_value, 0, 255).astype(np.uint8)
+        if np.issubdtype(img.dtype, np.integer):
+            result = cv2.convertScaleAbs(img, alpha=255.0 / max_value, beta=0)
+        else:
+            result = np.clip(data * 255.0 / max_value, 0, 255).astype(np.uint8)
         if result.ndim == 3:
-            result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+            result = ImageEditor._to_gray(result)
         return result
 
     @staticmethod
     def _apply_gray_math(img: np.ndarray, p: GrayMathParams) -> np.ndarray:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+        gray = ImageEditor._to_gray(img)
         gray8 = ImageEditor._apply_bit_depth_to_8bit(gray, BitDepthParams())
         if p.operation == "average":
             k = max(1, p.kernel_size)
@@ -359,6 +475,10 @@ class ImageEditor:
                 k += 1
             return cv2.blur(gray8, (k, k))
 
+        ImageEditor._check_temp_budget(
+            ImageEditor._estimate_bytes(gray8.shape, np.float32) * 2,
+            "灰度值计算",
+        )
         src = gray8.astype(np.float32) / 255.0
         if p.operation == "log":
             dst = np.log1p(src) / np.log(2.0)
@@ -377,7 +497,17 @@ class ImageEditor:
         img: np.ndarray,
         p: BrightnessContrastParams,
     ) -> np.ndarray:
-        return cv2.convertScaleAbs(img, alpha=p.alpha, beta=p.beta)
+        ImageEditor._validate_image(img)
+        ImageEditor._check_temp_budget(img.nbytes, "亮度/对比度")
+        alpha = float(p.alpha)
+        beta = float(p.beta)
+        if not np.isfinite(alpha):
+            alpha = 1.0
+        if not np.isfinite(beta):
+            beta = 0.0
+        alpha = float(np.clip(alpha, -100.0, 100.0))
+        beta = float(np.clip(beta, -100000.0, 100000.0))
+        return cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
 
     @staticmethod
     def _apply_arithmetic(
@@ -385,39 +515,52 @@ class ImageEditor:
         p: ArithmeticParams,
         operand_image: Optional[np.ndarray],
     ) -> np.ndarray:
+        ImageEditor._validate_image(img)
+        ImageEditor._check_temp_budget(
+            ImageEditor._estimate_bytes(img.shape, np.float32) * 3,
+            "图像加/减法",
+        )
         src = img.astype(np.float32)
         if operand_image is not None:
-            op = operand_image.astype(np.float32)
-            if op.shape[:2] != src.shape[:2]:
-                op = cv2.resize(op, (src.shape[1], src.shape[0]))
-            if src.ndim == 2 and op.ndim == 3:
-                op = cv2.cvtColor(op, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            elif src.ndim == 3 and op.ndim == 2:
-                op = cv2.cvtColor(op, cv2.COLOR_GRAY2BGR).astype(np.float32)
+            ImageEditor._validate_image(operand_image, "运算图像")
+            op_img = operand_image
+            if op_img.shape[:2] != img.shape[:2]:
+                op_img = cv2.resize(op_img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
+            op_img = ImageEditor._match_operand_channels(img, op_img)
+            op = op_img.astype(np.float32)
         else:
             op = np.float32(p.scalar_value)
 
-        result = src + op if p.operation == "add" else src - op
+        if p.operation == "add":
+            result = src + op
+        elif p.operation == "subtract":
+            result = src - op
+        else:
+            result = src
         return np.clip(result, 0, 255).astype(np.uint8)
 
     @staticmethod
     def _apply_threshold(img: np.ndarray, p: ThresholdParams) -> np.ndarray:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+        gray = ImageEditor._to_gray(img)
         gray8 = ImageEditor._apply_bit_depth_to_8bit(gray, BitDepthParams())
+        max_value = int(np.clip(p.max_value, 0, 255))
+        threshold_value = int(np.clip(p.threshold_value, 0, 255))
 
         if p.mode == "global":
-            _, result = cv2.threshold(gray8, p.threshold_value, p.max_value, cv2.THRESH_BINARY)
+            _, result = cv2.threshold(gray8, threshold_value, max_value, cv2.THRESH_BINARY)
         elif p.mode == "otsu":
-            _, result = cv2.threshold(gray8, 0, p.max_value, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            _, result = cv2.threshold(gray8, 0, max_value, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         elif p.mode == "adaptive_mean":
-            bs = p.block_size if p.block_size % 2 == 1 else p.block_size + 1
+            bs = max(3, int(p.block_size))
+            bs = bs if bs % 2 == 1 else bs + 1
             result = cv2.adaptiveThreshold(
-                gray8, p.max_value, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, bs, p.C
+                gray8, max_value, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, bs, p.C
             )
         elif p.mode == "adaptive_gaussian":
-            bs = p.block_size if p.block_size % 2 == 1 else p.block_size + 1
+            bs = max(3, int(p.block_size))
+            bs = bs if bs % 2 == 1 else bs + 1
             result = cv2.adaptiveThreshold(
-                gray8, p.max_value, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, p.C
+                gray8, max_value, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, p.C
             )
         else:
             result = gray8
