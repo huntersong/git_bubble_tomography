@@ -153,6 +153,15 @@ class ThresholdParams:
 
 
 @dataclass
+class ImageAnalysisParams:
+    """Shared controls for local image-analysis and particle-statistics nodes."""
+    threshold: int = 128
+    kernel_size: int = 15
+    min_area: int = 3
+    invert: bool = False
+
+
+@dataclass
 class ImageEditConfig:
     crop: CropParams = field(default_factory=CropParams)
     gray: GrayParams = field(default_factory=GrayParams)
@@ -164,6 +173,15 @@ class ImageEditConfig:
     arithmetic: ArithmeticParams = field(default_factory=ArithmeticParams)
     threshold: ThresholdParams = field(default_factory=ThresholdParams)
     bub_analysis: BubAnalysisParams = field(default_factory=BubAnalysisParams)
+    segmentation: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    focus_quality: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    speckle_quality_map: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    speckle_quality_time: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    particle_counter: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    particle_density: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    particle_size_map: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    particle_size_time: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
+    particle_size_average: ImageAnalysisParams = field(default_factory=ImageAnalysisParams)
 
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -182,6 +200,17 @@ class ImageEditor:
         "bc",
         "arithmetic",
         "threshold",
+        "segmentation",
+        "fft",
+        "ifft",
+        "focus_quality",
+        "speckle_quality_map",
+        "speckle_quality_time",
+        "particle_counter",
+        "particle_density",
+        "particle_size_map",
+        "particle_size_time",
+        "particle_size_average",
         "bub_analysis",
     ]
 
@@ -195,18 +224,33 @@ class ImageEditor:
         "bc": "亮度/对比度",
         "arithmetic": "图像加/减法",
         "threshold": "阈值化",
+        "segmentation": "图像分割",
+        "fft": "FFT 傅里叶变换",
+        "ifft": "IFFT 傅里叶逆变换",
+        "focus_quality": "聚焦质量",
+        "speckle_quality_map": "散斑质量图",
+        "speckle_quality_time": "散斑质量随时间",
+        "particle_counter": "粒子计数",
+        "particle_density": "粒子播种密度",
+        "particle_size_map": "粒子/散斑尺寸图",
+        "particle_size_time": "粒子/散斑尺寸随时间",
+        "particle_size_average": "粒子/散斑平均尺寸",
         "bub_analysis": "BubAnalysis 气泡识别",
     }
 
     def __init__(self, config: Optional[ImageEditConfig] = None):
         self.config = config or ImageEditConfig()
         self.last_bub_analysis_result: Optional[BubAnalysisResult] = None
+        self._fft_phase: Optional[np.ndarray] = None
+        self._fft_log_range = (0.0, 1.0)
 
     def process(
         self,
         image: np.ndarray,
         operand_image: Optional[np.ndarray] = None,
         step_order: Optional[List[str]] = None,
+        step_params: Optional[List[object]] = None,
+        operand_images: Optional[List[Optional[np.ndarray]]] = None,
     ) -> np.ndarray:
         self._validate_image(image, "输入图像")
         img = image.copy()
@@ -214,8 +258,23 @@ class ImageEditor:
         steps = step_order if step_order is not None else [
             step for step in self.ALL_STEPS if self._is_step_enabled(step, cfg)
         ]
-        for step in steps:
-            img = self._run_step(img, step, operand_image)
+        for index, step in enumerate(steps):
+            original_params = None
+            params_replaced = False
+            if step_params is not None and index < len(step_params):
+                params = step_params[index]
+                if params is not None and hasattr(cfg, step):
+                    original_params = getattr(cfg, step)
+                    setattr(cfg, step, params)
+                    params_replaced = True
+            current_operand = operand_image
+            if operand_images is not None and index < len(operand_images):
+                current_operand = operand_images[index]
+            try:
+                img = self._run_step(img, step, current_operand)
+            finally:
+                if params_replaced:
+                    setattr(cfg, step, original_params)
         return img
 
     def _is_step_enabled(self, step: str, cfg: ImageEditConfig) -> bool:
@@ -239,6 +298,14 @@ class ImageEditor:
             return cfg.threshold.enabled
         if step == "bub_analysis":
             return cfg.bub_analysis.enabled
+        if step in {
+            "segmentation", "fft", "ifft", "focus_quality",
+            "speckle_quality_map", "speckle_quality_time", "particle_counter",
+            "particle_density", "particle_size_map", "particle_size_time",
+            "particle_size_average",
+        }:
+            # New workflow nodes are selected explicitly through step_order.
+            return False
         return False
 
     @staticmethod
@@ -335,6 +402,28 @@ class ImageEditor:
             return self._apply_arithmetic(img, cfg.arithmetic, operand_image)
         if step == "threshold":
             return self._apply_threshold(img, cfg.threshold)
+        if step == "segmentation":
+            return self._apply_segmentation(img, cfg.segmentation)
+        if step == "fft":
+            return self._apply_fft(img)
+        if step == "ifft":
+            return self._apply_ifft(img)
+        if step == "focus_quality":
+            return self._apply_focus_quality(img, cfg.focus_quality)
+        if step == "speckle_quality_map":
+            return self._apply_speckle_quality_map(img, cfg.speckle_quality_map)
+        if step == "speckle_quality_time":
+            return self._apply_speckle_quality_time(img, cfg.speckle_quality_time)
+        if step == "particle_counter":
+            return self._apply_particle_counter(img, cfg.particle_counter)
+        if step == "particle_density":
+            return self._apply_particle_density(img, cfg.particle_density)
+        if step == "particle_size_map":
+            return self._apply_particle_size_map(img, cfg.particle_size_map)
+        if step == "particle_size_time":
+            return self._apply_particle_size_time(img, cfg.particle_size_time)
+        if step == "particle_size_average":
+            return self._apply_particle_size_average(img, cfg.particle_size_average)
         if step == "bub_analysis":
             self.last_bub_analysis_result = BubAnalysisProcessor(
                 cfg.bub_analysis
@@ -565,6 +654,163 @@ class ImageEditor:
         else:
             result = gray8
         return result
+
+    @staticmethod
+    def _analysis_gray8(img: np.ndarray) -> np.ndarray:
+        gray = ImageEditor._to_gray(img)
+        return ImageEditor._apply_bit_depth_to_8bit(gray, BitDepthParams())
+
+    @staticmethod
+    def _odd_kernel(value: int, minimum: int = 3) -> int:
+        value = max(minimum, int(value))
+        return value if value % 2 else value + 1
+
+    @staticmethod
+    def _normalize_u8(data: np.ndarray) -> np.ndarray:
+        data = np.nan_to_num(np.asarray(data, dtype=np.float32), copy=False)
+        low = float(np.min(data)) if data.size else 0.0
+        high = float(np.max(data)) if data.size else 0.0
+        if high <= low:
+            return np.zeros(data.shape, dtype=np.uint8)
+        return np.clip((data - low) * (255.0 / (high - low)), 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _apply_segmentation(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        gray = ImageEditor._analysis_gray8(img)
+        mode = cv2.THRESH_BINARY_INV if p.invert else cv2.THRESH_BINARY
+        _, mask = cv2.threshold(gray, int(np.clip(p.threshold, 0, 255)), 255, mode)
+        return mask
+
+    def _apply_fft(self, img: np.ndarray) -> np.ndarray:
+        gray = self._analysis_gray8(img).astype(np.float32)
+        self._check_temp_budget(gray.size * 32, "FFT 傅里叶变换")
+        spectrum = np.fft.fftshift(np.fft.fft2(gray))
+        self._fft_phase = np.angle(spectrum).astype(np.float32)
+        log_magnitude = np.log1p(np.abs(spectrum)).astype(np.float32)
+        self._fft_log_range = (
+            float(np.min(log_magnitude)), float(np.max(log_magnitude))
+        )
+        return self._normalize_u8(log_magnitude)
+
+    def _apply_ifft(self, img: np.ndarray) -> np.ndarray:
+        amplitude_image = self._analysis_gray8(img).astype(np.float32)
+        if self._fft_phase is not None and self._fft_phase.shape == amplitude_image.shape:
+            low, high = self._fft_log_range
+            log_magnitude = low + (amplitude_image / 255.0) * max(high - low, 0.0)
+            magnitude = np.expm1(log_magnitude)
+            spectrum = magnitude * np.exp(1j * self._fft_phase)
+        else:
+            spectrum = amplitude_image.astype(np.complex64)
+        self._check_temp_budget(spectrum.nbytes * 2, "IFFT 傅里叶逆变换")
+        reconstructed = np.real(np.fft.ifft2(np.fft.ifftshift(spectrum)))
+        return self._normalize_u8(reconstructed)
+
+    @staticmethod
+    def _apply_focus_quality(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        ImageEditor._check_temp_budget(img.shape[0] * img.shape[1] * 20, "聚焦质量")
+        gray = ImageEditor._analysis_gray8(img).astype(np.float32)
+        laplacian = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        energy = laplacian * laplacian
+        local = cv2.GaussianBlur(
+            energy, (ImageEditor._odd_kernel(p.kernel_size),) * 2, 0
+        )
+        return cv2.applyColorMap(ImageEditor._normalize_u8(local), cv2.COLORMAP_TURBO)
+
+    @staticmethod
+    def _speckle_quality(gray: np.ndarray, kernel_size: int) -> np.ndarray:
+        ImageEditor._check_temp_budget(gray.size * 24, "散斑质量")
+        source = gray.astype(np.float32)
+        kernel = (ImageEditor._odd_kernel(kernel_size),) * 2
+        mean = cv2.blur(source, kernel)
+        mean_sq = cv2.blur(source * source, kernel)
+        deviation = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+        return deviation / np.maximum(mean, 1.0)
+
+    @staticmethod
+    def _apply_speckle_quality_map(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        gray = ImageEditor._analysis_gray8(img)
+        quality = ImageEditor._speckle_quality(gray, p.kernel_size)
+        return cv2.applyColorMap(ImageEditor._normalize_u8(quality), cv2.COLORMAP_VIRIDIS)
+
+    @staticmethod
+    def _metric_image(img: np.ndarray, title: str, value: float, unit: str = "") -> np.ndarray:
+        if img.dtype == np.uint8:
+            canvas = ImageEditor._to_bgr(img)
+        else:
+            canvas = ImageEditor._to_bgr(ImageEditor._analysis_gray8(img))
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (12, 12), (min(canvas.shape[1] - 1, 430), 82), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0, canvas)
+        cv2.putText(canvas, title, (24, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (80, 220, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"{value:.3f}{unit}", (24, 69), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+        return canvas
+
+    @staticmethod
+    def _apply_speckle_quality_time(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        gray = ImageEditor._analysis_gray8(img)
+        value = float(np.mean(ImageEditor._speckle_quality(gray, p.kernel_size)))
+        return ImageEditor._metric_image(img, "Speckle quality", value)
+
+    @staticmethod
+    def _particle_mask(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        gray = ImageEditor._analysis_gray8(img)
+        mode = cv2.THRESH_BINARY_INV if p.invert else cv2.THRESH_BINARY
+        _, mask = cv2.threshold(gray, int(np.clip(p.threshold, 0, 255)), 255, mode)
+        return mask
+
+    @staticmethod
+    def _particle_components(img: np.ndarray, p: ImageAnalysisParams):
+        ImageEditor._check_temp_budget(img.shape[0] * img.shape[1] * 12, "粒子统计")
+        mask = ImageEditor._particle_mask(img, p)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        valid = [i for i in range(1, count) if int(stats[i, cv2.CC_STAT_AREA]) >= max(1, p.min_area)]
+        return mask, labels, stats, centroids, valid
+
+    @staticmethod
+    def _apply_particle_counter(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        _, _, stats, centroids, valid = ImageEditor._particle_components(img, p)
+        output = ImageEditor._to_bgr(ImageEditor._analysis_gray8(img))
+        for number, index in enumerate(valid, 1):
+            x, y, w, h, _ = stats[index]
+            cv2.rectangle(output, (x, y), (x + w - 1, y + h - 1), (0, 255, 80), 1)
+            cx, cy = centroids[index]
+            cv2.putText(output, str(number), (int(cx), int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1, cv2.LINE_AA)
+        return ImageEditor._metric_image(output, "Particle count", float(len(valid)))
+
+    @staticmethod
+    def _apply_particle_density(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        mask = ImageEditor._particle_mask(img, p).astype(np.float32) / 255.0
+        density = cv2.blur(mask, (ImageEditor._odd_kernel(p.kernel_size),) * 2)
+        return cv2.applyColorMap(np.clip(density * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+
+    @staticmethod
+    def _particle_size_field(img: np.ndarray, p: ImageAnalysisParams):
+        _, labels, stats, _, valid = ImageEditor._particle_components(img, p)
+        field = np.zeros(labels.shape, dtype=np.float32)
+        diameters = []
+        for index in valid:
+            area = float(stats[index, cv2.CC_STAT_AREA])
+            diameter = float(np.sqrt(4.0 * area / np.pi))
+            field[labels == index] = diameter
+            diameters.append(diameter)
+        return field, diameters
+
+    @staticmethod
+    def _apply_particle_size_map(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        field, _ = ImageEditor._particle_size_field(img, p)
+        return cv2.applyColorMap(ImageEditor._normalize_u8(field), cv2.COLORMAP_TURBO)
+
+    @staticmethod
+    def _apply_particle_size_time(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        _, diameters = ImageEditor._particle_size_field(img, p)
+        value = float(np.mean(diameters)) if diameters else 0.0
+        return ImageEditor._metric_image(img, "Mean particle size", value, " px")
+
+    @staticmethod
+    def _apply_particle_size_average(img: np.ndarray, p: ImageAnalysisParams) -> np.ndarray:
+        _, diameters = ImageEditor._particle_size_field(img, p)
+        value = float(np.mean(diameters)) if diameters else 0.0
+        return ImageEditor._metric_image(img, "Average particle size", value, " px")
 
     def process_single_file(
         self,

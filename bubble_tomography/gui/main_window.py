@@ -4,6 +4,7 @@
 
 import sys
 import os
+import copy
 import html
 import json
 import platform
@@ -31,7 +32,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QModelIndex, QSize, QFileSystemWatcher,
-    QVariantAnimation, QEasingCurve, QSettings, QByteArray,
+    QVariantAnimation, QEasingCurve, QSettings, QByteArray, QMimeData, QEvent,
     PYQT_VERSION_STR, QT_VERSION_STR
 )
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QIntValidator, QFont, QColor, QDrag, QPainter, QMovie
@@ -3907,6 +3908,9 @@ class _IEImageViewer(ScientificImageViewer):
         self.cancel_roi_selection()
 
 
+IMAGE_STEP_MIME_TYPE = "application/x-bubble-tomography-image-step"
+
+
 class _IEAlgoCard(QFrame):
     """操作面板算法卡片，支持点击和拖拽。"""
 
@@ -3919,6 +3923,8 @@ class _IEAlgoCard(QFrame):
         self._label = label
         self._name_label = None
         self._desc_label = None
+        self._drag_start = None
+        self._dragging = False
         self.setCursor(Qt.PointingHandCursor)
         self.setProperty("algo_key", key)
         self.setStyleSheet(
@@ -3940,6 +3946,7 @@ class _IEAlgoCard(QFrame):
             icon_lbl.setFixedSize(self._sp(28), self._sp(28))
             icon_lbl.setAlignment(Qt.AlignCenter)
             icon_lbl.setStyleSheet("border: none; background: transparent;")
+            icon_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             row.addWidget(icon_lbl)
 
         text_col = QVBoxLayout()
@@ -3950,12 +3957,14 @@ class _IEAlgoCard(QFrame):
         name_lbl = QLabel(f"<b>{label}</b>")
         self._name_label = name_lbl
         name_lbl.setStyleSheet("font-size: 12px; color: #eee; border: none;")
+        name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         text_col.addWidget(name_lbl)
 
         desc_lbl = QLabel(desc)
         self._desc_label = desc_lbl
         desc_lbl.setStyleSheet("font-size: 10px; color: #999; border: none;")
         desc_lbl.setWordWrap(True)
+        desc_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         text_col.addWidget(desc_lbl)
 
     def apply_theme(self, theme: Dict[str, str]):
@@ -3975,32 +3984,55 @@ class _IEAlgoCard(QFrame):
             )
 
     def mousePressEvent(self, event):
-        """点击添加到工作流。"""
+        """短按在释放时添加；拖动则由工作流画布接收。"""
         if event.button() == Qt.LeftButton:
-            self.add_requested.emit(self._key)
             self._drag_start = event.pos()
+            self._dragging = False
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         """拖拽算法卡片到工作流画布。"""
         if not (event.buttons() & Qt.LeftButton):
             return
+        if self._drag_start is None:
+            return
+        if (event.pos() - self._drag_start).manhattanLength() < QApplication.startDragDistance():
+            return
+        if self._dragging:
+            return
+        self._dragging = True
         drag = QDrag(self)
-        mime = drag.mimeData()
+        mime = QMimeData()
         mime.setText(self._key)
+        mime.setData(IMAGE_STEP_MIME_TYPE, self._key.encode("utf-8"))
+        drag.setMimeData(mime)
         # 创建拖拽预览
         pixmap = self.grab()
-        drag.setPixmap(pixmap.scaled(
+        preview = pixmap.scaled(
             min(pixmap.width(), 150), min(pixmap.height(), 60),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        drag.setHotSpot(event.pos())
-        drag.exec_(Qt.CopyAction)
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        drag.setPixmap(preview)
+        drag.setHotSpot(preview.rect().center())
+        try:
+            drag.exec_(Qt.CopyAction)
+        finally:
+            # Prevent the release event after a completed/cancelled drag from
+            # being interpreted as a short click.
+            self._drag_start = None
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._dragging:
+            self.add_requested.emit(self._key)
+        self._drag_start = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
 
 
 class _IEWorkflowCanvas(QWidget):
     """工作流画布，支持拖拽添加节点和节点拖拽排序。"""
 
-    node_drop_requested = pyqtSignal(str)  # step_key
-    node_move_requested = pyqtSignal(str, int)  # step_key, new_index
+    node_drop_requested = pyqtSignal(str, int)  # step_key, layout index
+    node_move_requested = pyqtSignal(str, int)  # node_id, new_index
 
     def __init__(self, sp_func, parent=None):
         super().__init__(parent)
@@ -4008,29 +4040,82 @@ class _IEWorkflowCanvas(QWidget):
         self.setAcceptDrops(True)
         self._drag_insert_line = None
         self._drag_insert_idx = -1
+        self._drop_surfaces = set()
+
+    def register_drop_surface(self, widget):
+        """Route drag/drop events from a child viewport back to this canvas."""
+        if widget is None or widget in self._drop_surfaces:
+            return
+        widget.setAcceptDrops(True)
+        widget.installEventFilter(self)
+        self._drop_surfaces.add(widget)
+
+    @staticmethod
+    def _step_key_from_event(event):
+        mime = event.mimeData()
+        if not mime.hasFormat(IMAGE_STEP_MIME_TYPE):
+            return ""
+        return bytes(mime.data(IMAGE_STEP_MIME_TYPE)).decode(
+            "utf-8", errors="ignore"
+        ).strip()
+
+    def eventFilter(self, watched, event):
+        if watched not in self._drop_surfaces:
+            return super().eventFilter(watched, event)
+        event_type = event.type()
+        if event_type == QEvent.DragEnter:
+            if self._step_key_from_event(event):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return True
+        if event_type == QEvent.DragMove:
+            if self._step_key_from_event(event):
+                event.acceptProposedAction()
+                canvas_pos = watched.mapTo(self, event.pos())
+                self._update_drop_indicator(canvas_pos)
+            else:
+                event.ignore()
+            return True
+        if event_type == QEvent.Drop:
+            step_key = self._step_key_from_event(event)
+            canvas_pos = watched.mapTo(self, event.pos())
+            self._clear_drop_indicator()
+            if step_key:
+                event.acceptProposedAction()
+                self.node_drop_requested.emit(
+                    step_key, self._calc_insert_index(canvas_pos)
+                )
+            else:
+                event.ignore()
+            return True
+        if event_type == QEvent.DragLeave:
+            self._clear_drop_indicator()
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasText():
+        if self._step_key_from_event(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasText():
+        if self._step_key_from_event(event):
             event.acceptProposedAction()
-            # 计算插入位置指示
             self._update_drop_indicator(event.pos())
         else:
             event.ignore()
 
     def dropEvent(self, event):
-        if event.mimeData().hasText():
-            step_key = event.mimeData().text()
+        step_key = self._step_key_from_event(event)
+        if step_key:
             event.acceptProposedAction()
-            # 计算插入位置
-            insert_idx = self._calc_insert_index(event.pos())
-            self.node_drop_requested.emit(step_key)
             self._clear_drop_indicator()
+            self.node_drop_requested.emit(
+                step_key, self._calc_insert_index(event.pos())
+            )
         else:
             event.ignore()
 
@@ -4050,8 +4135,10 @@ class _IEWorkflowCanvas(QWidget):
         if not layout:
             return -1
 
-        # 映射坐标到 canvas_content
-        local_pos = self.mapTo(canvas_content, pos)
+        # QWidget.mapTo() requires an ancestor target. canvas_content is a
+        # descendant, so map through global coordinates to avoid a native Qt
+        # access violation during dragMoveEvent.
+        local_pos = canvas_content.mapFromGlobal(self.mapToGlobal(pos))
         y = local_pos.y()
 
         count = layout.count()
@@ -4080,23 +4167,22 @@ class _IEWorkflowCanvas(QWidget):
         if not layout or idx >= layout.count():
             return
 
-        item = layout.itemAt(idx)
-        if item and item.widget():
-            widget = item.widget()
-            # 创建指示线
+        if self._drag_insert_line is None:
             line = QFrame(canvas_content)
             line.setFixedHeight(3)
             line.setStyleSheet("background: #4CAF50; border: none; border-radius: 1px;")
-            # 插入到布局中
-            layout.insertWidget(idx, line)
             self._drag_insert_line = line
-            self._drag_insert_idx = idx
+        layout.insertWidget(idx, self._drag_insert_line)
+        self._drag_insert_line.show()
+        self._drag_insert_idx = idx
 
     def _clear_drop_indicator(self):
         """清除插入位置指示线。"""
         if self._drag_insert_line is not None:
-            self._drag_insert_line.deleteLater()
-            self._drag_insert_line = None
+            parent = self._drag_insert_line.parentWidget()
+            if parent is not None and parent.layout() is not None:
+                parent.layout().removeWidget(self._drag_insert_line)
+            self._drag_insert_line.hide()
         self._drag_insert_idx = -1
 
 
@@ -4123,6 +4209,17 @@ class BubbleTomographyGUI(QMainWindow):
         "bc": "func-image-process.svg",
         "threshold": "func-bubble-analysis.svg",
         "arithmetic": "func-cpu-gpu.svg",
+        "segmentation": "func-bubble-analysis.svg",
+        "fft": "func-radial.svg",
+        "ifft": "func-radial.svg",
+        "focus_quality": "func-image-process.svg",
+        "speckle_quality_map": "func-image-process.svg",
+        "speckle_quality_time": "func-radial.svg",
+        "particle_counter": "func-bubble-analysis.svg",
+        "particle_density": "func-piv-2d.svg",
+        "particle_size_map": "func-bubble-analysis.svg",
+        "particle_size_time": "func-radial.svg",
+        "particle_size_average": "func-radial.svg",
         "bub_analysis": "func-bubble-analysis.svg",
     }
 
@@ -12847,6 +12944,19 @@ class BubbleTomographyGUI(QMainWindow):
             "🔢 运算处理": [
                 ("arithmetic", "图像加减", "标量或双图运算"),
             ],
+            "📊 图像分析": [
+                ("segmentation", "图像分割", "按灰度阈值提取目标区域"),
+                ("fft", "FFT", "计算傅里叶频谱图"),
+                ("ifft", "IFFT", "由频谱重建图像"),
+                ("focus_quality", "聚焦质量", "计算局部相对清晰度"),
+                ("speckle_quality_map", "散斑质量图", "计算局部散斑质量分布"),
+                ("speckle_quality_time", "散斑质量随时间", "输出每帧整体散斑质量"),
+                ("particle_counter", "粒子计数", "统计并标记图像中的粒子"),
+                ("particle_density", "粒子播种密度", "计算局部粒子密度分布"),
+                ("particle_size_map", "粒子/散斑尺寸图", "显示局部等效粒径"),
+                ("particle_size_time", "粒子/散斑尺寸随时间", "输出每帧平均粒径"),
+                ("particle_size_average", "粒子/散斑平均尺寸", "计算整幅图像平均粒径"),
+            ],
             "🫧 气泡分析": [
                 ("bub_analysis", "BubAnalysis 气泡识别", "识别、分离并统计气泡尺寸"),
             ],
@@ -12912,7 +13022,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_workflow_canvas = canvas
         canvas.setMinimumWidth(self._sp(180))
         canvas.setStyleSheet("background: #1e1e1e;")
-        canvas.node_drop_requested.connect(self._ie_add_node)
+        canvas.node_drop_requested.connect(self._ie_drop_node)
         canvas.node_move_requested.connect(self._ie_move_node)
         c_lay = QVBoxLayout(canvas)
         c_lay.setContentsMargins(self._sp(6), self._sp(6), self._sp(6), self._sp(6))
@@ -12938,11 +13048,14 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_canvas_layout.addStretch()
 
         self.ie_canvas_scroll.setWidget(self.ie_canvas_content)
+        canvas.register_drop_surface(self.ie_canvas_scroll.viewport())
+        canvas.register_drop_surface(self.ie_canvas_content)
         c_lay.addWidget(self.ie_canvas_scroll, stretch=1)
         collapsible_widgets.append(self.ie_canvas_scroll)
 
         # 节点引用列表
-        self._ie_workflow_nodes = {}  # key -> node widget
+        self._ie_workflow_nodes = {}  # instance id -> node metadata
+        self._ie_node_serial = 0
 
         return canvas
 
@@ -13325,13 +13438,8 @@ class BubbleTomographyGUI(QMainWindow):
     # ===== 工作流节点管理 =====
 
     def _ie_init_workflow_nodes(self, _IE):
-        """初始化默认工作流：数据源节点。"""
-        # 添加数据源节点
+        """初始化空工作流，仅保留数据源节点。"""
         self._ie_add_data_source_node()
-        # 默认添加所有处理节点
-        for step_key in _IE.ALL_STEPS:
-            self._ie_add_node(step_key, request_preview=False)
-        # 触发一次预览
         self._ie_request_preview()
 
     def _ie_add_data_source_node(self):
@@ -13387,20 +13495,27 @@ class BubbleTomographyGUI(QMainWindow):
         # 添加箭头
         self._ie_add_arrow()
 
-    def _ie_add_node(self, step_key, request_preview=True):
+    def _ie_drop_node(self, step_key, insert_idx):
+        self._ie_add_node(step_key, request_preview=True, insert_idx=insert_idx)
+
+    def _ie_add_node(self, step_key, request_preview=True, insert_idx=None):
         """添加处理节点到工作流画布。"""
         if step_key == "video_import":
             self.content_stack.setCurrentIndex(7)
             self._nav_buttons["video_import"].setChecked(True)
             return
-        if step_key in self._ie_workflow_nodes:
-            return  # 已存在
-
         from utils.image_editor import ImageEditor as _IE
+        if step_key not in _IE.ALL_STEPS:
+            return
+
+        self._ie_node_serial += 1
+        node_id = f"{step_key}__{self._ie_node_serial}"
+
         label = _IE.STEP_LABELS.get(step_key, step_key)
 
         node = QFrame()
         node.setProperty("step_key", step_key)
+        node.setProperty("node_id", node_id)
         node.setStyleSheet(
             "QFrame { background: #2b2b2b; border: 1px solid #2196F3; "
             "  border-radius: 6px; }"
@@ -13426,7 +13541,7 @@ class BubbleTomographyGUI(QMainWindow):
             "QCheckBox::indicator:unchecked { background: #555; border: 1px solid #777; border-radius: 2px; }"
             "QCheckBox::indicator:checked { background: #4CAF50; border: 1px solid #4CAF50; border-radius: 2px; }"
         )
-        enable_check.stateChanged.connect(lambda s, k=step_key: self._ie_toggle_node(k, s))
+        enable_check.stateChanged.connect(lambda s, n=node_id: self._ie_toggle_node(n, s))
         tb_lay.addWidget(enable_check)
 
         title_lbl = QLabel(f"<b>{label}</b>")
@@ -13442,7 +13557,7 @@ class BubbleTomographyGUI(QMainWindow):
             "  font-size: 14px; font-weight: bold; }"
             "QPushButton:hover { color: #ff5252; }"
         )
-        del_btn.clicked.connect(lambda _, k=step_key: self._ie_remove_node(k))
+        del_btn.clicked.connect(lambda _, n=node_id: self._ie_remove_node(n))
         tb_lay.addWidget(del_btn)
 
         n_lay.addWidget(title_bar)
@@ -13494,53 +13609,58 @@ class BubbleTomographyGUI(QMainWindow):
             "  border-radius: 3px; padding: 2px 8px; font-size: 11px; }"
             "QPushButton:hover { background: #505050; }"
         )
-        edit_btn.clicked.connect(lambda _, k=step_key: self._ie_edit_node_params(k))
+        edit_btn.clicked.connect(lambda _, n=node_id: self._ie_edit_node_params(n))
         b_lay.addWidget(edit_btn)
 
         n_lay.addWidget(body)
 
-        # 插入到画布（stretch之前，箭头之后）
-        insert_idx = self.ie_canvas_layout.count() - 1
+        # Valid function boundaries are 2, 4, 6... after data source + arrow.
+        append_idx = self.ie_canvas_layout.count() - 1
+        if insert_idx is None or insert_idx < 0:
+            insert_idx = append_idx
+        insert_idx = max(2, min(int(insert_idx), append_idx))
+        if insert_idx % 2:
+            insert_idx = min(insert_idx + 1, append_idx)
         self.ie_canvas_layout.insertWidget(insert_idx, node)
 
-        # 添加箭头
-        self._ie_add_arrow()
+        arrow = self._ie_add_arrow(insert_idx + 1)
 
-        self._ie_workflow_nodes[step_key] = {
+        self._ie_workflow_nodes[node_id] = {
+            "node_id": node_id,
+            "step_key": step_key,
             "widget": node,
+            "arrow": arrow,
             "enable_check": enable_check,
             "progress": progress,
             "param_label": param_lbl,
+            "config": copy.deepcopy(self.ie_config),
         }
 
         if request_preview:
             self._ie_request_preview()
 
-    def _ie_remove_node(self, step_key):
+        return node_id
+
+    def _ie_remove_node(self, node_id):
         """从工作流移除节点。"""
-        if step_key not in self._ie_workflow_nodes:
+        if node_id not in self._ie_workflow_nodes:
             return
 
-        info = self._ie_workflow_nodes.pop(step_key)
+        info = self._ie_workflow_nodes.pop(node_id)
         widget = info["widget"]
-        # 找到widget在layout中的index，同时移除其后的箭头
-        idx = self.ie_canvas_layout.indexOf(widget)
-        if idx >= 0:
-            # 移除箭头（在节点之后，stretch之前）
-            arrow_idx = idx + 1
-            if arrow_idx < self.ie_canvas_layout.count():
-                arrow_item = self.ie_canvas_layout.itemAt(arrow_idx)
-                if arrow_item and arrow_item.widget():
-                    arrow_item.widget().deleteLater()
-
+        arrow = info.get("arrow")
+        self.ie_canvas_layout.removeWidget(widget)
         widget.deleteLater()
+        if arrow is not None:
+            self.ie_canvas_layout.removeWidget(arrow)
+            arrow.deleteLater()
         self._ie_request_preview()
 
-    def _ie_toggle_node(self, step_key, state):
+    def _ie_toggle_node(self, node_id, state):
         """启用/禁用节点。"""
-        if step_key not in self._ie_workflow_nodes:
+        if node_id not in self._ie_workflow_nodes:
             return
-        info = self._ie_workflow_nodes[step_key]
+        info = self._ie_workflow_nodes[node_id]
         enabled = (state == Qt.Checked)
         # 视觉反馈：改变边框颜色
         border_color = "#2196F3" if enabled else "#555"
@@ -13552,7 +13672,7 @@ class BubbleTomographyGUI(QMainWindow):
         self._apply_image_editor_theme()
         self._ie_request_preview()
 
-    def _ie_add_arrow(self):
+    def _ie_add_arrow(self, insert_idx=None):
         """在工作流中添加向下箭头。"""
         arrow = QLabel("▼")
         arrow.setAlignment(Qt.AlignCenter)
@@ -13560,12 +13680,17 @@ class BubbleTomographyGUI(QMainWindow):
         arrow.setStyleSheet(
             "color: #666; font-size: 14px; background: transparent; border: none;"
         )
-        insert_idx = self.ie_canvas_layout.count() - 1
+        if insert_idx is None:
+            insert_idx = self.ie_canvas_layout.count() - 1
         self.ie_canvas_layout.insertWidget(insert_idx, arrow)
+        return arrow
 
-    def _ie_get_param_summary(self, step_key):
+    def _ie_param_config(self):
+        return getattr(self, "_ie_dialog_config", self.ie_config)
+
+    def _ie_get_param_summary(self, step_key, config=None):
         """获取步骤参数的简要描述。"""
-        cfg = self.ie_config
+        cfg = config or self._ie_param_config()
         summaries = {
             "crop": f"ROI: ({cfg.crop.x}, {cfg.crop.y}) {cfg.crop.w}×{cfg.crop.h}",
             "gray": "彩色 → 8-bit 灰度",
@@ -13576,6 +13701,17 @@ class BubbleTomographyGUI(QMainWindow):
             "bc": f"α={cfg.bc.alpha:.1f}, β={cfg.bc.beta}",
             "arithmetic": f"{cfg.arithmetic.operation}" + (f" val={cfg.arithmetic.scalar_value}" if not cfg.arithmetic.operand_path else " 双图"),
             "threshold": f"模式: {cfg.threshold.mode} T={cfg.threshold.threshold_value}",
+            "segmentation": f"阈值={cfg.segmentation.threshold}, {'暗目标' if cfg.segmentation.invert else '亮目标'}",
+            "fft": "输出对数幅值频谱",
+            "ifft": "使用上游 FFT 相位重建",
+            "focus_quality": f"局部核={cfg.focus_quality.kernel_size}",
+            "speckle_quality_map": f"局部核={cfg.speckle_quality_map.kernel_size}",
+            "speckle_quality_time": f"局部核={cfg.speckle_quality_time.kernel_size}",
+            "particle_counter": f"阈值={cfg.particle_counter.threshold}, 面积≥{cfg.particle_counter.min_area}px²",
+            "particle_density": f"阈值={cfg.particle_density.threshold}, 局部核={cfg.particle_density.kernel_size}",
+            "particle_size_map": f"阈值={cfg.particle_size_map.threshold}, 面积≥{cfg.particle_size_map.min_area}px²",
+            "particle_size_time": f"阈值={cfg.particle_size_time.threshold}, 面积≥{cfg.particle_size_time.min_area}px²",
+            "particle_size_average": f"阈值={cfg.particle_size_average.threshold}, 面积≥{cfg.particle_size_average.min_area}px²",
             "bub_analysis": (
                 f"面积≥{cfg.bub_analysis.min_area}px², "
                 f"直径 {cfg.bub_analysis.min_diameter:g}–"
@@ -13585,10 +13721,17 @@ class BubbleTomographyGUI(QMainWindow):
         }
         return summaries.get(step_key, "")
 
-    def _ie_edit_node_params(self, step_key):
+    def _ie_edit_node_params(self, node_id):
         """弹出参数编辑对话框。"""
         from PyQt5.QtWidgets import QDialog, QDialogButtonBox
         from utils.image_editor import ImageEditor as _IE
+
+        info = self._ie_workflow_nodes.get(node_id)
+        if info is None:
+            return
+        step_key = info["step_key"]
+        self._ie_dialog_config = info["config"]
+        self._ie_dialog_node_id = node_id
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"编辑参数 — {_IE.STEP_LABELS.get(step_key, step_key)}")
@@ -13633,6 +13776,21 @@ class BubbleTomographyGUI(QMainWindow):
             self._build_arith_param_widget(p_lay)
         elif step_key == "threshold":
             self._build_threshold_param_widget(p_lay)
+        elif step_key in ("fft", "ifft"):
+            text = (
+                "计算二维快速傅里叶变换，并显示中心化的对数幅值频谱。"
+                if step_key == "fft" else
+                "若上游存在 FFT 节点，将使用保存的幅值和相位重建原始图像。"
+            )
+            note = QLabel(text)
+            note.setWordWrap(True)
+            p_lay.addWidget(note)
+        elif step_key in (
+            "segmentation", "focus_quality", "speckle_quality_map",
+            "speckle_quality_time", "particle_counter", "particle_density",
+            "particle_size_map", "particle_size_time", "particle_size_average",
+        ):
+            self._build_image_analysis_param_widget(p_lay, step_key)
         elif step_key == "bub_analysis":
             self._build_bub_analysis_param_widget(p_lay)
 
@@ -13659,20 +13817,22 @@ class BubbleTomographyGUI(QMainWindow):
                 self._ie_apply_bub_analysis_params()
             self._ie_sync_config_from_ui(step_key)
             # 更新节点参数摘要
-            if step_key in self._ie_workflow_nodes:
-                param_lbl = self._ie_workflow_nodes[step_key]["param_label"]
-                param_lbl.setText(self._ie_get_param_summary(step_key))
+            info["param_label"].setText(
+                self._ie_get_param_summary(step_key, info["config"])
+            )
             self._ie_request_preview()
+        self._ie_dialog_config = self.ie_config
+        self._ie_dialog_node_id = None
 
     # ===== 参数构建器（对话框版本） =====
 
     def _build_crop_param_widget(self, layout):
         labels = ["X (px):", "Y (px):", "宽 (px):", "高 (px):"]
         values = [
-            self.ie_config.crop.x,
-            self.ie_config.crop.y,
-            self.ie_config.crop.w,
-            self.ie_config.crop.h,
+            self._ie_param_config().crop.x,
+            self._ie_param_config().crop.y,
+            self._ie_param_config().crop.w,
+            self._ie_param_config().crop.h,
         ]
         self.ie_crop_spins = []
         for i, lbl in enumerate(labels):
@@ -13691,7 +13851,7 @@ class BubbleTomographyGUI(QMainWindow):
         if len(getattr(self, "ie_crop_spins", [])) != 4:
             return
         values = [spin.value() for spin in self.ie_crop_spins]
-        crop = self.ie_config.crop
+        crop = self._ie_param_config().crop
         crop.x, crop.y, crop.w, crop.h = values
         crop.enabled = crop.w > 0 and crop.h > 0
         if hasattr(self, "ie_orig_label"):
@@ -13703,14 +13863,14 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_mirror_combo.addItems(["水平镜像", "垂直镜像", "水平+垂直"])
         modes = ["horizontal", "vertical", "both"]
         self.ie_mirror_combo.setCurrentIndex(
-            modes.index(self.ie_config.mirror.mode)
-            if self.ie_config.mirror.mode in modes else 0
+            modes.index(self._ie_param_config().mirror.mode)
+            if self._ie_param_config().mirror.mode in modes else 0
         )
         layout.addWidget(self.ie_mirror_combo)
 
     def _build_rotate_param_widget(self, layout):
         layout.addWidget(QLabel("旋转方式:"))
-        cfg = self.ie_config.rotate
+        cfg = self._ie_param_config().rotate
         self.ie_rotate_mode_combo = QComboBox()
         self.ie_rotate_mode_combo.addItems(["顺时针 90°", "逆时针 90°", "180°", "自定义角度"])
         mode_index = {"cw90": 0, "ccw90": 1, "180": 2, "custom": 3}.get(cfg.mode, 0)
@@ -13745,7 +13905,7 @@ class BubbleTomographyGUI(QMainWindow):
             "ie_rotate_border_spin",
         )):
             return
-        cfg = self.ie_config.rotate
+        cfg = self._ie_param_config().rotate
         modes = ["cw90", "ccw90", "180", "custom"]
         cfg.mode = modes[max(0, min(self.ie_rotate_mode_combo.currentIndex(), len(modes) - 1))]
         cfg.angle = float(self.ie_rotate_angle_spin.value())
@@ -13758,7 +13918,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_bit_depth_combo = QComboBox()
         self.ie_bit_depth_combo.addItems(["自动识别", "24 位", "16 位", "12 位"])
         source_bits = [0, 24, 16, 12]
-        bits = self.ie_config.bit_depth.source_bits
+        bits = self._ie_param_config().bit_depth.source_bits
         self.ie_bit_depth_combo.setCurrentIndex(
             source_bits.index(bits) if bits in source_bits else 0
         )
@@ -13769,7 +13929,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_gray_math_combo = QComboBox()
         self.ie_gray_math_combo.addItems(["平均", "log", "exp", "sqrt", "sqr"])
         operations = ["average", "log", "exp", "sqrt", "sqr"]
-        operation = self.ie_config.gray_math.operation
+        operation = self._ie_param_config().gray_math.operation
         op_index = operations.index(operation) if operation in operations else 0
         self.ie_gray_math_combo.setCurrentIndex(op_index)
         layout.addWidget(self.ie_gray_math_combo)
@@ -13777,7 +13937,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_gray_math_kernel_spin = QSpinBox()
         self.ie_gray_math_kernel_spin.setRange(1, 99)
         self.ie_gray_math_kernel_spin.setSingleStep(2)
-        self.ie_gray_math_kernel_spin.setValue(self.ie_config.gray_math.kernel_size)
+        self.ie_gray_math_kernel_spin.setValue(self._ie_param_config().gray_math.kernel_size)
         self.ie_gray_math_kernel_spin.setEnabled(op_index == 0)
         self.ie_gray_math_combo.currentIndexChanged.connect(
             lambda idx: self.ie_gray_math_kernel_spin.setEnabled(idx == 0)
@@ -13789,22 +13949,22 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_alpha_spin = QDoubleSpinBox()
         self.ie_alpha_spin.setRange(0.1, 5.0)
         self.ie_alpha_spin.setSingleStep(0.1)
-        self.ie_alpha_spin.setValue(self.ie_config.bc.alpha)
+        self.ie_alpha_spin.setValue(self._ie_param_config().bc.alpha)
         layout.addWidget(self.ie_alpha_spin)
         layout.addWidget(QLabel("亮度 β:"))
         self.ie_beta_spin = QSpinBox()
         self.ie_beta_spin.setRange(-255, 255)
-        self.ie_beta_spin.setValue(self.ie_config.bc.beta)
+        self.ie_beta_spin.setValue(self._ie_param_config().bc.beta)
         layout.addWidget(self.ie_beta_spin)
         layout.addWidget(QLabel("α 滑块:"))
         self.ie_alpha_slider = QSlider(Qt.Horizontal)
         self.ie_alpha_slider.setRange(1, 50)
-        self.ie_alpha_slider.setValue(int(round(self.ie_config.bc.alpha * 10)))
+        self.ie_alpha_slider.setValue(int(round(self._ie_param_config().bc.alpha * 10)))
         layout.addWidget(self.ie_alpha_slider)
         layout.addWidget(QLabel("β 滑块:"))
         self.ie_beta_slider = QSlider(Qt.Horizontal)
         self.ie_beta_slider.setRange(-255, 255)
-        self.ie_beta_slider.setValue(self.ie_config.bc.beta)
+        self.ie_beta_slider.setValue(self._ie_param_config().bc.beta)
         layout.addWidget(self.ie_beta_slider)
         self.ie_alpha_slider.valueChanged.connect(
             lambda value: self.ie_alpha_spin.setValue(value / 10.0)
@@ -13817,7 +13977,7 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _build_arith_param_widget(self, layout):
         layout.addWidget(QLabel("操作:"))
-        cfg = self.ie_config.arithmetic
+        cfg = self._ie_param_config().arithmetic
         self.ie_arith_combo = QComboBox()
         self.ie_arith_combo.addItems(["加法 (add)", "减法 (subtract)"])
         self.ie_arith_combo.setCurrentIndex(1 if cfg.operation == "subtract" else 0)
@@ -13859,7 +14019,7 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _build_threshold_param_widget(self, layout):
         layout.addWidget(QLabel("模式:"))
-        cfg = self.ie_config.threshold
+        cfg = self._ie_param_config().threshold
         self.ie_thr_mode_combo = QComboBox()
         self.ie_thr_mode_combo.addItems([
             "全局阈值 (Global)", "大津法 (Otsu)",
@@ -13912,8 +14072,67 @@ class BubbleTomographyGUI(QMainWindow):
         update_threshold_mode(mode_index)
         self.ie_thr_mode_combo.currentIndexChanged.connect(update_threshold_mode)
 
+    def _build_image_analysis_param_widget(self, layout, step_key):
+        """构建图像分析与粒子统计节点的公共参数控件。"""
+        params = getattr(self._ie_param_config(), step_key)
+        threshold_steps = {
+            "segmentation", "particle_counter", "particle_density",
+            "particle_size_map", "particle_size_time", "particle_size_average",
+        }
+        kernel_steps = {
+            "focus_quality", "speckle_quality_map", "speckle_quality_time",
+            "particle_density",
+        }
+        particle_steps = {
+            "particle_counter", "particle_density", "particle_size_map",
+            "particle_size_time", "particle_size_average",
+        }
+
+        if step_key in threshold_steps:
+            layout.addWidget(QLabel("灰度阈值:"))
+            self.ie_analysis_threshold_spin = QSpinBox()
+            self.ie_analysis_threshold_spin.setRange(0, 255)
+            self.ie_analysis_threshold_spin.setValue(params.threshold)
+            layout.addWidget(self.ie_analysis_threshold_spin)
+
+            self.ie_analysis_invert_check = QCheckBox("识别暗目标（低于阈值）")
+            self.ie_analysis_invert_check.setChecked(params.invert)
+            layout.addWidget(self.ie_analysis_invert_check)
+
+        if step_key in kernel_steps:
+            layout.addWidget(QLabel("局部计算核大小（奇数）:"))
+            self.ie_analysis_kernel_spin = QSpinBox()
+            self.ie_analysis_kernel_spin.setRange(3, 255)
+            self.ie_analysis_kernel_spin.setSingleStep(2)
+            kernel = max(3, int(params.kernel_size))
+            self.ie_analysis_kernel_spin.setValue(kernel if kernel % 2 else kernel + 1)
+            layout.addWidget(self.ie_analysis_kernel_spin)
+
+        if step_key in particle_steps:
+            layout.addWidget(QLabel("最小粒子面积 (px²):"))
+            self.ie_analysis_min_area_spin = QSpinBox()
+            self.ie_analysis_min_area_spin.setRange(1, 10000000)
+            self.ie_analysis_min_area_spin.setValue(params.min_area)
+            layout.addWidget(self.ie_analysis_min_area_spin)
+
+        descriptions = {
+            "segmentation": "输出二值分割图。",
+            "focus_quality": "颜色越暖表示局部拉普拉斯清晰度越高。",
+            "speckle_quality_map": "使用局部灰度变异系数生成质量分布图。",
+            "speckle_quality_time": "批量处理时每个输出帧显示该时刻的整体散斑质量。",
+            "particle_counter": "输出粒子边框、编号和总数。",
+            "particle_density": "以局部粒子像素占比生成密度热图。",
+            "particle_size_map": "以连通域等效圆直径生成粒径热图。",
+            "particle_size_time": "批量处理时每个输出帧显示该时刻的平均粒径。",
+            "particle_size_average": "输出当前整幅图像中粒子的平均等效直径。",
+        }
+        hint = QLabel(descriptions[step_key])
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(hint)
+
     def _build_bub_analysis_param_widget(self, layout):
-        cfg = self.ie_config.bub_analysis
+        cfg = self._ie_param_config().bub_analysis
         source_group = QGroupBox("图像与尺度")
         source_layout = QGridLayout(source_group)
         source_layout.addWidget(QLabel("背景图:"), 0, 0)
@@ -14001,7 +14220,7 @@ class BubbleTomographyGUI(QMainWindow):
             self.ie_bub_background_edit.setText(path)
 
     def _ie_apply_bub_analysis_params(self):
-        p = self.ie_config.bub_analysis
+        p = self._ie_param_config().bub_analysis
         p.background_path = self.ie_bub_background_edit.text().strip()
         p.scale_mm_per_px = self.ie_bub_scale_spin.value()
         p.min_area = self.ie_bub_min_area_spin.value()
@@ -14066,42 +14285,45 @@ class BubbleTomographyGUI(QMainWindow):
             item = self.ie_canvas_layout.itemAt(i)
             if item and item.widget():
                 widget = item.widget()
-                step_key = widget.property("step_key")
-                if step_key and step_key in self._ie_workflow_nodes:
-                    info = self._ie_workflow_nodes[step_key]
+                node_id = widget.property("node_id")
+                if node_id and node_id in self._ie_workflow_nodes:
+                    info = self._ie_workflow_nodes[node_id]
                     if info["enable_check"].isChecked():
-                        order.append(step_key)
+                        order.append(info["step_key"])
         return order
 
-    def _ie_move_node(self, step_key, new_idx):
+    def _ie_get_step_params(self):
+        """Return each enabled node's own parameters in workflow order."""
+        params = []
+        for i in range(self.ie_canvas_layout.count()):
+            item = self.ie_canvas_layout.itemAt(i)
+            widget = item.widget() if item else None
+            node_id = widget.property("node_id") if widget is not None else None
+            info = self._ie_workflow_nodes.get(node_id) if node_id else None
+            if info is not None and info["enable_check"].isChecked():
+                params.append(getattr(info["config"], info["step_key"], None))
+        return params
+
+    def _ie_move_node(self, node_id, new_idx):
         """移动工作流节点到新位置。"""
-        if step_key not in self._ie_workflow_nodes:
+        if node_id not in self._ie_workflow_nodes:
             return
-        info = self._ie_workflow_nodes[step_key]
+        info = self._ie_workflow_nodes[node_id]
         widget = info["widget"]
+        arrow_widget = info.get("arrow")
         cur_idx = self.ie_canvas_layout.indexOf(widget)
         if cur_idx < 0 or cur_idx == new_idx:
             return
 
-        # 找到对应的箭头（节点后面紧跟的箭头）
-        arrow_idx = cur_idx + 1
-
-        # 移除节点和箭头
         self.ie_canvas_layout.removeWidget(widget)
-        if arrow_idx < self.ie_canvas_layout.count():
-            arrow_item = self.ie_canvas_layout.itemAt(arrow_idx)
-            if arrow_item and arrow_item.widget():
-                arrow_widget = arrow_item.widget()
-                self.ie_canvas_layout.removeWidget(arrow_widget)
-            else:
-                arrow_widget = None
-        else:
-            arrow_widget = None
+        if arrow_widget is not None:
+            self.ie_canvas_layout.removeWidget(arrow_widget)
 
-        # 重新插入（new_idx 可能因为移除而偏移）
-        target_idx = min(new_idx, self.ie_canvas_layout.count() - 1)  # -1 for stretch
+        target_idx = max(2, min(new_idx, self.ie_canvas_layout.count() - 1))
+        if target_idx % 2:
+            target_idx = min(target_idx + 1, self.ie_canvas_layout.count() - 1)
         self.ie_canvas_layout.insertWidget(target_idx, widget)
-        if arrow_widget:
+        if arrow_widget is not None:
             self.ie_canvas_layout.insertWidget(target_idx + 1, arrow_widget)
 
         self._ie_request_preview()
@@ -14185,9 +14407,11 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _ie_on_rotate_params_changed(self):
         self._ie_apply_rotate_params_from_controls()
-        if "rotate" in getattr(self, "_ie_workflow_nodes", {}):
-            self._ie_workflow_nodes["rotate"]["param_label"].setText(
-                self._ie_get_param_summary("rotate")
+        node_id = getattr(self, "_ie_dialog_node_id", None)
+        info = getattr(self, "_ie_workflow_nodes", {}).get(node_id)
+        if info is not None and info["step_key"] == "rotate":
+            info["param_label"].setText(
+                self._ie_get_param_summary("rotate", info["config"])
             )
         self._ie_request_preview()
 
@@ -14247,18 +14471,24 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_log.append("框选裁剪：请在右侧源图像中按住鼠标左键拖出矩形区域。")
 
     def _ie_apply_selected_crop(self, x, y, width, height):
-        crop = self.ie_config.crop
+        crop_node = next(
+            (info for info in self._ie_workflow_nodes.values()
+             if info["step_key"] == "crop"),
+            None,
+        )
+        if crop_node is None:
+            node_id = self._ie_add_node("crop", request_preview=False)
+            crop_node = self._ie_workflow_nodes[node_id]
+        crop = crop_node["config"].crop
         crop.x = int(x)
         crop.y = int(y)
         crop.w = int(width)
         crop.h = int(height)
         crop.enabled = True
-
-        if "crop" not in self._ie_workflow_nodes:
-            self._ie_add_node("crop", request_preview=False)
-        crop_node = self._ie_workflow_nodes["crop"]
         crop_node["enable_check"].setChecked(True)
-        crop_node["param_label"].setText(self._ie_get_param_summary("crop"))
+        crop_node["param_label"].setText(
+            self._ie_get_param_summary("crop", crop_node["config"])
+        )
 
         for spin, value in zip(
             getattr(self, "ie_crop_spins", []),
@@ -14357,7 +14587,7 @@ class BubbleTomographyGUI(QMainWindow):
 
     def _ie_sync_config_from_ui(self, step_key):
         """在参数对话框确认后，将当前步骤的控件值一次性写回配置。"""
-        cfg = self.ie_config
+        cfg = self._ie_param_config()
         if step_key == "mirror":
             cfg.mirror.mode = ["horizontal", "vertical", "both"][
                 self.ie_mirror_combo.currentIndex()
@@ -14391,6 +14621,29 @@ class BubbleTomographyGUI(QMainWindow):
             block_size = int(self.ie_thr_block_spin.value())
             cfg.threshold.block_size = block_size if block_size % 2 else block_size + 1
             cfg.threshold.C = int(self.ie_thr_c_spin.value())
+        elif step_key in (
+            "segmentation", "focus_quality", "speckle_quality_map",
+            "speckle_quality_time", "particle_counter", "particle_density",
+            "particle_size_map", "particle_size_time", "particle_size_average",
+        ):
+            params = getattr(cfg, step_key)
+            if step_key in {
+                "segmentation", "particle_counter", "particle_density",
+                "particle_size_map", "particle_size_time", "particle_size_average",
+            }:
+                params.threshold = int(self.ie_analysis_threshold_spin.value())
+                params.invert = bool(self.ie_analysis_invert_check.isChecked())
+            if step_key in {
+                "focus_quality", "speckle_quality_map", "speckle_quality_time",
+                "particle_density",
+            }:
+                kernel = int(self.ie_analysis_kernel_spin.value())
+                params.kernel_size = kernel if kernel % 2 else kernel + 1
+            if step_key in {
+                "particle_counter", "particle_density", "particle_size_map",
+                "particle_size_time", "particle_size_average",
+            }:
+                params.min_area = int(self.ie_analysis_min_area_spin.value())
 
     def _ie_estimate_processing_bytes(self, img: np.ndarray, step_order) -> int:
         if img is None:
@@ -14401,7 +14654,7 @@ class BubbleTomographyGUI(QMainWindow):
         dtype_size = getattr(getattr(img, "dtype", None), "itemsize", 1)
         peak = base
         for step in step_order:
-            if step in ("gray", "threshold"):
+            if step in ("gray", "threshold", "segmentation"):
                 peak = max(peak, base + pixels)
             elif step == "mirror":
                 peak = max(peak, base * 2)
@@ -14416,6 +14669,15 @@ class BubbleTomographyGUI(QMainWindow):
                 peak = max(peak, base * 2)
             elif step == "arithmetic":
                 peak = max(peak, base + pixels * channels * 4 * 3)
+            elif step in ("fft", "ifft"):
+                peak = max(peak, base + pixels * 32)
+            elif step in ("focus_quality", "speckle_quality_map", "speckle_quality_time"):
+                peak = max(peak, base + pixels * 24)
+            elif step in (
+                "particle_counter", "particle_density", "particle_size_map",
+                "particle_size_time", "particle_size_average",
+            ):
+                peak = max(peak, base + pixels * 16)
             elif step == "rotate":
                 if self.ie_config.rotate.mode == "custom" and self.ie_config.rotate.expand:
                     h, w = img.shape[:2]
@@ -14464,8 +14726,7 @@ class BubbleTomographyGUI(QMainWindow):
             self._ie_current_preview = None
             return
 
-        # 不再调用 _ie_sync_config_from_ui()，
-        # 因为新工作流通过对话框直接更新 self.ie_config
+        # Each workflow node owns its own parameter snapshot.
         try:
             img = robust_imread(self.ie_single_path, _cv2.IMREAD_UNCHANGED)
             if img is None:
@@ -14473,12 +14734,24 @@ class BubbleTomographyGUI(QMainWindow):
                 return
             if not self._ie_confirm_processing_if_risky(img, step_order):
                 return
-            op_img = None
-            if hasattr(self, 'ie_config') and self.ie_config.arithmetic.operand_path:
-                op_img = robust_imread(self.ie_config.arithmetic.operand_path,
-                                     _cv2.IMREAD_UNCHANGED)
-            editor = ImageEditor(self.ie_config)
-            result = editor.process(img, op_img, step_order=step_order)
+            step_params = self._ie_get_step_params()
+            operand_images = []
+            for step, params in zip(step_order, step_params):
+                operand_path = (
+                    params.operand_path
+                    if step == "arithmetic" and params is not None else ""
+                )
+                operand_images.append(
+                    robust_imread(operand_path, _cv2.IMREAD_UNCHANGED)
+                    if operand_path and os.path.isfile(operand_path) else None
+                )
+            editor = ImageEditor(copy.deepcopy(self.ie_config))
+            result = editor.process(
+                img,
+                step_order=step_order,
+                step_params=step_params,
+                operand_images=operand_images,
+            )
             self._ie_last_bub_analysis_result = editor.last_bub_analysis_result
             self._ie_current_preview = result
             display_result = (
@@ -14665,6 +14938,7 @@ class BubbleTomographyGUI(QMainWindow):
         self.ie_worker_thread = _IEBatchWorker(
             self.ie_src_dir, self.ie_dst_dir,
             self.ie_config, step_order, filename_pattern,
+            step_params=copy.deepcopy(self._ie_get_step_params()),
             max_workers=self.ie_workers_spin.value())
         self.ie_worker_thread.progress.connect(self._ie_on_batch_progress)
         self.ie_worker_thread.finished.connect(self._ie_on_batch_finished)
@@ -14879,12 +15153,13 @@ class _IEBatchWorker(QThread):
 
     def __init__(self, src_dir, dst_dir, config: "ImageEditConfig",
                  step_order=None, filename_pattern="{original}_processed",
-                 max_workers=None):
+                 max_workers=None, step_params=None):
         super().__init__()
         self.src_dir = src_dir
         self.dst_dir = dst_dir
         self.config  = config
         self.step_order = step_order or []
+        self.step_params = step_params or []
         self.filename_pattern = filename_pattern
         self.max_workers = max_workers
         self._stop   = False
@@ -14897,19 +15172,23 @@ class _IEBatchWorker(QThread):
             from utils.image_editor import ImageEditor, SUPPORTED_EXTS, robust_imread
             import cv2 as _cv2
 
-            files = [
+            files = sorted([
                 f for f in Path(self.src_dir).iterdir()
                 if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
-            ]
+            ], key=lambda path: path.name.lower())
             total   = len(files)
             success = 0
 
-            # 预加载操作数图像
-            op_img = None
-            if (self.config.arithmetic.operand_path
-                    and os.path.isfile(self.config.arithmetic.operand_path)):
-                op_img = robust_imread(self.config.arithmetic.operand_path,
-                                     _cv2.IMREAD_UNCHANGED)
+            operand_images = []
+            for step, params in zip(self.step_order, self.step_params):
+                operand_path = (
+                    params.operand_path
+                    if step == "arithmetic" and params is not None else ""
+                )
+                operand_images.append(
+                    robust_imread(operand_path, _cv2.IMREAD_UNCHANGED)
+                    if operand_path and os.path.isfile(operand_path) else None
+                )
 
             worker_count = default_worker_count(self.max_workers)
             if total <= 1:
@@ -14917,14 +15196,19 @@ class _IEBatchWorker(QThread):
 
             def process_one(index, file_path):
                 try:
-                    editor = ImageEditor(self.config)
+                    editor = ImageEditor(copy.deepcopy(self.config))
                     dst_name = _ie_resolve_batch_filename(
                         file_path.name, index, self.step_order, self.filename_pattern)
                     dst = str(Path(self.dst_dir) / dst_name)
                     img = robust_imread(str(file_path), _cv2.IMREAD_UNCHANGED)
                     if img is None:
                         return index, f"{file_path.name} (失败: 无法读取图像)", False
-                    result = editor.process(img, op_img, step_order=self.step_order)
+                    result = editor.process(
+                        img,
+                        step_order=self.step_order,
+                        step_params=self.step_params,
+                        operand_images=operand_images,
+                    )
                     ok = robust_imwrite(dst, result)
                     if ok and editor.last_bub_analysis_result is not None:
                         editor.last_bub_analysis_result.write_artifacts(dst)
