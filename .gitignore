@@ -1,0 +1,4 @@
+# Keep generated installer payloads out of normal bulk commits.
+# Split archives are added intentionally with `git add -f`, one part at a time.
+bubble_tomography_install/*.exe
+bubble_tomography_install/*.zip.*
