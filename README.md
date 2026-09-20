@@ -1,9 +1,12 @@
 # MISTA
 
-直接进行安装包安装，可以不安装整体opencv库。
+直接进行安装包安装，可以不安装整体opencv库。安装包在这里：
+通过网盘分享的文件：bubble_tomography_install
+链接: https://pan.baidu.com/s/1sgALkEd2siHkAyQYCbVsZg 提取码: vvf5 
 
 **多相流科研图像处理、三维重建与 PIV/PTV 分析工作站**
-
+![alt text](92415f0deaa1fb46aaceb69628c55e9c.png)
+![alt text](405be7a694f6e6992857e8638cd1865e.png)
 当前版本：`v2.3.20260901`  
 支持平台：Windows 10/11 x64；提供 macOS 构建脚本
 
