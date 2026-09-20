@@ -1,344 +1,276 @@
-#本程序为广大流体实验工作者提供近乎完备的测量体系，实现从采集，测量，分析，以及AI辅助调度软件功能（仍在开发）
-基于多相机视角进行三维重建，支持多相机标定、气泡重建、三维点云导出、示踪粒子3D重建、Tomographic PIV。 #目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV， { #上面的功能都在\bubble_tomography文件夹里。 通过shell命令启动：python main.py --gui #GUI界面提供四个标签页： #1. 相机标定：添加相机、加载标定图像、设置标定板参数、执行标定 #2. 气泡重建：批量加载气泡图像序列、设置MART参数、执行重建、时间点切换查看
-#3. 结果可视化：查看点云、体素切片、投影对比、综合报告、批量结果概览
-#4. Particle Tracking / PIV：批量加载粒子图像、粒子3D重建、速度场计算、时间点切换 #目前仅支持单相机重建，多相机重建、示踪粒子3D重建、2DPIV、Tomographic PIV， #PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里。
-![alt text](image.png)
-{
-    修改记录：
-    
-    #封装的软件安装包都在bubble_tomography_exe文件夹里。 通过直接打开exe文件启动，
+# MISTA
 
-    #PTV功能正在开发中。主要在\bubble_tomography_VOL_work文件里
+直接进行安装包安装，可以不安装整体opencv库。
 
-    1、20260615修改了图像处理模块的预览模块显示功能，可以缩小到最小尺寸。
+**多相流科研图像处理、三维重建与 PIV/PTV 分析工作站**
 
-}
+当前版本：`v2.3.20260901`  
+支持平台：Windows 10/11 x64；提供 macOS 构建脚本
 
-} #本程序基于Python3.7开发，依赖PyQt5、numpy、opencv-python、scipy、matplotlib、scikit-image、tqdm
+MISTA 将实验图像管理、图像处理工作流、视频/CINE 导入、多相机标定、气泡与粒子三维重建、二维/三维 PIV、PTV 以及 AI 辅助分析整合在同一个桌面应用中。软件面向高速摄影、多相流、气泡动力学和粒子测速实验，支持单图交互调参，也支持保持参数一致的目录批处理。
 
-若有问题，请提issue，联系方式huntersong1992@qq.com,songyuchen@sjtu.edu.cn
+> 科研提示：重建与测速结果会受到标定质量、相机同步、粒子密度、时间间隔和处理参数影响。正式实验应保存原始数据、标定文件和项目记录，并对结果进行独立验证。
 
-{#以下是README.md的内容：
-# git_bubble_tomography
-bubble_tomography_VOL_work260430
+## 主要功能
 
-# 气泡三维多相机层析重建系统
+| 模块 | 功能 |
+|---|---|
+| 图像处理 | 文件树联动、单图/批量目录模式、可编排工作流、ROI、镜像、旋转、位深与灰度运算、滤波、阈值、分割、FFT/IFFT、图像质量、粒子统计、气泡识别与追踪、自定义算法、点云与速度场分析、图片/视频导出 |
+| 视频导入 | CINE、MP4、MOV、AVI、MKV、MXF 等视频预览，亮度/增益/伽马、裁剪、翻转、帧范围选择和停止导出 |
+| 相机标定 | 单相机、双相机和 3 台及以上相机联合标定；棋盘格、对称/非对称圆点阵和 LaVision 双层体标定板点阵；标定结果导入与导出 |
+| 气泡重建 | 多相机图像批量加载，MART/SMART 等层析重建，体素、切片和点云结果输出 |
+| 单相机 3D 重建 | 基于轮廓与光线追踪的三维重建和点云导出 |
+| 三维 PIV | 粒子体重建、多级互相关、自动分块与内存规划、并行计算、批量速度场、切片/云图/矢量/涡量面显示 |
+| 二维 PIV | 单组与批量互相关、矢量过滤、密度和显示参数调整、结果导出 |
+| PTV | 多相机粒子检测、三维匹配、轨迹连接和速度计算 |
+| AI 辅助模型 | 普通对话、图像上下文、自然语言任务规划和图像处理工作流建议 |
+| 本地模型 | OpenAI 兼容接口与本地 GGUF 模型配置，可配合 LM Studio 提供离线对话服务 |
+| 相机采集 | 通用相机入口及 Phantom 相机采集页面；实际采集能力取决于相机和厂商 SDK |
 
-## 功能概述
+## 推荐操作流程
 
-本程序实现了基于多相机视角的气泡三维层析重建完整流程：
+### 图像处理
 
-1. **多相机标定** — 支持棋盘格、对称点阵、非对称点阵、体标定板点阵，3~N个相机联合标定
-2. **气泡图像预处理** — 背景去除、去畸变、二值化分割、投影计算
-3. **MART层析重建** — 基于光线追踪的乘法代数重建算法（Multiplicative ART）
-4. **三维点云输出** — PLY/PCD/OBJ格式导出，支持CloudCompare、MeshLab等软件
-5. **示踪粒子3D重建** — 多视角三角测量 + 外极线约束匹配
-6. **Tomographic PIV** — 3D互相关速度场计算
-7. **批量时间序列处理** — 支持多时刻图像批量加载、重建和速度场计算
+统一流程为：
 
-## 目录结构
-
-```
-bubble_tomography/
-├── main.py                          # 主入口（GUI/Demo/PIV-Demo）
-├── __init__.py
-├── requirements.txt                 # Python依赖
-├── calibration/                     # 相机标定模块
-│   ├── __init__.py
-│   └── camera_calibrator.py         # 多相机标定器
-├── mart/                            # MART重建模块
-│   ├── __init__.py
-│   └── mart_reconstructor.py        # MART算法 + 光线追踪器
-├── utils/                           # 工具模块
-│   ├── __init__.py
-│   └── image_processor.py           # 气泡图像预处理器
-├── visualization/                   # 可视化模块
-│   ├── __init__.py
-│   └── visualizer.py                # 3D可视化与点云导出
-├── particles/                       # 粒子追踪模块
-│   ├── __init__.py
-│   ├── particle_reconstructor.py    # 粒子3D重建
-│   └── velocity_field.py            # 3D速度场计算
-├── gui/                             # GUI界面
-│   ├── __init__.py
-│   └── main_window.py               # PyQt5主窗口（含批量处理）
-└── demo_output/                     # 演示输出
+```text
+选择数据 -> 单图预览 -> 调整工作流 -> 批量执行 -> 检查输出结果
 ```
 
-## 快速开始
+1. 在左侧文件树中设置工作目录。
+2. 选择一张图片时，软件自动进入“单张图像”模式，仅处理当前图片；参数变化会实时刷新预览。
+3. 选择文件夹时，软件自动进入“批量目录”模式，按自然顺序载入第一张有效图片作为预览帧。
+4. 从“操作功能区”把算法加入工作流；选中工作流节点后，在下方“编辑参数”区域调节参数。
+5. 批量模式调参时只重新计算当前预览图，不会重复处理整个目录。可通过序列控制栏切换预览帧。
+6. 输出目录默认建议为输入文件夹内的子目录，名称由“输入文件夹名称 + 工作流缩写”组成。例如 `Experiment01_C-M-B`。
+7. 只有点击“批量处理”后才创建输出目录。处理期间工作流结构和参数会被锁定，并显示当前文件、完成数量、耗时和异常信息。
 
-### 1. 环境依赖
+文件树支持复制、移动、重命名、删除和复制路径等右键操作，也支持拖拽移动文件或文件夹。移动文件夹时会保留其内部目录结构。删除和移动实验原始数据前请先做好备份。
 
-```bash
-pip install -r requirements.txt
+支持的常用图像格式：`.png`、`.jpg`、`.jpeg`、`.bmp`、`.tif`、`.tiff`、`.pgm`、`.ppm`。
+
+### 多相机标定与三维 PIV
+
+1. 在“相机标定”中选择标定模式和标定板类型。
+2. 为每台相机加载清晰、完整且对应关系正确的标定图像。
+3. LaVision 双层板应选择 `volume_dots`，并按板型填写点距和层间距，例如 204-15 为点距 15 mm、层间距 3 mm。
+4. 检查每台相机的识别点覆盖、编号方向、重投影误差和相机空间布局。
+5. 导出标定结果，并在“三维 PIV”中导入。
+6. 按相机批量加载同步粒子图像，设置第 1/第 2 帧、物理重建范围、体素数、MART 参数和内存预算。
+7. 先进行小体素或局部区域试算，再执行完整粒子 3D 重建和多级互相关速度场计算。
+8. 在结果区选择 X-Y、X-Z 或 Y-Z 切片，并调整矢量密度、长度、单位、云图变量、色阶和涡量面。
+
+大体素任务会自动进行分块和内存规划。建议预留系统内存，并在“CPU/GPU 调度”中为系统保留 1 至 2 个逻辑核心。显卡加速为可选能力，无独立显卡时可使用 CPU 模式。
+
+### 气泡识别与追踪
+
+1. 在图像处理工作流中加入 `BubAnalysis 气泡识别`。
+2. 根据图像调整背景、阈值、轮廓和重叠气泡分割参数。
+3. 批量执行后会生成标注图和 `*_bubbles.csv`。
+4. 将“气泡追踪”加入工作流，读取上述结果目录，生成气泡轨迹、事件与速度结果。
+
+## 安装与启动
+
+### Windows 安装包
+
+安装包默认输出到相邻目录：
+
+```text
+D:\Code\BubbleandPIV\bubble_tomography_install\MISTA_Setup_v2.3.20260901_x64.exe
 ```
 
-或手动安装：
-```bash
-pip install numpy opencv-python scipy matplotlib scikit-image tqdm pyqt5
+运行安装程序后，从开始菜单或桌面快捷方式启动 `MISTA`。LM Studio、本地 GGUF 模型运行环境和 NVIDIA 驱动属于可选组件；普通 CPU 计算不要求独立显卡。
+
+### Windows 便携版
+
+标准便携目录为：
+
+```text
+dist\MISTA\
+├── MISTA.exe
+└── _internal\
 ```
 
-### 2. 运行演示
+复制到其他电脑时必须整体复制 `dist\MISTA`，不能只复制 `MISTA.exe`。项目根目录中的 `MISTA.exe` 同样依赖相邻的 `_internal` 目录。
 
-```bash
-cd bubble_tomography
+### 从源码运行
 
-# 气泡重建演示
-python main.py --demo
+建议使用 Python 3.11 x64：
 
-# Tomographic PIV演示
-python main.py --piv-demo
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-### 3. 启动GUI
+常用命令：
 
-```bash
-python main.py --gui
+```powershell
+python main.py --gui       # 启动图形界面；无参数时也是 GUI
+python main.py --demo      # 运行气泡层析演示
+python main.py --piv-demo  # 运行 Tomographic PIV 演示
+python main.py --verbose   # 输出更详细的启动日志
 ```
 
-GUI界面提供四个标签页：
-- **1. 相机标定**：添加相机、加载标定图像、设置标定板参数、执行标定
-- **2. 气泡重建**：批量加载气泡图像序列、设置MART参数、执行重建、时间点切换查看
-- **3. 结果可视化**：查看点云、体素切片、投影对比、综合报告、批量结果概览
-- **4. Particle Tracking / PIV**：批量加载粒子图像、粒子3D重建、速度场计算、时间点切换
+## 数据组织示例
 
-### 4. 批量时间序列处理
+多相机时间序列推荐使用“相机目录 + 自然排序文件名”：
 
-GUI支持从文件夹根目录批量加载多时刻图像：
-
+```text
+Experiment01/
+├── cam1/
+│   ├── frame_0000.tif
+│   └── frame_0001.tif
+├── cam2/
+│   ├── frame_0000.tif
+│   └── frame_0001.tif
+└── cam3/
+    ├── frame_0000.tif
+    └── frame_0001.tif
 ```
-root_dir/
+
+部分批量重建入口也支持“时间点目录 + 相机文件”：
+
+```text
+Experiment01/
 ├── t000/
-│   ├── cam1.png
-│   ├── cam2.png
-│   └── cam3.png
-├── t001/
-│   ├── cam1.png
-│   ├── cam2.png
-│   └── cam3.png
-└── t002/
-    ├── cam1.png
-    ├── cam2.png
-    └── cam3.png
+│   ├── cam1.tif
+│   ├── cam2.tif
+│   └── cam3.tif
+└── t001/
+    ├── cam1.tif
+    ├── cam2.tif
+    └── cam3.tif
 ```
 
-- 每个子文件夹对应一个时间点，文件夹名作为时间标识
-- 子文件夹内图像名需包含对应相机ID（如 `cam1.png`）以自动匹配
-- 右侧面板底部有**时间点滑块**，可快速切换查看各时刻的处理结果
+所有相机必须使用相同的时间点集合。建议使用固定宽度编号，如 `0000`、`0001`，避免不同系统的排序差异。
 
-## 快速开始
+## 文件格式
 
-### 1. 环境依赖
+| 数据 | 输入/输出格式 |
+|---|---|
+| 图像 | PNG、JPEG、BMP、TIFF、PGM、PPM |
+| 视频 | CINE、MP4、MOV、AVI、MKV、MXF、WMV、MPG/MPEG、M4V |
+| 图像导出 | PNG、JPEG、BMP、TIFF、WebP |
+| 视频导出 | MP4、AVI、MOV、MKV |
+| 点云 | PLY、PCD、PTS、XYZ、OBJ、CSV/TXT、NPY/NPZ |
+| 速度场 | VTK、NPZ、NPY、CSV/TXT |
+| 项目记录 | `.btproject` |
+| 标定结果 | JSON |
 
-```bash
-pip install numpy opencv-python scipy matplotlib scikit-image tqdm pyqt5
+## 项目结构
+
+```text
+bubble_tomography/
+├── main.py                 # 程序入口与演示命令
+├── gui/                    # PyQt5 主界面、采集和分析组件
+├── calibration/            # 单/双/多相机标定
+├── mart/                   # MART、SMART、分块重建与射线模型
+├── particles/              # 粒子三维重建、二维/三维速度场
+├── ptv/                    # PTV 检测、匹配、追踪与速度计算
+├── raytrace/               # 单相机轮廓光线追踪重建
+├── utils/                  # 图像、视频、CINE、气泡分析和项目记录
+├── visualization/          # 点云、切片、速度场与报告输出
+├── tests/                  # 自动化测试
+├── scripts/                # 打包、巡览视频和辅助脚本
+├── installer/              # Inno Setup 安装配置
+├── assets/                 # 图标和界面资源
+├── requirements.txt        # Windows/Python 依赖
+└── mista.spec              # PyInstaller 配置
 ```
 
-### 2. 运行演示
+## 构建发布版本
 
-```bash
-cd bubble_tomography
-python main.py --demo
+### 便携 EXE
+
+```powershell
+.\scripts\build_portable.ps1
 ```
 
-演示将生成4个模拟相机的标定参数、合成气泡投影、执行MART重建，输出结果到 `demo_output/`。
+完全重建虚拟环境：
 
-### 3. 启动GUI
-
-```bash
-python main.py --gui
+```powershell
+.\scripts\build_portable.ps1 -RecreateVenv
 ```
 
-GUI界面提供三个标签页：
-- **相机标定**：添加相机、加载标定图像、设置标定板参数、执行标定
-- **气泡重建**：加载气泡图像和背景图、设置MART参数、执行重建
-- **结果可视化**：查看点云、体素切片、投影对比、综合报告
+仅复用已验证的构建环境：
 
-## 使用流程
-
-### Step 1: 相机标定
-
-#### 命令行方式
-
-```python
-from calibration import MultiCameraCalibrator
-
-# 创建标定器
-calibrator = MultiCameraCalibrator(
-    pattern_type='checkerboard',   # 棋盘格
-    pattern_size=(11, 8),          # 内角点数 (宽 x 高)
-    square_size=5.0                # 方格边长 (mm)
-)
-
-# 逐相机标定
-camera_images = {
-    'cam1': ['cam1_img1.jpg', 'cam1_img2.jpg', ...],  # 每个相机至少3张
-    'cam2': ['cam2_img1.jpg', 'cam2_img2.jpg', ...],
-    'cam3': ['cam3_img1.jpg', 'cam3_img2.jpg', ...],
-}
-
-results = calibrator.calibrate_multi_camera(camera_images)
-
-# 保存结果
-calibrator.save_results('./calibration_output')
-
-# 查看报告
-print(calibrator.get_calibration_report())
+```powershell
+.\scripts\build_portable.ps1 -SkipDependencyInstall
 ```
 
-支持的标定板类型：
-| 类型 | 参数值 | 说明 |
-|------|--------|------|
-| 棋盘格 | `'checkerboard'` | 最常用，黑白交替方格 |
-| 对称圆点阵 | `'circles'` | 规则排列的圆形 |
-| 非对称圆点阵 | `'acircles'` | 交错排列的圆形，精度更高 |
-| 体标定板点阵 | `'volume_dots'` | 亮圆点体标定板，支持规则点阵中存在少量缺失/编码点 |
+构建完成后会生成 `dist\MISTA\MISTA.exe`，并把便携运行时同步到项目根目录。
 
-#### 标定图像拍摄建议
-- 每个相机至少拍摄 **5-10张** 不同角度/距离的标定板图像
-- 标定板应覆盖图像的不同区域（中心、边缘）
-- 保持标定板平整，无反光
-- 图像应清晰对焦
+### Windows 安装包
 
-### Step 2: 气泡图像预处理
+先生成 `dist\MISTA`，再使用 Inno Setup 6 编译：
 
-```python
-from utils import BubbleImageProcessor
-import cv2
-
-processor = BubbleImageProcessor(
-    background_method='reference',  # 使用无气泡参考图
-    threshold_method='otsu',        # 自适应阈值
-    morph_operations=True           # 形态学去噪
-)
-
-# 加载图像
-bubble_images = {
-    'cam1': cv2.imread('bubble_cam1.png'),
-    'cam2': cv2.imread('bubble_cam2.png'),
-    'cam3': cv2.imread('bubble_cam3.png'),
-}
-
-# 加载背景参考图（可选但推荐）
-reference_images = {
-    'cam1': cv2.imread('background_cam1.png'),
-    'cam2': cv2.imread('background_cam2.png'),
-    'cam3': cv2.imread('background_cam3.png'),
-}
-
-# 准备投影数据
-projections = processor.prepare_projection_data(
-    bubble_images,
-    {cid: {'camera_matrix': p.camera_matrix, 'dist_coeffs': p.dist_coeffs}
-     for cid, p in calibrator.camera_params.items()},
-    reference_images=reference_images,
-    projection_type='soft_edge'  # 柔化边缘投影
-)
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer\MISTA.iss"
 ```
 
-### Step 3: MART层析重建
+安装包配置可选打入 LM Studio 和 NVIDIA 驱动。打包前应确认 `installer\MISTA.iss` 中声明的可选安装文件实际存在。
 
-```python
-from mart import MARTReconstructor, MARTConfig
+## 测试
 
-# 配置重建参数
-config = MARTConfig(
-    grid_size=(64, 64, 64),       # 重建网格分辨率
-    domain_size=(20, 20, 20),      # 重建域尺寸 (mm)
-    relaxation_factor=0.5,          # 松弛因子 (0-1)
-    max_iterations=50,              # 最大迭代次数
-    voxel_threshold=0.1,            # 体素提取阈值
-    ray_sample_step=0.2             # 光线采样步长 (mm)
-)
+运行完整测试：
 
-reconstructor = MARTReconstructor(config)
-
-# 准备相机投影矩阵
-camera_params_recon = {}
-for cam_id, params in calibrator.camera_params.items():
-    P = calibrator.compute_projection_matrix(cam_id)
-    K = np.array(params.camera_matrix)
-    camera_params_recon[cam_id] = {
-        'P': P,
-        'K_inv': np.linalg.inv(K)
-    }
-
-# 执行重建
-volume = reconstructor.reconstruct(projections, camera_params_recon)
-
-# 提取气泡点云（基于Marching Cubes）
-points, normals = reconstructor.extract_bubble_point_cloud()
-
-print(f"重建体素场: {volume.shape}")
-print(f"点云点数: {len(points)}")
+```powershell
+python -m pytest -q
 ```
 
-### Step 4: 结果输出
+运行打包程序的启动检查：
 
-```python
-from visualization import ResultVisualizer
-
-viz = ResultVisualizer(output_dir='./results')
-
-# 3D点云可视化
-viz.plot_point_cloud(points, normals)
-
-# 体素切片
-viz.plot_volume_slices(volume, axis='z', num_slices=5)
-
-# 投影对比
-viz.plot_projection_comparison(projections)
-
-# 综合报告
-viz.create_report_figure(volume, points, projections,
-                          reconstructor.get_volume_stats())
-
-# 导出点云文件
-viz.save_point_cloud_ply(points, normals, 'bubble.ply')   # PLY格式
-viz.save_point_cloud_pcd(points, 'bubble.pcd')             # PCD格式
-viz.save_point_cloud_obj(points, normals, 'bubble.obj')    # OBJ格式
-viz.save_volume_npy(volume, 'volume.npy')                  # 体素数据
+```powershell
+.\dist\MISTA\MISTA.exe --smoke-test
 ```
 
-## MART算法参数调优指南
+生成自动页面巡览、截图、视频和功能报告：
 
-| 参数 | 默认值 | 说明 | 调优建议 |
-|------|--------|------|---------|
-| `grid_size` | (64,64,64) | 三维网格分辨率 | 增大提高精度但计算量立方增长 |
-| `domain_size` | (20,20,20) | 重建域物理尺寸(mm) | 应略大于气泡群的实际范围 |
-| `relaxation_factor` | 0.5 | 松弛因子μ | 0.1~0.3更稳定但收敛慢；0.5~0.8更快但可能发散 |
-| `max_iterations` | 50 | 最大迭代次数 | 通常20~50次足够收敛 |
-| `voxel_threshold` | 0.1 | 表面提取阈值 | 根据重建值分布调整 |
-| `ray_sample_step` | 0.2 | 光线采样步长(mm) | 越小越精确但越慢 |
+```powershell
+python .\scripts\create_feature_tour.py `
+  --test-data-root D:\Code\BubbleandPIV\git_bubble_tomography\image_for_test `
+  --output-dir .\artifacts\MISTA_feature_tour
+```
 
-## 输出文件格式
-
-| 格式 | 扩展名 | 兼容软件 |
-|------|--------|---------|
-| PLY | `.ply` | MeshLab, CloudCompare, ParaView |
-| PCD | `.pcd` | CloudCompare, PCL Viewer |
-| OBJ | `.obj` | Blender, MeshLab |
-| NPY | `.npy` | Python (numpy.load) |
+测试报告会明确区分软件功能、外部 API、本地模型和相机硬件等受限条件。
 
 ## 常见问题
 
-**Q: 标定重投影误差太大怎么办？**
-A: 确保标定图像清晰、标定板平整、角点被完整检测。尝试增加标定图像数量（10+张），覆盖图像不同区域。
+### 软件停在启动画面或提示主窗口初始化失败
 
-**Q: 重建结果出现伪影？**
-A: 降低松弛因子（0.1~0.3），增加迭代次数，减小光线采样步长，确保相机角度覆盖足够（建议相邻相机间隔≤45°）。
+查看日志：
 
-**Q: 重建速度太慢？**
-A: 减小网格分辨率（如32?），增大光线采样步长，减少迭代次数。MART计算复杂度为O(N_rays × N_voxels × N_iterations)。
+```text
+%LOCALAPPDATA%\MISTA\logs\startup.log
+```
 
-## 引用
+不要把程序安装到需要写入权限且被策略限制的目录中。运行结果和日志应保存到用户可写目录；若安全软件拦截，可将便携版放在本地可信路径后重试。
 
-如果本程序对您的研究有帮助，请引用：
+### CINE 文件无法读取
 
-> MART算法: Gordon, R., Bender, R., & Herman, G. T. (1970). Algebraic reconstruction techniques (ART) for three-dimensional electron microscopy and X-ray photography. Journal of Theoretical Biology, 29(3), 471-481.
-> 气泡三维重建：Y. Song, G. Huang, J. Yin, D. Wang, Three-dimensional reconstruction of bubble geometry from single-perspective images based on ray tracing algorithm, Measurement Science and Technology, DOI 10.1088/1361-6501/ad7e43.(2024)
+MISTA 支持 RAW 和软件已实现解码的压缩 CINE 类型。CINE 编码随相机型号和 Phantom 软件版本变化；遇到不支持的压缩方式时，请保留原文件和错误中的 `compression` 编号，或先用厂商软件导出为无损 TIFF 序列。
 
-## 许可
+### 体标定板无法自动识别
 
-MIT License
-}
+确认选择 `volume_dots`、板型尺寸正确、亮点未饱和且完整入镜。先逐相机检查识别叠加图；编码点、三角/方形方向标记和双层点的方向错误会导致相机姿态翻转或编号不一致。
+
+### 三维速度场过于稀疏
+
+速度网格由最终互相关窗口、重叠率、有效重建区域和 SNR 筛选共同决定，并不等同于 MART 体素数。缩小最终窗口、提高 overlap 会增加网格密度，同时显著增加计算量和内存占用。
+
+### 本地模型不能对话
+
+确认 LM Studio 或其他 OpenAI 兼容服务已启动，API 地址和模型 ID 正确。使用 GGUF 时先在本地服务中加载模型；安装包不会自动包含体积较大的模型文件。
+
+## 算法参考
+
+MART/ART 方法的基础参考：
+
+> Gordon, R., Bender, R., & Herman, G. T. (1970). Algebraic reconstruction techniques (ART) for three-dimensional electron microscopy and X-ray photography. *Journal of Theoretical Biology*, 29(3), 471-481.
+
+## 许可与贡献
+
+请以项目实际附带的许可文件和发布约定为准。提交修改前请运行相关测试，并避免把实验原始数据、模型文件、驱动安装包、构建目录或用户密钥提交到版本库。
